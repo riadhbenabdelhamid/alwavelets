@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alwavelets — The Complete Field Guide</title>
+<style>
+  :root {
+    --bg: #f2f5f2;
+    --panel: #e7ede8;
+    --panel2: #dde5de;
+    --ink: #1d2620;
+    --dim: #5c6a60;
+    --faint: #74836f;
+    --acc: #17803e;
+    --acc-ink: #0e5c2b;
+    --cyan: #0f6e80;
+    --amber: #8a6414;
+    --line: #c8d2c9;
+    --key-bg: #ffffff;
+    --key-edge: #b9c4ba;
+    --term-bg: #10140f;
+    --term-ink: #cfe0d2;
+    --code-bg: #e2e9e3;
+    --shadow: 0 1px 3px rgba(20,40,25,.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1210; --panel: #151b17; --panel2: #1a221c;
+      --ink: #d8e2da; --dim: #8a988e; --faint: #6b7a70;
+      --acc: #3ddc6e; --acc-ink: #7ceb9a; --cyan: #5bc4d4; --amber: #d9b45b;
+      --line: #243028; --key-bg: #1d2620; --key-edge: #34413a;
+      --term-bg: #0a0d0a; --term-ink: #cfe0d2; --code-bg: #131a15;
+      --shadow: 0 1px 3px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1210; --panel: #151b17; --panel2: #1a221c;
+    --ink: #d8e2da; --dim: #8a988e; --faint: #6b7a70;
+    --acc: #3ddc6e; --acc-ink: #7ceb9a; --cyan: #5bc4d4; --amber: #d9b45b;
+    --line: #243028; --key-bg: #1d2620; --key-edge: #34413a;
+    --term-bg: #0a0d0a; --term-ink: #cfe0d2; --code-bg: #131a15;
+    --shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+  :root[data-theme="light"] {
+    --bg: #f2f5f2; --panel: #e7ede8; --panel2: #dde5de;
+    --ink: #1d2620; --dim: #5c6a60; --faint: #74836f;
+    --acc: #17803e; --acc-ink: #0e5c2b; --cyan: #0f6e80; --amber: #8a6414;
+    --line: #c8d2c9; --key-bg: #ffffff; --key-edge: #b9c4ba;
+    --term-bg: #10140f; --term-ink: #cfe0d2; --code-bg: #e2e9e3;
+    --shadow: 0 1px 3px rgba(20,40,25,.12);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  .mono, kbd, code, pre, h1, h2, h3, .brand, .toc, .chip, th {
+    font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  .layout { display: grid; grid-template-columns: 232px minmax(0, 1fr); gap: 0; max-width: 1240px; margin: 0 auto; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } nav.toc { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); } }
+
+  /* ── sidebar: the viewer's tree panel ── */
+  nav.toc {
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    padding: 20px 14px 40px; border-right: 1px solid var(--line);
+    font-size: 12.5px; line-height: 2;
+  }
+  .brand { font-weight: 700; font-size: 15px; letter-spacing: .02em; margin-bottom: 2px; }
+  .brand .dia { color: var(--acc); }
+  .brand-sub { color: var(--dim); font-size: 11px; margin-bottom: 14px; }
+  .toc a { display: block; color: var(--dim); text-decoration: none; padding: 0 6px; border-radius: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .toc a:hover { color: var(--ink); background: var(--panel); }
+  .toc a::before { content: "▸ "; color: var(--faint); }
+  .toc a:hover::before { color: var(--acc); }
+  .toc .grp { color: var(--faint); text-transform: uppercase; letter-spacing: .14em; font-size: 10px; margin: 14px 6px 2px; }
+
+  main { padding: 0 40px 90px; min-width: 0; }
+  @media (max-width: 900px) { main { padding: 0 18px 60px; } }
+
+  /* ── hero terminal ── */
+  header.hero { padding: 44px 0 8px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
+  h1 .dia { color: var(--acc); }
+  .tagline { color: var(--dim); max-width: 62ch; margin: 0 0 22px; }
+  .term {
+    background: var(--term-bg); color: var(--term-ink); border-radius: 8px;
+    border: 1px solid var(--line); box-shadow: var(--shadow); overflow: hidden; margin: 0 0 14px;
+  }
+  .term-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: rgba(255,255,255,.04); border-bottom: 1px solid rgba(255,255,255,.07); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: #7d8a82; }
+  .term-bar .dot { width: 10px; height: 10px; border-radius: 50%; background: #3a463d; }
+  .term-bar .dot:first-child { background: #3ddc6e55; }
+  .term pre { margin: 0; padding: 14px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  .g { color: #3ddc6e; } .cy { color: #5bc4d4; } .xd { color: #d9b45b; } .dm { color: #66756a; } .rd { color: #e0705f; }
+
+  .quick { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 0; }
+  .quick code { background: var(--code-bg); border: 1px solid var(--line); padding: 6px 12px; border-radius: 6px; font-size: 13px; }
+
+  /* ── sections ── */
+  section { margin-top: 58px; }
+  h2 { font-size: 19px; margin: 0 0 4px; padding-top: 10px; letter-spacing: .01em; }
+  h2::before { content: "── "; color: var(--acc); }
+  h2 + p.lead, .lead { color: var(--dim); margin: 4px 0 18px; max-width: 68ch; }
+  h3 { font-size: 14px; margin: 26px 0 10px; color: var(--ink); }
+  h3::before { content: "▼ "; color: var(--acc); font-size: 11px; }
+  p { max-width: 68ch; }
+  a { color: var(--cyan); }
+  a:focus-visible, .toc a:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+
+  /* ── tables ── */
+  .tblwrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; background: var(--panel); }
+  th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .12em; color: var(--faint); padding: 9px 14px; border-bottom: 1px solid var(--line); font-weight: 600; background: var(--panel2); }
+  td { padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.k { white-space: nowrap; width: 1%; }
+  td .why { color: var(--dim); font-size: 12.5px; }
+  tbody tr:hover { background: var(--panel2); }
+
+  kbd {
+    display: inline-block; min-width: 21px; text-align: center;
+    background: var(--key-bg); border: 1px solid var(--key-edge);
+    border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px;
+    font-size: 12px; color: var(--ink); margin: 1px 1px;
+  }
+  code { background: var(--code-bg); border-radius: 4px; padding: 1.5px 5px; font-size: 13px; }
+  pre.block { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font-size: 12.8px; line-height: 1.55; }
+  pre.block code { background: none; padding: 0; }
+  .cm { color: var(--dim); }
+
+  /* ── cards (MCP tools) ── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; margin-top: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .card h4 { margin: 0 0 6px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13.5px; color: var(--acc-ink); }
+  .card p { font-size: 13px; color: var(--dim); margin: 0 0 10px; }
+  .card table { font-size: 12px; background: transparent; }
+  .card td, .card th { padding: 4px 8px; }
+
+  .chip { display: inline-block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; border: 1px solid var(--line); color: var(--dim); border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 2px; }
+  .chip.acc { color: var(--acc-ink); border-color: var(--acc); }
+
+  .callout { border-left: 3px solid var(--acc); background: var(--panel); padding: 10px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; font-size: 14px; max-width: 74ch; }
+  .callout.warn { border-left-color: var(--amber); }
+  .callout b { color: var(--acc-ink); }
+  .callout.warn b { color: var(--amber); }
+
+  .cols2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; align-items: start; }
+
+  /* ── logo lockup ── */
+  .logo {
+    display: block; width: 100%; max-width: 186px; height: auto;
+    margin: 2px 0 10px; }
+  /* The mark is bright phosphor green, tuned for a dark ground. On the light
+     theme deepen it so it holds contrast against paper instead of glowing. */
+  :root[data-theme="light"] .logo { filter: brightness(.66) saturate(1.45); }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) .logo { filter: brightness(.66) saturate(1.45); }
+  }
+
+  /* ── theme toggle ── */
+  .tbtn {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin: 0 0 16px; padding: 4px 10px;
+    font: 600 11px/1 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .08em; text-transform: uppercase;
+    color: var(--dim); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px;
+    cursor: pointer; transition: color .15s, border-color .15s; }
+  .tbtn:hover { color: var(--acc-ink); border-color: var(--acc); }
+  .tbtn:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .tbtn-ico { font-size: 13px; line-height: 1; }
+  @media (prefers-reduced-motion: reduce) { .tbtn { transition: none; } }
+  footer { margin-top: 70px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--faint); font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <img class="logo" src="data:image/png;base64,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" alt="Alwavelets — a waveform above the wordmark">
+  <div class="brand-sub">terminal VCD/FST viewer<br>— complete field guide</div>
+  <button id="themeToggle" type="button" class="tbtn" aria-live="polite">
+    <span class="tbtn-ico" aria-hidden="true">◐</span><span id="themeLabel">Auto</span>
+  </button>
+  <div class="grp">Start</div>
+  <a href="#start">Quick start &amp; CLI</a>
+  <a href="#screen">Reading the screen</a>
+  <div class="grp">Interactive</div>
+  <a href="#keys-nav">Navigation &amp; zoom</a>
+  <a href="#keys-cursor">Cursors &amp; measurement</a>
+  <a href="#keys-search">Search: finder &amp; friends</a>
+  <a href="#keys-signals">Managing the signal list</a>
+  <a href="#groups">Groups (incl. nested)</a>
+  <a href="#keys-display">Display &amp; styling</a>
+  <a href="#mouse">Mouse</a>
+  <div class="grp">Command layer</div>
+  <a href="#cmdline">The ; command line</a>
+  <a href="#tcl">Tcl scripting (:)</a>
+  <div class="grp">Persistence</div>
+  <a href="#session">Sessions &amp; sidecars</a>
+  <a href="#themes">Themes &amp; config</a>
+  <div class="grp">Output</div>
+  <a href="#export">Export &amp; graphics</a>
+  <div class="grp">Services</div>
+  <a href="#mcp">MCP server (LLMs)</a>
+  <a href="#control">Agent control (live)</a>
+  <a href="#pyapi">Python API</a>
+  <a href="#demo">Guided demo tour</a>
+</nav>
+
+<main>
+<header class="hero">
+  <h1><span class="dia">◆</span> Alwavelets — The Complete Field Guide</h1>
+  <p class="tagline">Every key, command, file and service in the dependency-free terminal waveform viewer — from first launch to driving it with an LLM over MCP. Runs anywhere Python 3.8+ and a terminal exist: SSH, tmux, a bare console.</p>
+
+  <div class="term">
+    <div class="term-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>&nbsp;alwavelets — demo_waveform.vcd · TS:1ns · 0ns‥600ns</div>
+    <pre><span class="dm">              ┬0ns           ┬120ns          ┬240ns         ┬360ns          ┬480ns</span>
+<span class="cy">top.clk     </span>  <span class="g">▓▓│▓│▓│▓│▓│▓│▓▓│▓│▓│▓│▓│▓│▓▓│▓│▓│▓│▓│▓│▓▓│▓│▓│▓│▓│▓│▓▓│▓│▓│▓│▓│▓│▓▓│▓│▓│▓│▓</span>
+<span class="cy">top.valid   </span>  <span class="g">▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁│▔│▁▁</span>
+<span class="cy">top.ready   </span>  <span class="g">▔▔▔▔▔│▁│▔▔▔▔▔▔▔│▁│▔▔▔▔▔▔▔│▁│▔▔▔▔▔▔▔▔│▁│▔▔▔▔▔▔▔│▁│▔▔▔▔▔▔▔▔│▁│▔▔▔▔▔▔▔│▁│▔▔▔▔▔</span>
+<span class="cy">top.data_out</span>  <span class="xd">XXXXXX</span><span class="dm">╳</span><span class="cy">96</span><span class="dm">═══╳</span><span class="cy">B9</span><span class="dm">════╳</span><span class="cy">62</span><span class="dm">═══╳</span><span class="cy">23</span><span class="dm">════╳</span><span class="cy">17</span><span class="dm">═══╳</span><span class="cy">74</span><span class="dm">════╳</span><span class="cy">94</span><span class="dm">═══╳</span><span class="cy">28</span><span class="dm">════╳</span><span class="cy">77</span><span class="dm">═══╳</span>
+<span class="cy">top.adc     </span>  <span class="dm">⠎⠉⠑⠢⣀⡠⠔⠊⠉⠒⠤⣀⣀⠤⠔⠒⠉⠑⠢⢄⣀⡠⠤⠊⠉⠒⠤⢄⣀⠤⠔⠊⠉⠑⠒⠤⣀⡠⠔⠒⠉⠑⠢⣀⣀⡠⠤⠒⠉⠒⠢⣀</span> <span class="dm">← braille analog (w×2)</span></pre>
+  </div>
+  <div class="quick">
+    <code>python3 alwavelets.py --demo</code>
+    <code>python3 alwavelets.py trace.vcd</code>
+    <code>python3 alwavelets.py trace.fst</code>
+    <code>python3 alwavelets.py --mcp</code>
+  </div>
+</header>
+
+<!-- ══════════════════ QUICK START ══════════════════ -->
+<section id="start">
+  <h2>Quick start &amp; CLI</h2>
+  <p class="lead">Zero dependencies — the launcher is <code>alwavelets.py</code> next to the <code>alwavelets/</code> package. It parses VCD (streaming, background-loaded, or lazy for huge files) and FST (native pure-Python reader).</p>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><code>file</code></td><td>Path to a <code>.vcd</code> or <code>.fst</code> trace. Files &gt;5&nbsp;MB background-load (the viewer opens instantly); &gt;50&nbsp;MB use lazy on-demand chunk loading.</td></tr>
+      <tr><td class="k"><code>--demo</code></td><td>Generate <code>/tmp/demo_waveform.vcd</code> and open it pre-arranged: nested signal groups (<em>Interface ▸ Handshake / Data&nbsp;bus</em>) and a 3-row analog ADC sine.</td></tr>
+      <tr><td class="k"><code>--signals, -s</code></td><td>Comma-separated glob filter applied at load, e.g. <code>-s 'clk,data*,alu.*'</code>.</td></tr>
+      <tr><td class="k"><code>--sync</code></td><td>Force a synchronous parse (no background thread).</td></tr>
+      <tr><td class="k"><code>--jobs, -j N</code></td><td>Opt-in parallel parse with N fork workers for large (&gt;16&nbsp;MB) synchronous VCD parses: <code>--sync --jobs 8</code>.</td></tr>
+      <tr><td class="k"><code>--expanded</code></td><td>Start with all scopes expanded (default: first-level sub-scopes folded, root-scope signals visible).</td></tr>
+      <tr><td class="k"><code>--loadunchecked</code></td><td>Start with an empty display; pick signals via the <kbd>B</kbd> tree browser.</td></tr>
+      <tr><td class="k"><code>--no-cache</code></td><td>Skip the persistent parse cache (see <a href="#session">Sessions &amp; sidecars</a>).</td></tr>
+      <tr><td class="k"><code>--no-config</code></td><td>Ignore <code>~/.config/alwavelets/config.json</code>.</td></tr>
+      <tr><td class="k"><code>--no-session</code></td><td>Ignore a saved session sidecar and open the trace fresh. <code>--expanded</code> and <code>--loadunchecked</code> imply it, so an explicit layout flag is never overruled by a session.</td></tr>
+      <tr><td class="k"><code>--mcp</code></td><td>Run as an <a href="#mcp">MCP server</a> over stdio instead of the TUI.</td></tr>
+      <tr><td class="k"><code>--control</code></td><td>Expose a token-authenticated control socket so an authorized local agent can drive this live session — see <a href="#control">Agent control</a>.</td></tr>
+      <tr><td class="k"><code>--list-sessions</code></td><td>Print the controllable running viewers as JSON, then exit. This is how an agent discovers a session to attach to.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout"><b>Memory note.</b> Values are bit-packed in RAM: 1&nbsp;byte per change for 1-bit signals, 2&nbsp;bits per bit for buses up to 64 bits wide (4-state: <code>0 1 x z</code>). A bus-heavy 51&nbsp;MB VCD that used to occupy ~144&nbsp;MB resident sits at ~42&nbsp;MB.</div>
+</section>
+
+<!-- ══════════════════ SCREEN ══════════════════ -->
+<section id="screen">
+  <h2>Reading the screen</h2>
+  <p class="lead">Top to bottom: title bar (file, timescale, signal/change counts) · menu bar with paged key hints (<kbd>0</kbd>/<kbd>9</kbd> flip pages, <kbd>F2</kbd> hides it) · time ruler · signal rows · status bar.</p>
+  <p>The status bar shows the active cursor and its time, <b>ΔAB</b> with its equivalent frequency and the focused signal's transition count between the cursors — e.g. <code>ΔAB=20ns (50MHz · 40t)</code> — the visible window, the signal range, panel focus, and the focused signal's value.</p>
+  <p>Glyph language: <code>▔</code> high · <code>▁</code> low · <code>│</code> edge · <code>▓</code> "busy" (transitions denser than columns) · <code>▚</code> unknown&nbsp;<code>x</code> · <code>┄</code> high-impedance&nbsp;<code>z</code> · <code>╳══╳</code> bus segments with value labels · block or braille curves for analog. Press <kbd>C</kbd> for the in-app color legend, <kbd>?</kbd> for quick help, <kbd>F1</kbd> for the full 12-page manual.</p>
+  <p>By default the split <b>panel</b> (scope tree, width 30) is open on the left and <kbd>Tab</kbd> switches focus between panel and waves; press <kbd>s</kbd> to close it and give the full width to names + waves.</p>
+</section>
+
+<!-- ══════════════════ KEYS: NAV ══════════════════ -->
+<section id="keys-nav">
+  <h2>Navigation &amp; zoom</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><kbd>←</kbd><kbd>→</kbd> / <kbd>h</kbd><kbd>l</kbd></td><td>Scroll time — or move the active cursor when the cursor is on.</td></tr>
+      <tr><td class="k"><kbd>↑</kbd><kbd>↓</kbd> / <kbd>k</kbd><kbd>j</kbd></td><td>Move signal focus up / down (extends the selection in visual mode).</td></tr>
+      <tr><td class="k"><kbd>+</kbd>/<kbd>=</kbd> · <kbd>-</kbd></td><td>Zoom in · zoom out (2× steps).</td></tr>
+      <tr><td class="k"><kbd>Z</kbd></td><td>Zoom to fit the whole trace. Also the "undo" for a mouse drag-zoom.</td></tr>
+      <tr><td class="k"><kbd>W</kbd></td><td>Zoom to the A↔B cursor span.</td></tr>
+      <tr><td class="k"><kbd>Home</kbd> / <kbd>End</kbd></td><td>Jump the window (and cursor A) to the start / end of the trace.</td></tr>
+      <tr><td class="k"><kbd>PgUp</kbd> / <kbd>PgDn</kbd></td><td>Page through the signal list.</td></tr>
+      <tr><td class="k"><kbd>g</kbd><kbd>g</kbd> · <kbd>G</kbd></td><td>First / last signal in the current scope level (vim-style).</td></tr>
+      <tr><td class="k"><kbd>g</kbd><kbd>t</kbd></td><td>Go to time (prompts; accepts raw ticks).</td></tr>
+      <tr><td class="k"><kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd></td><td>Jump to the previous / next module (scope boundary).</td></tr>
+      <tr><td class="k"><kbd>Shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd></td><td>Collapse / expand the focused signal's scope.</td></tr>
+      <tr><td class="k"><kbd>{</kbd> · <kbd>}</kbd></td><td>Collapse all first-level sub-scopes (root signals stay visible) · expand everything.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ══════════════════ KEYS: CURSORS ══════════════════ -->
+<section id="keys-cursor">
+  <h2>Cursors, markers &amp; measurement</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><kbd>c</kbd></td><td>Toggle cursor display.</td></tr>
+      <tr><td class="k"><kbd>1</kbd> · <kbd>2</kbd></td><td>Activate cursor A · cursor B. With both on, the status bar live-computes <b>ΔAB</b>, frequency (via the trace timescale) and the focused signal's transitions in the span.</td></tr>
+      <tr><td class="k"><kbd>S</kbd></td><td>Snap the cursor to the nearest edge of the focused signal.</td></tr>
+      <tr><td class="k"><kbd>]</kbd> · <kbd>[</kbd></td><td>Jump to next / previous edge of the focused signal.</td></tr>
+      <tr><td class="k"><kbd>e</kbd></td><td>Edge-to-edge measure: pick two edges interactively, get the distance.</td></tr>
+      <tr><td class="k"><kbd>m</kbd> · <kbd>M</kbd></td><td>Place a labelled marker at the cursor · clear all markers.</td></tr>
+      <tr><td class="k"><kbd>&lt;</kbd>/<kbd>,</kbd> · <kbd>&gt;</kbd>/<kbd>.</kbd></td><td>Jump to previous · next marker.</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>;stats</b> — the deep measurement. Focus a signal, optionally set cursors A and B, then run <code>;stats</code>: transitions, median rise-to-rise period + frequency, cycle count and duty for 1-bit signals; numeric min/max for buses and reals. Scope is A‥B when both cursors are on, else the visible window.</div>
+</section>
+
+<!-- ══════════════════ KEYS: SEARCH ══════════════════ -->
+<section id="keys-search">
+  <h2>Search: the fuzzy finder &amp; friends</h2>
+  <p class="lead"><kbd>/</kbd> opens an fzf-style overlay that filters <em>every signal in the file</em> live — not just the displayed ones. It is also "go to signal": an already-displayed match is jumped to instead of re-added.</p>
+  <div class="cols2">
+    <div class="tblwrap"><table>
+      <thead><tr><th colspan="2">Inside the finder</th></tr></thead>
+      <tbody>
+        <tr><td class="k">type</td><td>Filter live. Space separates AND-terms; each term matches as a substring or a scattered subsequence — <code>cwe</code> finds <code>cpu.wr_en</code>. Word-boundary and leaf-name matches rank first; shorter names win ties.</td></tr>
+        <tr><td class="k"><kbd>↑</kbd><kbd>↓</kbd> / <kbd>Ctrl</kbd>+<kbd>P</kbd>/<kbd>N</kbd></td><td>Move the highlight.</td></tr>
+        <tr><td class="k"><kbd>Tab</kbd></td><td>Mark for multi-select (▪), advance.</td></tr>
+        <tr><td class="k"><kbd>Enter</kbd></td><td>Add marked/highlighted signals, jump to the first (unfolds its group if collapsed), close. Seeds <kbd>n</kbd>.</td></tr>
+        <tr><td class="k"><kbd>Ctrl</kbd>+<kbd>U</kbd> · <kbd>Ctrl</kbd>+<kbd>W</kbd></td><td>Clear query · delete last word.</td></tr>
+        <tr><td class="k"><kbd>Esc</kbd></td><td>Cancel without changes.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tblwrap"><table>
+      <thead><tr><th colspan="2">Other search keys</th></tr></thead>
+      <tbody>
+        <tr><td class="k"><kbd>n</kbd></td><td>Cycle to the next displayed match of the last finder query.</td></tr>
+        <tr><td class="k"><kbd>f</kbd></td><td>Find a value on the focused signal (e.g. <code>3F</code>, <code>0x3F</code>) — cursor jumps to the next occurrence, wrapping.</td></tr>
+        <tr><td class="k"><kbd>P</kbd></td><td>Pattern trigger across signals: <code>clk=1 &amp; enable=1 &amp; state=0x3</code> — cursor jumps to the next time all hold.</td></tr>
+        <tr><td class="k"><code>;when EXPR</code></td><td>Boolean expression search with full operators: <code>valid &amp;&amp; state==3 &amp;&amp; addr&gt;=0x40</code>.</td></tr>
+        <tr><td class="k"><code>;glitches</code></td><td>Jump to the next x-hazard / zero-width / runt pulse.</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <p style="margin-top:12px">Finder performance: re-ranking 50 000 names takes ~15 ms, and extending a query only re-ranks the previous matches — filtering is effectively instant per keystroke.</p>
+</section>
+
+<!-- ══════════════════ KEYS: SIGNALS ══════════════════ -->
+<section id="keys-signals">
+  <h2>Managing the signal list</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><kbd>s</kbd></td><td>Toggle the split panel (scope tree + per-scope signal list).</td></tr>
+      <tr><td class="k"><kbd>B</kbd></td><td>Full-screen scope tree browser: <kbd>↑↓</kbd> navigate, <kbd>→</kbd>/<kbd>←</kbd> expand/collapse, <kbd>Space</kbd> check a signal or a whole scope in/out of the display, <kbd>t</kbd>/<kbd>T</kbd> tag signals / load a tag file, <kbd>B</kbd>/<kbd>Esc</kbd> close.</td></tr>
+      <tr><td class="k"><kbd>Tab</kbd></td><td>Panel open: switch panel↔waveform focus. Panel closed: fold/unfold the focused <em>group header</em> (does nothing on a plain signal).</td></tr>
+      <tr><td class="k"><kbd>V</kbd></td><td>Visual line-select mode; <kbd>↑↓</kbd> extends. Basis for grouping and bulk removal.</td></tr>
+      <tr><td class="k"><kbd>Space</kbd></td><td>Toggle-highlight the focused signal (scattered multi-select).</td></tr>
+      <tr><td class="k"><kbd>J</kbd> / <kbd>K</kbd></td><td>Move the focused signal down / up in the list.</td></tr>
+      <tr><td class="k"><kbd>d</kbd> · <kbd>Backspace</kbd></td><td>Remove the focused signal · remove the whole selection.</td></tr>
+      <tr><td class="k"><kbd>u</kbd></td><td><b>Undo</b> — one stack for every layout/styling change: removes (single and bulk), moves, finder adds, radix/color/height cycles, analog toggles, group edits. Flashes what it undid.</td></tr>
+      <tr><td class="k"><kbd>x</kbd></td><td>Expand a bus into per-bit virtual lanes.</td></tr>
+      <tr><td class="k"><kbd>F</kbd></td><td>Decompose a float bus into IEEE-754 sign / exponent / mantissa / value lanes (f16/f32/f64).</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ══════════════════ GROUPS ══════════════════ -->
+<section id="groups">
+  <h2>Groups — collapsible, nestable</h2>
+  <p class="lead">Bundle related signals under a named header row that folds with <kbd>Tab</kbd>. Groups are an overlay: the canonical signal order is untouched.</p>
+  <pre class="block"><code><span class="cm"># 1. select members</span>
+V            <span class="cm"># visual mode on the first signal, ↑↓ to extend</span>
+<span class="cm"># 2. create</span>
+;group Handshake             <span class="cm"># top-level group</span>
+;group Interface/Handshake   <span class="cm"># same, nested under "Interface" (auto-created)</span>
+<span class="cm"># 3. operate</span>
+Tab          <span class="cm"># on the ▼/▶ header: fold / unfold</span>
+;ungroup     <span class="cm"># dissolve (focused header, or ;ungroup NAME) — children re-attach to its parent</span>
+u            <span class="cm"># undo any group edit</span></code></pre>
+  <ul>
+    <li>Headers render as <code>▼ name (n)</code>; nested headers indent by depth and show child counts (<code>2▸</code>).</li>
+    <li>Collapsing a parent hides child headers <em>and</em> their members; collapsing a child leaves the parent open.</li>
+    <li>Nesting cycles are rejected; empty leafless parent nodes are pruned automatically.</li>
+    <li>Groups persist through <code>;session</code>, saved arrangements, and undo snapshots.</li>
+  </ul>
+</section>
+
+<!-- ══════════════════ KEYS: DISPLAY ══════════════════ -->
+<section id="keys-display">
+  <h2>Display &amp; styling</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Key</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><kbd>r</kbd> · <kbd>R</kbd></td><td>Cycle the global radix · the focused signal's own radix (bin / hex / dec / unsigned / f16 / f32 / f64).</td></tr>
+      <tr><td class="k"><kbd>a</kbd></td><td>Toggle analog rendering for the focused signal (line graph instead of bits).</td></tr>
+      <tr><td class="k"><kbd>H</kbd></td><td>Cycle signal height 1–4 rows. Multi-row analog gets real vertical resolution.</td></tr>
+      <tr><td class="k"><kbd>w</kbd></td><td>Wave style: ultra-thin → thin → <b>hi-res</b>. Hi-res doubles horizontal resolution for bits (sub-cell ▀▄▚▞) and draws multi-row analog as a <b>braille curve</b> (2×4 sub-pixels per cell) — see the ADC in the hero above.</td></tr>
+      <tr><td class="k"><kbd>v</kbd></td><td>Cycle a per-signal color (6 user colors + default).</td></tr>
+      <tr><td class="k"><kbd>L</kbd></td><td>Bus value label size: hidden / compact (4 chars) / full.</td></tr>
+      <tr><td class="k"><kbd>t</kbd> · <kbd>Enter</kbd></td><td>Toggle at-cursor value column · full vs short signal names.</td></tr>
+      <tr><td class="k"><kbd>i</kbd></td><td>Indent names by scope depth.</td></tr>
+      <tr><td class="k"><kbd>(</kbd> <kbd>)</kbd> · <kbd>|</kbd></td><td>Shrink/grow the name column · cycle row spacing (0 → 0.25 → 0.5 → 1 → 2 → 3).</td></tr>
+      <tr><td class="k"><kbd>T</kbd> · <kbd>Q</kbd></td><td>Ruler in time units vs raw ticks · grid off / vertical / both.</td></tr>
+      <tr><td class="k"><kbd>\</kbd> · <kbd>C</kbd></td><td>Cycle built-in themes · show the color legend.</td></tr>
+      <tr><td class="k"><kbd>D</kbd></td><td>Load a translation JSON (enum decode: raw value → state name shown on the wave).</td></tr>
+      <tr><td class="k"><kbd>I</kbd></td><td>Protocol decode menu: SPI, I²C, UART overlays on the selected signals.</td></tr>
+      <tr><td class="k"><kbd>p</kbd> · <kbd>`</kbd></td><td>RISC-V register panel · ISA trace query prompt.</td></tr>
+      <tr><td class="k"><kbd>A</kbd></td><td>Add a time-anchored annotation (saved to the notes sidecar).</td></tr>
+      <tr><td class="k"><kbd>F5</kbd></td><td>Live reload: watch the file and re-parse on change; <code>;follow</code> instead tails appended changes incrementally and auto-scrolls.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ══════════════════ MOUSE ══════════════════ -->
+<section id="mouse">
+  <h2>Mouse</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Gesture</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td class="k">Click</td><td>Place the active cursor at that time; focus that row.</td></tr>
+      <tr><td class="k">Drag</td><td><b>Drag-to-zoom</b>: hold and sweep a time range — the band inverts live — release to zoom to it. Under 3 columns counts as a click. <kbd>Z</kbd> fits back out; drag jumps are in the zoom history.</td></tr>
+      <tr><td class="k">Right-click</td><td>Drop a marker at that time.</td></tr>
+      <tr><td class="k">Scroll ↑ / ↓</td><td>Zoom in / out, centered on the pointer.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ══════════════════ COMMAND LINE ══════════════════ -->
+<section id="cmdline">
+  <h2>The <code>;</code> command line</h2>
+  <p class="lead">Press <kbd>;</kbd>, type a command. Unrecognized input falls through to the Tcl engine, so <code>;puts [signals]</code> works too.</p>
+
+  <h3>View &amp; navigation</h3>
+  <div class="tblwrap"><table><tbody>
+    <tr><td class="k"><code>zoom A B</code></td><td>Set the window to [A‥B] (ticks).</td></tr>
+    <tr><td class="k"><code>fit</code></td><td>Zoom to the whole trace.</td></tr>
+    <tr><td class="k"><code>goto T</code></td><td>Move the cursor to time T.</td></tr>
+    <tr><td class="k"><code>find PAT</code></td><td>Focus a signal by name pattern — among those <em>already displayed</em>.</td></tr>
+    <tr><td class="k"><code>add PAT…</code></td><td>Put signals on screen: <code>add top.valid top.ready</code>, <code>add top.alu.*</code>. This is how a script or agent changes which signals are shown; the interactive routes are <kbd>/</kbd> and <kbd>B</kbd>.</td></tr>
+    <tr><td class="k"><code>remove PAT…</code> · <code>rm</code></td><td>Take signals off screen. Both are undoable with <kbd>u</kbd>.</td></tr>
+    <tr><td class="k"><code>grid</code> · <code>spacing</code> · <code>names</code> · <code>tree</code></td><td>Toggle grid · cycle spacing · full/short names · open the tree browser.</td></tr>
+  </tbody></table></div>
+
+  <h3>Analysis</h3>
+  <div class="tblwrap"><table><tbody>
+    <tr><td class="k"><code>when EXPR</code> / <code>match</code></td><td>Jump to where a boolean expression over signals becomes true: <code>when valid &amp;&amp; state==3 &amp;&amp; addr&gt;=0x40</code>. Operators <code>&amp;&amp; || ! == != &lt; &lt;= &gt; &gt;=</code>, literals decimal/<code>0x</code>/<code>0b</code>/<code>x</code>/<code>z</code>.</td></tr>
+    <tr><td class="k"><code>glitches</code></td><td>Jump to the next x-hazard or zero-width/runt pulse.</td></tr>
+    <tr><td class="k"><code>derive N=E</code></td><td>Create a virtual signal from an expression: <code>derive bus=(a1&lt;&lt;1)|a0</code>.</td></tr>
+    <tr><td class="k"><code>stats</code> / <code>measure</code></td><td>One-line measurement of the focused signal over A‥B or the window (period, frequency, duty, min/max…).</td></tr>
+    <tr><td class="k"><code>formal</code> / <code>cex</code></td><td>Formal counter-example analyzer: finds assertion-style signals and marks the failure time.</td></tr>
+    <tr><td class="k"><code>power</code></td><td>Switching-activity (power) heatmap estimate.</td></tr>
+    <tr><td class="k"><code>axi</code> · <code>wb</code> · <code>ahb</code></td><td>Decode AXI / Wishbone / AHB bus transactions.</td></tr>
+    <tr><td class="k"><code>trace</code> · <code>query</code></td><td>Build the RISC-V instruction trace · query it.</td></tr>
+    <tr><td class="k"><code>diff</code></td><td>Toggle comparison against a second trace: differing regions get a second row + highlighted ranges.</td></tr>
+  </tbody></table></div>
+
+  <h3>Layout, persistence &amp; misc</h3>
+  <div class="tblwrap"><table><tbody>
+    <tr><td class="k"><code>group NAME</code> · <code>group P/C</code> · <code>ungroup [NAME]</code></td><td>Group the selection (nested with a path) · dissolve.</td></tr>
+    <tr><td class="k"><code>session [save]</code> · <code>session load</code> · <code>session clear</code></td><td>Whole-session sidecar — see <a href="#session">Sessions</a>.</td></tr>
+    <tr><td class="k"><code>loadgtkw F</code> · <code>savegtkw F</code></td><td>GTKWave <code>.gtkw</code> interop: apply / write a save file (signal list + radixes).</td></tr>
+    <tr><td class="k"><code>radix R</code> · <code>theme T</code></td><td>Set global radix · switch theme by name or load a theme JSON path.</td></tr>
+    <tr><td class="k"><code>decode F</code></td><td>Load a decode/translation JSON file.</td></tr>
+    <tr><td class="k"><code>follow</code></td><td>Live-tail a growing dump (running simulation) with auto-scroll.</td></tr>
+    <tr><td class="k"><code>bookmark</code>/<code>bm</code> · <code>gb</code> · <code>bookmarks</code> · <code>savebm</code></td><td>Create / jump to / list / save bookmarks.</td></tr>
+    <tr><td class="k"><code>annotate</code> · <code>annotations</code> · <code>saveann</code> · <code>hideann</code></td><td>Time-anchored notes: add / list / save / hide.</td></tr>
+    <tr><td class="k"><code>tags</code> · <code>autotag</code> · <code>savetags</code></td><td>ISA-role signal tags: list / auto-detect / save.</td></tr>
+    <tr><td class="k"><code>export</code></td><td>Open the export menu (same as <kbd>E</kbd>).</td></tr>
+    <tr><td class="k"><code>tcl</code> · <code>eval CMD</code></td><td>Open the Tcl prompt · run one Tcl command.</td></tr>
+    <tr><td class="k"><code>manual</code>/<code>man</code> · <code>help</code> · <code>quit</code>/<code>q</code></td><td>Manual · command list · exit.</td></tr>
+  </tbody></table></div>
+</section>
+
+<!-- ══════════════════ TCL ══════════════════ -->
+<section id="tcl">
+  <h2>Tcl scripting <span class="chip">:</span></h2>
+  <p class="lead">Press <kbd>:</kbd> for a small GTKWave-flavoured Tcl engine — enough to script view setup and batch measurements. Commands:</p>
+  <pre class="block"><code>add_signal &lt;glob&gt;      remove_signal &lt;glob&gt;    signals [glob]
+zoom &lt;a&gt; &lt;b&gt;           zoom_fit                goto &lt;t&gt;
+cursor &lt;t&gt;             marker &lt;t&gt; [label]      radix &lt;r&gt; [signal]
+analog &lt;signal&gt;        expand &lt;bus&gt;            translate &lt;file&gt;
+measure &lt;signal&gt;       export_csv &lt;file&gt;       screenshot &lt;file&gt;
+theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variables &amp; loops</span></code></pre>
+  <p>Example — arrange a debug view in one line: <code>:foreach s [signals cpu.*] { add_signal $s }</code></p>
+</section>
+
+<!-- ══════════════════ SESSIONS ══════════════════ -->
+<section id="session">
+  <h2>Sessions &amp; sidecar files</h2>
+  <p class="lead">Everything persistent lives in small JSON sidecars next to the trace (never inside it), plus one global cache and one global config.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>File</th><th>What it holds</th><th>Written by</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><code>&lt;trace&gt;.alwavelets_session.json</code></td><td><b>The whole session</b>: display order, groups (incl. nesting), analog flags, global + per-signal radixes, colors, heights, markers, zoom window, cursors, name width, spacing, grid, wave style, theme. <b>Auto-restores on the next open</b> of that trace.</td><td><code>;session</code></td></tr>
+      <tr><td class="k"><code>&lt;trace&gt;.alwavelets_bookmarks.json</code></td><td>Named time bookmarks.</td><td><code>;savebm</code></td></tr>
+      <tr><td class="k"><code>&lt;trace&gt;.alwavelets_notes.json</code></td><td>Time-anchored annotations.</td><td><code>;saveann</code> / <kbd>A</kbd></td></tr>
+      <tr><td class="k">arrangement <code>.json</code></td><td>Portable layout (order, groups, radix, markers) at a path you choose — reusable across traces with matching signal ids.</td><td><kbd>E</kbd>&nbsp;→&nbsp;<code>a</code> / load with <code>l</code></td></tr>
+      <tr><td class="k"><code>*.gtkw</code></td><td>GTKWave save file (signal list + radixes) for interop both ways.</td><td><code>;savegtkw</code></td></tr>
+      <tr><td class="k"><code>~/.cache/alwavelets/*.wlc</code></td><td>Binary parse cache validated against file size + mtime — an unchanged 51&nbsp;MB VCD reopens in ~0.15&nbsp;s. Disable per-run with <code>--no-cache</code>.</td><td>automatic</td></tr>
+      <tr><td class="k"><code>~/.config/alwavelets/config.json</code></td><td>Startup defaults + key remaps — see below.</td><td>you</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout"><b>Session flow.</b> Arrange your debug view once, run <code>;session</code>, quit. Next <code>alwavelets.py trace.vcd</code> reopens exactly where you left off — the status bar confirms <em>"Session restored"</em>. <code>;session clear</code> forgets it; stale entries (renamed signals) are silently dropped rather than failing.</div>
+</section>
+
+<!-- ══════════════════ THEMES ══════════════════ -->
+<section id="themes">
+  <h2>Themes &amp; configuration</h2>
+  <div class="cols2">
+    <div>
+      <h3>Themes</h3>
+      <p><kbd>\</kbd> cycles built-ins (dark, light, phosphor, …); <code>;theme &lt;name|file.json&gt;</code> loads by name or file. A theme JSON maps ~30 roles (HIGH, LOW, EDGE, BUS, CURSOR, MENU, …) to colors:</p>
+      <pre class="block"><code>{
+  "name": "Nord",
+  "HIGH":   ["#A3BE8C", -1],
+  "BUS":    ["#88C0D0", -1],
+  "CURSOR": ["#2E3440", "#88C0D0"],
+  "SELECT": ["#2E3440", "#A3BE8C"]
+}</code></pre>
+      <p>Colors are xterm-256 indices <em>or</em> <code>#rrggbb</code>. Hex resolves at the best fidelity the terminal offers: exact RGB on direct-color terminfo → redefined palette slots where the palette is writable → nearest-256 quantization. <code>theme_nord.json</code> ships as a full true-color example; <code>theme_solarized.json</code> as an indexed one.</p>
+    </div>
+    <div>
+      <h3>config.json</h3>
+      <p>Optional, at <code>~/.config/alwavelets/config.json</code> (or <code>$XDG_CONFIG_HOME</code>). Every key optional; malformed files never block startup.</p>
+      <pre class="block"><code>{
+  "theme": "phosphor",
+  "radix": "hex",
+  "wave_style": 2,        <span class="cm">// 0 thin … 2 hi-res</span>
+  "menu_bar": false,
+  "grid": 1,
+  "name_width": 28,
+  "keys": {               <span class="cm">// remap by action name</span>
+    "quit": "Q",
+    "zoom_in": "=",
+    "toggle_cursor": " "
+  }
+}</code></pre>
+      <p>Action names are the handler names — <code>quit</code>, <code>zoom_in</code>, <code>next_edge</code>, <code>toggle_panel</code>, … (any <code>_kb_*</code> with the prefix dropped).</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════ EXPORT ══════════════════ -->
+<section id="export">
+  <h2>Export &amp; graphics</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Output</th><th>How</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="k">CSV</td><td><kbd>E</kbd>→<code>c</code></td><td>Time/value table of the visible window.</td></tr>
+      <tr><td class="k">SVG</td><td><kbd>X</kbd> or <kbd>E</kbd>→<code>v</code></td><td>Vector snapshot of the current view; theme-aware.</td></tr>
+      <tr><td class="k">PDF</td><td><kbd>E</kbd>→<code>p</code></td><td>Single-page PDF, hand-written writer (still zero deps).</td></tr>
+      <tr><td class="k">Text screenshot</td><td><kbd>E</kbd>→<code>s</code></td><td>The screen as plain Unicode text.</td></tr>
+      <tr><td class="k">Pixel image</td><td><kbd>E</kbd>→<code>i</code></td><td>Waveform rasterized to PNG and shown <em>inline in the terminal</em> on kitty / iTerm2 / sixel; falls back to saving the PNG.</td></tr>
+      <tr><td class="k">Arrangement</td><td><kbd>E</kbd>→<code>a</code>/<code>l</code>/<code>t</code></td><td>Save / load layout · load theme.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ══════════════════ MCP ══════════════════ -->
+<section id="mcp">
+  <h2>MCP server — connect an LLM <span class="chip acc">service</span></h2>
+  <p class="lead">Alwavelets speaks the Model Context Protocol natively (stdio, newline-delimited JSON-RPC 2.0, protocol <code>2024-11-05</code>) — implemented in the stdlib, no SDK. Any MCP client (Claude Code, Claude Desktop, agent frameworks) can open traces and interrogate them through seven tools. Parsed traces are cached per file+mtime, so repeated queries are instant.</p>
+
+  <h3>Hook-up</h3>
+  <div class="cols2">
+    <div>
+      <p><b>Claude Code</b> (one line):</p>
+      <pre class="block"><code>claude mcp add alwavelets -- \
+  python3 /path/to/alwavelets.py --mcp</code></pre>
+    </div>
+    <div>
+      <p><b>Claude Desktop</b> — <code>claude_desktop_config.json</code>:</p>
+      <pre class="block"><code>{
+  "mcpServers": {
+    "alwavelets": {
+      "command": "python3",
+      "args": ["/path/to/alwavelets.py", "--mcp"]
+    }
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <h3>Tool reference</h3>
+  <p>Common conventions: <code>file</code> is a VCD/FST path (required everywhere); <code>signals</code> is a list of names or globs (<code>top.alu.*</code>); <code>start</code>/<code>end</code> accept ticks or unit strings like <code>"500ns"</code>, <code>"1.5us"</code> and default to the trace extent; <code>arrangement</code> points at a saved arrangement JSON to supply the signal list + radixes.</p>
+  <div class="cards">
+    <div class="card"><h4>render_waveform</h4><p>Unicode-text waveform of the given signals over a window — directly readable by the model.</p>
+      <table><tbody><tr><td class="k"><code>width</code></td><td>character width, default 100</td></tr><tr><td class="k"><code>radix</code></td><td>bin | hex | dec | unsigned</td></tr></tbody></table></div>
+    <div class="card"><h4>render_waveform_svg</h4><p>Same snapshot as inline SVG image content (vision-capable clients render it).</p>
+      <table><tbody><tr><td class="k"><code>width</code></td><td>pixel width, default 900</td></tr><tr><td class="k"><code>theme</code></td><td>dark | light | phosphor | theme-JSON path</td></tr></tbody></table></div>
+    <div class="card"><h4>render_waveform_png</h4><p>Pixel-accurate PNG raster of the window, inline image content.</p>
+      <table><tbody><tr><td class="k"><code>width</code></td><td>pixel width, default 900</td></tr><tr><td class="k"><code>radix</code></td><td>bin | hex | dec | unsigned</td></tr></tbody></table></div>
+    <div class="card"><h4>list_signals</h4><p>Discover signal full-names, optionally glob-filtered.</p>
+      <table><tbody><tr><td class="k"><code>pattern</code></td><td>glob, default <code>*</code></td></tr><tr><td class="k"><code>limit</code></td><td>max names, default 200</td></tr></tbody></table></div>
+    <div class="card"><h4>measure</h4><p>Per-signal stats over a window — transition count, period, frequency — plus the edge-to-edge delta between the first two signals.</p>
+      <table><tbody><tr><td class="k"><code>signals</code></td><td>required</td></tr></tbody></table></div>
+    <div class="card"><h4>find_when</h4><p>Times where a boolean expression becomes true: <code>"valid &amp;&amp; state==3 &amp;&amp; addr&gt;=0x40"</code>. Operators <code>&amp;&amp; || ! == != &lt; &lt;= &gt; &gt;=</code>, parentheses; literals decimal/0x/0b/x/z.</p>
+      <table><tbody><tr><td class="k"><code>expr</code></td><td>required</td></tr><tr><td class="k"><code>limit</code></td><td>max matches, default 50</td></tr></tbody></table></div>
+    <div class="card"><h4>find_glitches</h4><p>Anomaly sweep: transitions into <code>x</code> and zero-width / runt pulses, across all or chosen signals.</p>
+      <table><tbody><tr><td class="k"><code>max_pulse</code></td><td>runt threshold in ticks; default auto per signal (~⅓ detected period)</td></tr></tbody></table></div>
+  </div>
+
+  <h3>On the wire</h3>
+  <p>One JSON-RPC message per line on stdin/stdout. A complete exchange:</p>
+  <pre class="block"><code><span class="cm">→</span> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}
+<span class="cm">←</span> {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"alwavelets","version":"0.1.0"}, …}}
+<span class="cm">→</span> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+      "name":"find_when",
+      "arguments":{"file":"bench.vcd","expr":"fifo_full && wr_en","limit":5}}}
+<span class="cm">←</span> {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text",
+      "text":"3 time(s) where 'fifo_full && wr_en' becomes true:\n  1.24us\t(t=1240) …"}],
+      "isError":false}}</code></pre>
+  <p>Tool failures come back as <code>isError: true</code> content (not protocol errors), so the model can read the message and self-correct — e.g. a mistyped signal name.</p>
+
+  <h3>What to ask the model</h3>
+  <ul>
+    <li>"Open <code>bench.vcd</code>, list the FIFO signals, and find when <code>fifo_full &amp;&amp; wr_en</code> first happens" — chains <code>list_signals → find_when</code>.</li>
+    <li>"Show me 200 ns around the first overflow" — <code>find_when → render_waveform</code> with a computed window.</li>
+    <li>"Any glitches or x-propagation in the ALU?" — <code>find_glitches</code> with <code>signals: ["top.alu.*"]</code>.</li>
+    <li>"Is the core clock really 100 MHz across the whole run?" — <code>measure</code> on <code>clk</code>.</li>
+  </ul>
+  <h3>Live-viewer tools <span class="chip acc">drives your screen</span></h3>
+  <p>The seven tools above are <b>headless</b> — they parse a trace of their own and know nothing about what you have open. These five attach to a <em>running</em> viewer started with <code>--control</code>, so an MCP client can drive the session in front of you with no extra plumbing. They're a thin proxy over the same socket documented in <a href="#control">Agent control</a> — one implementation, two transports.</p>
+  <div class="cards">
+    <div class="card"><h4>list_viewer_sessions</h4><p>Which running viewers can be driven. Call it first when the user talks about "my screen", or when another <code>viewer_*</code> tool reports several open.</p></div>
+    <div class="card"><h4>viewer_state</h4><p>Read-only: window, cursors, focused/displayed signals, groups, markers, radix. Returns a compact summary rather than raw JSON.</p></div>
+    <div class="card"><h4>viewer_render</h4><p>Read-only: the current view as Unicode waveforms — literally what the user is looking at. Use it to answer screen questions and to confirm a change landed.</p></div>
+    <div class="card"><h4>viewer_command</h4><p>Runs one <code>;</code> command and returns the new state. <code>when valid &amp;&amp; ready</code>, <code>zoom</code>, <code>group A/B</code>, <code>stats</code>, <code>glitches</code>… The acting tool.</p></div>
+    <div class="card"><h4>viewer_key</h4><p>Keystrokes for key-only actions: <code>x</code> expand a bus, <code>a</code> analog, <code>w</code> wave style, <code>tab</code> fold a group, <code>u</code> undo.</p></div>
+  </div>
+  <p>All five take an optional <code>session</code> (a pid or trace filename). With one viewer open it's inferred; with several the tool <b>refuses to guess</b> and lists the choices — silently steering the wrong window would be the worst failure mode here. With none open, the error tells the agent to ask you to start one with <code>--control</code>.</p>
+
+  <div class="callout"><b>Which family to use.</b> Analyzing a file nobody has open → the headless tools. The user is looking at something and describes what they want done → the <code>viewer_*</code> tools.</div>
+</section>
+
+<!-- ══════════════════ AGENT CONTROL ══════════════════ -->
+<section id="control">
+  <h2>Agent control of a live session <span class="chip acc">service</span></h2>
+  <p class="lead">The direct socket protocol behind the <code>viewer_*</code> MCP tools above — use this when your agent isn't an MCP client, or wants a persistent connection. Start a viewer with <code>--control</code> and an authorized local agent can drive <em>that exact session</em> while you watch — group signals, jump the cursor to where an expression holds, zoom, restyle — and read back both the view state and the waveform on your screen. Built for exactly this: describe what you want to your agent, watch your own viewer do it.</p>
+
+  <h3>Turning it on</h3>
+  <pre class="block"><code>python3 alwavelets.py bench.vcd --control     <span class="cm"># your terminal / tmux pane</span>
+python3 alwavelets.py --list-sessions         <span class="cm"># how an agent finds it</span></code></pre>
+  <p>Nothing listens unless you pass <code>--control</code>. The status bar then shows who's driving: <code>◇ctl</code> armed but idle · <code>◆agent:1</code> connected · <code>◆AGENT</code> acted within the last two seconds.</p>
+
+  <h3>Protocol</h3>
+  <p>Each session publishes a <b>0600</b> descriptor (socket path + per-session token) under <code>$XDG_RUNTIME_DIR/alwavelets/sessions/&lt;pid&gt;.json</code>. The agent connects to the Unix socket and exchanges one JSON object per line.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Op</th><th>Arguments</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td class="k"><code>ping</code></td><td>—</td><td>protocol version, trace, signal count</td></tr>
+      <tr><td class="k"><code>capabilities</code></td><td>—</td><td>ops + the <em>live</em> list of <code>;</code> verbs, generated from the viewer's own dispatch table so it can't drift</td></tr>
+      <tr><td class="k"><code>state</code></td><td>—</td><td>window, cursors + Δ, focused/displayed/selected signals, groups, markers, radix, last status message</td></tr>
+      <tr><td class="k"><code>render</code></td><td><code>width</code> 20–400</td><td>the current view as Unicode waveforms — what the user is seeing</td></tr>
+      <tr><td class="k"><code>command</code></td><td><code>text</code></td><td>runs one <code>;</code> command; returns its message and fresh state</td></tr>
+      <tr><td class="k"><code>key</code></td><td><code>keys</code> ≤64</td><td>feeds keystrokes for key-only actions (<code>x</code>, <code>a</code>, <code>w</code>, <code>tab</code>…)</td></tr>
+    </tbody>
+  </table></div>
+  <p>The first four never modify the view. <code>command</code> takes exactly what you'd type at the <code>;</code> prompt, so the agent's vocabulary is the same one documented above — nothing is duplicated, nothing can drift. Commands that would open an interactive prompt are no-ops over the channel rather than freezing the viewer for a keyboard nobody is at.</p>
+
+  <h3>Python client</h3>
+  <pre class="block"><code>from alwavelets.control import list_sessions, ControlClient
+
+session = next(s for s in list_sessions() if not s["stale"])
+with ControlClient(session) as c:
+    c.command("group Interface/Handshake")   <span class="cm"># organize the view</span>
+    r = c.command("when valid &amp;&amp; ready")      <span class="cm"># cursor lands on the match</span>
+    t = r["state"]["cursor"]["a"]
+    c.command(f"zoom {t-200} {t+200}")        <span class="cm"># frame it</span>
+    print(c.render(width=100)["text"])        <span class="cm"># see what the user sees</span></code></pre>
+
+  <div class="callout"><b>The contract lives in <code>SKILL.md</code></b> at the project root — frontmatter plus protocol, ops, command vocabulary, state schema, working method and worked recipes. Point your agent at that file rather than re-describing the API.</div>
+
+  <div class="callout warn"><b>Trust boundary.</b> Opt-in only; socket and descriptor are <code>0600</code> so just your account can reach them, and the token stops an unrelated process that merely guesses the path. Commands run with <b>your authority</b> — a few write files (<code>session</code>, <code>savegtkw</code>, Tcl <code>export_csv</code>). <code>command: "quit"</code> closes your viewer. The <code>◆AGENT</code> indicator exists so you can always see when something else is steering.</div>
+</section>
+
+<!-- ══════════════════ PYTHON API ══════════════════ -->
+<section id="pyapi">
+  <h2>Python API</h2>
+  <p class="lead">The same snapshot machinery the MCP server uses is importable directly — handy in scripts, notebooks and CI checks.</p>
+
+  <h3>Two lines in a REPL</h3>
+  <p>The quickest way to show what this does — no curses terminal, no file needed. <code>demo()</code> generates the built-in trace (cached after the first call), prints it, and hands back the parsed <code>VCDFile</code> so the session can continue:</p>
+  <pre class="block"><code>&gt;&gt;&gt; import alwavelets
+&gt;&gt;&gt; vcd = alwavelets.demo()
+waveform  [0ns .. 300ns]
+              ┬0ns          ┬60ns          ┬120ns         ┬180ns         ┬240ns
+top.clk       ▁││▁││││▁││││▁││││▁│││││▔││││▔││││▔│││││▁││││▁││││▁││││▁│││││▔││
+top.valid     ▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁│▔│▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁│▔▔│
+top.data_out  XXXXXXXX░░░╳96═════════╳B9══════════╳62═════════╳23═════════╳17═
+
+&gt;&gt;&gt; alwavelets.demo(signals=["top.adc"], end="1us")   <span class="cm"># pick signals / window</span>
+&gt;&gt;&gt; alwavelets.measure(vcd, ["top.clk"])              <span class="cm"># keep going with the trace</span></code></pre>
+
+  <h3>Full surface</h3>
+  <pre class="block"><code>import alwavelets
+
+vcd = alwavelets.parse_file("trace.vcd")                       <span class="cm"># VCD or FST</span>
+print(alwavelets.render_text(vcd, ["top.clk", "top.data*"],
+                          "0ns", "2us", width=100))          <span class="cm"># Unicode snapshot</span>
+svg = alwavelets.render_svg(vcd, ["top.*"], None, None)         <span class="cm"># vector snapshot</span>
+stats = alwavelets.measure(vcd, ["top.clk", "top.valid"])       <span class="cm"># period/freq/edges</span>
+names = alwavelets.list_signals(vcd, "cpu.*")                   <span class="cm"># discovery</span>
+
+sig = vcd.signals[names and vcd.signal_order[0]]             <span class="cm"># raw access:</span>
+sig.value_at(1500); sig.changes_in_window(0, 2000)           <span class="cm"># O(log n) reads</span></code></pre>
+  <p>Values are 4-state throughout (<code>0 1 x z</code>); buses return full-width bit strings, reals return numeric strings.</p>
+</section>
+
+<!-- ══════════════════ DEMO ══════════════════ -->
+<section id="demo">
+  <h2>Guided demo tour — five minutes</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>#</th><th>Do this</th><th>You learn</th></tr></thead>
+    <tbody>
+      <tr><td class="k">1</td><td><code>python3 alwavelets.py --demo</code>, then <kbd>s</kbd></td><td>Launch; close the split panel to see names, group headers and waves full-width.</td></tr>
+      <tr><td class="k">2</td><td><kbd>Tab</kbd> on <code>▼ Interface</code></td><td>Nested groups: the parent folds <em>Handshake</em> and <em>Data bus</em> away in one keystroke.</td></tr>
+      <tr><td class="k">3</td><td><kbd>/</kbd> then type <code>adc</code>, <kbd>Enter</kbd></td><td>The fuzzy finder jumps you to the ADC.</td></tr>
+      <tr><td class="k">4</td><td><kbd>w</kbd> <kbd>w</kbd></td><td>Hi-res style: the 3-row ADC becomes a smooth braille sine curve.</td></tr>
+      <tr><td class="k">5</td><td>drag across two sine periods</td><td>Drag-to-zoom; <kbd>Z</kbd> fits back out.</td></tr>
+      <tr><td class="k">6</td><td><kbd>1</kbd>, <kbd>]</kbd>, <kbd>2</kbd>, <kbd>]</kbd> on <code>clk</code>, then <code>;stats</code></td><td>Cursor measurement: ΔAB + frequency in the status bar, full stats on demand.</td></tr>
+      <tr><td class="k">7</td><td><code>;when valid &amp;&amp; ready</code></td><td>Expression search lands the cursor on the first handshake.</td></tr>
+      <tr><td class="k">8</td><td><code>;session</code>, quit, reopen</td><td>The whole arrangement comes back on its own.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>
+  ◆ Alwavelets field guide · generated from the source at <code>alwavelets/</code> (keymap, ui_commands, mcp_server, config) · in-app: <kbd>?</kbd> quick help / <kbd>F1</kbd> full manual / <kbd>C</kbd> color legend
+</footer>
+</main>
+</div>
+
+
+<script>
+(function () {
+  var root = document.documentElement,
+      btn  = document.getElementById('themeToggle'),
+      lbl  = document.getElementById('themeLabel'),
+      ico  = btn.querySelector('.tbtn-ico'),
+      MODES = ['auto', 'light', 'dark'],
+      FACE  = {auto: '\u25D0', light: '\u2600', dark: '\u263D'};
+
+  function apply(mode) {
+    if (mode === 'auto') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', mode);
+    lbl.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+    ico.textContent = FACE[mode];
+    btn.setAttribute('aria-label', 'Colour theme: ' + mode + '. Click to change.');
+    try { localStorage.setItem('alwavelets-theme', mode); } catch (e) {}
+  }
+
+  var saved;
+  try { saved = localStorage.getItem('alwavelets-theme'); } catch (e) {}
+  apply(MODES.indexOf(saved) >= 0 ? saved : 'auto');
+
+  btn.addEventListener('click', function () {
+    var cur = root.getAttribute('data-theme') || 'auto';
+    apply(MODES[(MODES.indexOf(cur) + 1) % MODES.length]);
+  });
+})();
+</script>
+</body>
+</html>

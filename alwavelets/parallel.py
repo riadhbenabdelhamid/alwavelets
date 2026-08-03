@@ -1,0 +1,202 @@
+"""Parallel VCD value-change parsing across processes (opt-in, large files).
+
+After the header is parsed, the value-change region is split into byte ranges
+aligned to '#timestamp' line boundaries; each worker process parses its range
+independently and returns compact per-signal arrays (array('q').tobytes() +
+packed bytes / a joined blob), which the parent concatenates in chunk order.
+
+This only speeds up the *first* full parse of a large file (the parse cache
+makes re-opens instant regardless). It is gated to fork-capable platforms and
+sizable VCDs, and every entry point falls back to the sequential parser on any
+problem, so correctness never depends on it.
+
+Caveats (documented, rare): a chunk assumes dumping is active at its start, so a
+$dumpoff/$dumpon region spanning a split is not modelled (such regions normally
+carry no value changes); $comment blocks spanning a split are likewise not
+special-cased.
+"""
+import array
+import os
+
+from .parsers import VCDFile, _BITBYTE, _compact_times
+
+
+def _split_points(filename, offset, size, n):
+    """Return up to n (start, end) byte ranges over [offset, size), each
+    starting at the beginning of a '#timestamp' line (the first range starts at
+    offset). Fewer ranges are returned if good split points aren't found."""
+    if n <= 1 or size - offset < 2:
+        return [(offset, size)]
+    bounds = [offset]
+    step = (size - offset) // n
+    with open(filename, 'rb') as f:
+        for i in range(1, n):
+            target = offset + i * step
+            if target <= bounds[-1]:
+                continue
+            f.seek(target)
+            f.readline()                       # discard the partial line
+            while True:
+                p = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if line[:1] == b'#':
+                    if p > bounds[-1]:
+                        bounds.append(p)
+                    break
+    bounds.append(size)
+    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1) if bounds[i] < bounds[i + 1]]
+
+
+def _worker(args):
+    """Parse [start, end) of `filename`; return (max_time, {id: (tbytes, vblob, scalar)})."""
+    import sys as _sys
+    filename, start, end, meta_items = args
+    meta = dict(meta_items)                     # id_bytes -> scalar(bool)
+    bitbyte = _BITBYTE
+    intern = _sys.intern
+    result = {}
+    rget = result.get
+    ct = 0
+    dump = True
+    mx = 0
+    with open(filename, 'rb') as f:
+        f.seek(start)
+        pos = start
+        for raw in f:
+            if pos >= end:
+                break
+            pos += len(raw)
+            c0 = raw[0]
+            if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
+                if dump:
+                    bid = raw[1:].rstrip()
+                    if meta.get(bid):          # scalar signal
+                        tv = rget(bid)
+                        if tv is None:
+                            tv = result[bid] = ([], [])
+                        tv[0].append(ct); tv[1].append(bitbyte[c0])
+                continue
+            if c0 == 35:                       # '#'
+                try:
+                    ct = int(raw[1:])
+                    if ct > mx:
+                        mx = ct
+                except ValueError:
+                    pass
+                continue
+            if c0 == 98 or c0 == 66 or c0 == 114 or c0 == 82:   # b/B/r/R
+                if dump:
+                    sp = raw.find(32, 1)
+                    if sp > 0:
+                        bid = raw[sp + 1:].rstrip()
+                        if meta.get(bid) is False:   # bus/real signal
+                            tv = rget(bid)
+                            if tv is None:
+                                tv = result[bid] = ([], [])
+                            v = raw[1:sp].decode('ascii', 'ignore')
+                            tv[0].append(ct); tv[1].append(intern(v) if len(v) < 64 else v)
+                continue
+            if c0 == 36:                       # '$'
+                line = raw.decode('ascii', 'ignore')
+                if line.startswith('$dumpoff'):
+                    dump = False
+                elif line.startswith('$dumpon'):
+                    dump = True
+                continue
+    out = {}
+    for bid, (ts, vs) in result.items():
+        tb = array.array('q', ts).tobytes()
+        if meta.get(bid):                       # scalar -> packed bytes
+            out[bid.decode('ascii', 'ignore')] = (tb, bytes(vs), True)
+        else:                                   # bus -> newline-joined blob
+            out[bid.decode('ascii', 'ignore')] = (tb, "\n".join(vs).encode('utf-8', 'replace'), False)
+    return mx, out
+
+
+def _fill_parallel(vcd, filename, offset, jobs):
+    """Parse the value region with `jobs` workers and fill vcd's signals.
+    Returns True on success, False to signal a fallback to sequential parsing."""
+    import multiprocessing as mp
+    import sys
+    size = os.path.getsize(filename)
+    n = min(jobs, mp.cpu_count() or jobs) if jobs else min(mp.cpu_count() or 1, 8)
+    ranges = _split_points(filename, offset, size, n)
+    if len(ranges) < 2:
+        return False
+    meta = [(k.encode('ascii'), (s.size == 1 and s.signal_type != 'real'))
+            for k, s in vcd.signals.items()]
+    tasks = [(filename, a, b, meta) for (a, b) in ranges]
+    ctx = mp.get_context('fork')
+    with ctx.Pool(len(ranges)) as pool:
+        parts = pool.map(_worker, tasks)       # ordered by chunk
+
+    pieces = {}
+    mx = 0
+    for cmx, part in parts:
+        if cmx > mx:
+            mx = cmx
+        for sid, triple in part.items():
+            pieces.setdefault(sid, []).append(triple)
+
+    intern = sys.intern
+    signals = vcd.signals
+    for sid, plist in pieces.items():
+        sig = signals.get(sid)
+        if sig is None:
+            continue
+        times = array.array('q')
+        if plist[0][2]:                         # scalar
+            vals = bytearray()
+            for tb, vb, _ in plist:
+                times.frombytes(tb); vals += vb
+        else:                                   # bus / real
+            strs = []
+            for tb, vb, _ in plist:
+                times.frombytes(tb)
+                if vb:
+                    strs.extend(vb.decode('utf-8', 'replace').split("\n"))
+            if sig._packed:                     # encode once; no interning needed
+                vals = sig._encode_values(strs)
+                if vals is None:                # unpackable value: string fallback
+                    sig._packed = False
+                    vals = [intern(s) for s in strs]
+            else:
+                vals = [intern(s) for s in strs]
+        sig._times = times
+        sig._values = vals
+    vcd.max_time = mx
+    _compact_times(vcd)
+    return True
+
+
+def parse_parallel_file(filename, jobs=None):
+    """Header-parse `filename`, then fill values in parallel. Returns a fully
+    loaded VCDFile, or None to fall back to the sequential parser."""
+    vcd, offset = VCDFile.parse_header(filename)
+    if not vcd.signal_order:
+        return None
+    return vcd if _fill_parallel(vcd, filename, offset, jobs) else None
+
+
+def viable(filename, jobs=None, min_size=16 * 1024 * 1024):
+    """True if parallel parsing is worth attempting for this file.
+
+    Opt-in only: returns False unless `jobs` >= 2 is given explicitly. Measured
+    speedup is modest and depends on core count + file size (it can even be
+    slower with few workers because the parsed data must be merged serially), so
+    parallelism is never enabled by default — no regression for the common case.
+    """
+    if not jobs or jobs < 2 or not hasattr(os, 'fork'):
+        return False
+    try:
+        if os.path.getsize(filename) < min_size:
+            return False
+        with open(filename, 'rb') as f:
+            if f.read(1)[:1] != b'$':           # VCD only (FST is binary)
+                return False
+    except OSError:
+        return False
+    import multiprocessing as mp
+    return (mp.cpu_count() or 1) > 1

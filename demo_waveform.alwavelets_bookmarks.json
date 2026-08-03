@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "bookmarks": [
+    {
+      "name": "startup",
+      "time_start": 0, "time_end": 200,
+      "cursor_a": 100, "cursor_on": true, "active_cursor": "a",
+      "signals": ["top.clk", "top.rst_n", "top.enable"],
+      "notes": "Initial reset sequence"
+    },
+    {
+      "name": "data_path",
+      "time_start": 500, "time_end": 1500,
+      "cursor_a": 1000, "cursor_on": true, "active_cursor": "a",
+      "signals": ["top.data_in", "top.data_out", "top.valid", "top.ready"],
+      "notes": "Focus on data flow"
+    }
+  ]
+}

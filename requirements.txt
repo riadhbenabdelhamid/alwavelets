@@ -1,0 +1,5 @@
+# Alwavelets runs on the Python 3 standard library only (curses, array, bisect…).
+# No third-party runtime dependencies.
+
+# Development / testing only:
+# pytest

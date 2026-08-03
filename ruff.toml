@@ -1,0 +1,24 @@
+# Ruff configuration for Alwavelets.
+#
+# We enable ruff's bug-finding rules rather than full style enforcement:
+# pyflakes ("F") catches unused imports, undefined names, redefinitions, and bad
+# format strings; "E9" catches syntax errors. Style rules (line length,
+# whitespace, naming) are deliberately left off to avoid drowning real findings
+# in cosmetic noise.
+#
+# The codebase is mid-refactor from a single module into the alwavelets/ package;
+# the transitional _monolith.py re-exports submodules via `from .x import *`, so
+# F403/F405 (star-import) are ignored until the split finishes and the
+# re-exports become explicit.
+
+target-version = "py39"
+line-length = 200
+
+[lint]
+select = ["E9", "F"]
+ignore = [
+    "F541",  # f-string without placeholders — many intentional banners/progress bars
+    "F841",  # pre-existing unused locals in legacy code; tighten incrementally
+    "F403",  # `from .x import *` — deliberate transitional re-exports (see above)
+    "F405",  # name may be undefined / from star imports — same transitional reason
+]

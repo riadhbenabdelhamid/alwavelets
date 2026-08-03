@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "annotations": [
+    {"time_start": 100, "time_end": 100, "signal": "top.clk", "text": "First rising edge observed", "category": "note"},
+    {"time_start": 500, "time_end": 600, "signal": "top.data_in", "text": "Suspicious value change", "category": "bug"},
+    {"time_start": 1200, "time_end": 1200, "signal": null, "text": "TODO: verify this matches spec", "category": "todo"}
+  ]
+}
