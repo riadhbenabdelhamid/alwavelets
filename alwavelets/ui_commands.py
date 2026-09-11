@@ -1,5 +1,6 @@
 """Command-line and TCL execution for Alwavelets: the ':' command line, its
 _cmd_* subcommands, TCL script execution, and translation/decode file loading."""
+import fnmatch
 import os
 
 from .core import *  # noqa: F401,F403
@@ -118,8 +119,14 @@ class CommandLineMixin:
             result = commands[verb]()
             if result:
                 self._show_message(str(result)[:self.width - 2])
+        elif verb in getattr(self.tcl, 'commands', {}):
+            # A Tcl-engine command (marker, add_signal, …). Most of them print
+            # nothing on success; say so instead of reporting them unknown —
+            # an agent on the control channel reads this message as the verdict.
+            result = self.tcl.execute(cmd)
+            self._show_message((result or f"{verb}: ok")[:self.width - 2])
         else:
-            # Fall through to Tcl for unrecognized commands
+            # Fall through to Tcl for anything else (variables, scripts)
             result = self.tcl.execute(cmd)
             if result:
                 self._show_message(result[:self.width - 2])
@@ -162,24 +169,30 @@ class CommandLineMixin:
         ]
         self._show_message(" | ".join(["help","zoom","fit","goto","find","radix","theme","export","diff","grid","tree","tcl","quit"]))
 
+    def _time_arg(self, text):
+        """A time in ticks ('220000') or with a unit ('220ns', '1.5us') —
+        the unit form is what a person or an agent naturally writes."""
+        from .snapshot import parse_time
+        return parse_time(self.vcd, text.strip())
+
     def _cmd_zoom_range(self, args):
         parts = args.split()
         if len(parts) >= 2:
             try:
-                self.time_start = int(parts[0])
-                self.time_end = int(parts[1])
+                self.time_start = self._time_arg(parts[0])
+                self.time_end = self._time_arg(parts[1])
             except ValueError:
-                self._show_message("Usage: zoom <start> <end>")
+                self._show_message("Usage: zoom <start> <end>   (ticks or e.g. 170ns 290ns)")
         else:
-            self._show_message("Usage: zoom <start> <end>")
+            self._show_message("Usage: zoom <start> <end>   (ticks or e.g. 170ns 290ns)")
 
     def _cmd_goto_time(self, args):
         try:
-            t = int(args.strip())
+            t = self._time_arg(args)
             self.cursor_time = t
             self._ensure_cursor_visible()
         except ValueError:
-            self._show_message("Usage: goto <time>")
+            self._show_message("Usage: goto <time>   (ticks or e.g. 220ns)")
 
     def _cmd_find_sig(self, args):
         pattern = args.strip().lower()
@@ -277,13 +290,30 @@ class CommandLineMixin:
         self._needs_layout = True
         self._show_message(f"Derived '{name}' ({sig.size}-bit, {sig.num_changes()} changes)")
 
+    def _signals_matching(self, patterns):
+        """Signal ids whose full or short name equals or globs any pattern, in
+        trace order — the same matching `add` uses."""
+        pats = [p.strip() for p in patterns if p and p.strip()]
+        out = []
+        for sid in self.vcd.signal_order:
+            sig = self.vcd.signals.get(sid)
+            if not sig:
+                continue
+            for p in pats:
+                if (fnmatch.fnmatch(sig.full_name, p) or fnmatch.fnmatch(sig.name, p)
+                        or p == sig.full_name or p == sig.name):
+                    out.append(sid)
+                    break
+        return out
+
     def _cmd_group(self, args):
         """group <name>: collapse-group the visual-mode selection (or focused
         signal) under <name>. 'group A/B' nests group B under group A (nested
         headers indent; collapsing A hides B). Fold with Tab on a header."""
-        name = args.strip()
+        words = args.split()
+        name = words[0] if words else ""
         if not name:
-            self._show_message("Usage: group <name> or <parent>/<name>  (select rows with V first)")
+            self._show_message("Usage: group <name> [signal|glob …] or <parent>/<name>  (or select rows with V first)")
             return
         parent = None
         if '/' in name:
@@ -292,7 +322,22 @@ class CommandLineMixin:
         if not name:
             self._show_message("Usage: group <name> or <parent>/<name>")
             return
-        members = list(self.selected_signals) if self.selected_signals else []
+        # Named members: 'group ptrs dut.rptr dut.wptr dut.rd_*' — what a script
+        # or an agent writes, since neither has a V key. Anything named but not
+        # yet on screen is added first, so the group is exactly what was asked.
+        members = self._signals_matching(words[1:]) if len(words) > 1 else []
+        if len(words) > 1 and not members:
+            self._show_message("group: nothing matched %s" % " ".join(words[1:]))
+            return
+        if members:
+            missing = [sid for sid in members if sid not in self._display_order_set]
+            if missing:
+                for sid in missing:
+                    self.display_order.append(sid)
+                    self._display_order_set.add(sid)
+                self._sync_display_set()
+        if not members:
+            members = list(self.selected_signals) if self.selected_signals else []
         if not members:
             sid = self.focused_signal_id()
             if sid:

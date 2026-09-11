@@ -52,7 +52,7 @@ def _viewer(w, tmp_path):
               "toggle_group_collapse", "_reindex_groups", "_rebuild_view_rows",
               "_group_chain", "_sync_display_set", "push_undo", "undo",
               "_undo_groups_snapshot", "zoom_fit_all", "_cmd_zoom_range",
-              "_cmd_goto_time", "_cmd_group", "_cmd_ungroup", "_cmd_help",
+              "_cmd_goto_time", "_time_arg", "_cmd_group", "_signals_matching", "_cmd_ungroup", "_cmd_help",
               "_ensure_cursor_visible", "cursor_delta", "cursor_time",
               "_focus_on"):
         attr = getattr(Alwavelets, m, None)
@@ -395,3 +395,45 @@ def test_internal_error_carries_a_stale_session_hint(w, tmp_path, monkeypatch):
         assert r["started"] > 0            # lets an agent judge session age
     finally:
         srv.stop()
+
+
+def test_group_by_name_over_the_channel(w, tmp_path):
+    """'group <name> sig…' takes explicit members (what an agent writes); a
+    member not yet displayed is added first."""
+    from alwavelets.control import handle
+    v = _viewer(w, tmp_path)
+    ids = list(v.vcd.signal_order[:2])
+    names = [v.vcd.signals[s].full_name for s in ids]
+    v.display_order = ids[1:]; v._display_order_set = set(ids[1:])   # first one not shown
+    r = handle(v, {"op": "command", "text": "group Ptrs " + " ".join(names)})
+    g = {x["name"]: x for x in r["state"]["groups"]}
+    assert set(g["Ptrs"]["members"]) == set(names)
+    assert v.vcd.signal_order[0] in v._display_order_set          # added on the way
+    r = handle(v, {"op": "command", "text": "group Nope no.such.signal"})
+    assert "nothing matched" in r["state"]["message"]
+
+
+def test_named_group_members_are_made_contiguous(w, tmp_path):
+    """Grouping the first and last displayed signal must pull them together
+    under the header instead of trapping the rows in between."""
+    from alwavelets.control import handle
+    v = _viewer(w, tmp_path)
+    if len(v.display_order) < 2:
+        return
+    a, b = v.display_order[0], v.display_order[-1]
+    names = [v.vcd.signals[a].full_name, v.vcd.signals[b].full_name]
+    handle(v, {"op": "command", "text": "group Pair " + " ".join(names)})
+    assert v.display_order[:2] == [a, b]
+    assert v.view_rows[0] == ("\x01hdr", "Pair") and v.view_rows[1:3] == [a, b]
+
+
+def test_goto_and_zoom_accept_unit_strings(w, tmp_path):
+    from alwavelets.control import handle
+    v = _viewer(w, tmp_path)
+    v.vcd.timescale_unit, v.vcd.timescale_number = "ps", 1
+    r = handle(v, {"op": "command", "text": "zoom 10ns 20ns"})
+    assert (v.time_start, v.time_end) == (10000, 20000)
+    handle(v, {"op": "command", "text": "goto 15ns"})
+    assert v.cursor_time == 15000
+    r = handle(v, {"op": "command", "text": "goto soon"})
+    assert "Usage: goto" in r["state"]["message"]

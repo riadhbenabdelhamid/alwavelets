@@ -4,7 +4,7 @@ import fnmatch
 import os
 import re
 
-from .core import Radix, TranslationMap
+from .core import Radix, TranslationMap, Marker
 
 
 # ══════════════════════════════════════════════════════════════
@@ -149,8 +149,13 @@ class TclEngine:
 
     def _cmd_marker(self, args):
         if len(args) >= 1:
-            t = int(args[0])
-            label = args[1] if len(args) > 1 else ""
+            try:
+                t = int(args[0])
+            except ValueError:
+                # "220ns" — a unit string, the form an agent naturally writes
+                from .snapshot import parse_time
+                t = parse_time(self.viewer.vcd, args[0])
+            label = " ".join(args[1:]) if len(args) > 1 else ""
             self.viewer.markers.append(Marker(t, label))
 
     def _cmd_radix(self, args):

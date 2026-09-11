@@ -865,6 +865,15 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                                 'collapsed': False, 'parent': None})
         self.groups.append({'name': name, 'members': mset,
                             'collapsed': False, 'parent': parent})
+        # A header spans the rows below it, so the members must sit together:
+        # gather them at the first member's slot, keeping their order. A V
+        # selection is contiguous already; named members ('group x a c') and
+        # a selection with gaps are not.
+        first = next((i for i, s in enumerate(self.display_order) if s in mset), None)
+        if first is not None:
+            picked = [s for s in self.display_order if s in mset]
+            rest = [s for s in self.display_order if s not in mset]
+            self.display_order = rest[:first] + picked + rest[first:]
         self._reindex_groups()
         self._rebuild_view_rows()
         return True
