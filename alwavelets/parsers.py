@@ -126,8 +126,8 @@ def parse_file(filename, progress_cb=None, use_cache=True, jobs=None,
                storage='auto', memory_mib=256):
     """Universal reader with persistent caching and optional disk storage.
 
-    Auto storage pages VCD/FST files above 50 MiB to disk, keeping all signal
-    declarations available. memory_mib bounds the decoded-page cache, not total
+    Auto storage pages files above 50 MiB and FSTs with large estimated expansion
+    to disk, keeping all signal declarations available. memory_mib bounds the decoded-page cache, not total
     process memory. Close the returned trace (or use a with statement) when done.
     storage='memory' preserves the eager reader and full parse-cache path.
     jobs opts into parallel eager VCD parsing (None or 1 = sequential).

@@ -85,7 +85,7 @@ Flags:
 | --- | --- |
 | `--signals`, `-s` | Comma-separated name/glob filters |
 | `--sync` | Force synchronous parse (disable background loading) |
-| `--storage auto\|memory\|disk` | Use disk storage above 50 MiB by default; override either way |
+| `--storage auto\|memory\|disk` | Use disk above 50 MiB or for FSTs with large estimated expansion; override either way |
 | `--memory-mib N` | Decoded waveform page-cache budget, default 256 MiB |
 | `--loadunchecked` | Start with no signals shown (pick them in the `B` tree browser) |
 | `--expanded` | Start with all scope modules expanded |
@@ -111,6 +111,10 @@ to in-memory VCD parsing (`--storage memory --sync --jobs 8`).
 ### Very large traces
 
 VCD and FST files above 50 MiB automatically use an indexed SQLite trace store.
+For smaller native FSTs, automatic selection also examines uncompressed block
+sizes, timestamp counts, and declaration counts. Gzip-wrapped FSTs use disk
+storage conservatively, since inspecting their inner block layout requires
+decompression. `--storage memory` remains an explicit override.
 Every declared signal remains available. `--signals`, `--loadunchecked`, and
 tree selection remain optional display controls; disk mode does not require a
 signal shortlist. To force disk storage or choose a smaller page cache:
@@ -131,15 +135,26 @@ Changed sources rebuild the index; incomplete/cancelled indexes are never reused
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, declarations, SQLite, builder buffers,
-and active query pages need additional memory. FST also decompresses one signal
-chain plus block time tables/hierarchy; an unusually large individual chain or
-declaration can exceed the budget. There is no new native dependency. Disk mode
+and active query pages need additional memory. FST chains, frames, hierarchies,
+geometry, block/chain indexes, and timestamp tables use bounded buffers that
+spill to temporary files. zlib, LZ4, FastLZ, and outer gzip decompression process
+small chunks and check cancellation. A single declaration name or signal value
+can still exceed the working-buffer budget, and metadata grows with signal
+count. There is no new native dependency. Disk mode
 trades a slower first scan and disk space for low memory use and quick subsequent
 opens. `--no-cache` still uses temporary disk storage, removed on close.
 Declarations share metadata with the page store, and sequence wrappers are
 created only when a signal is accessed. Pending index-summary groups spill to
 disk when their bounded builder cache fills. Metadata still grows with the
 number of declared signals; all signals remain available.
+
+During background disk indexing, `;cancel` stops the load; closing the viewer
+also cancels it. Partial indexes are never published, and spill files close on
+completion, cancellation, or failure. Library callers can pass a cancellation
+event to `FSTReader.parse(cancel=event)` or `storage.open_trace(cancel=event)`.
+FST metadata is parsed before the viewer opens; library cancellation also covers
+this stage. Disk spilling reduces memory at the cost of additional I/O and can
+make the first parse slower. Eager FST parsing still retains decoded history.
 
 Expression searches stream only the referenced signals. `when`/`match` searches
 run in the background in disk mode, with progress and a `cancel` command. Derived
@@ -396,6 +411,7 @@ whenever an agent is connected and acting.
 | `parsers` | VCD parsing (sync / background / lazy / follow), scope tree, `parse_file` dispatcher |
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
+| `fst_stream` | Bounded FST decompression and temporary storage for blocks and numeric tables |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
 | `background` | Bounded UI read queue and cancellable analysis jobs |
@@ -507,6 +523,21 @@ The report includes index size, query/build times, and total process peak RSS.
 The synthetic workload includes repeated timestamps and unsigned 64-bit PCs.
 The cache roundtrip additionally checks persistence, reopening, final-page
 access, and purge. It needs space for both the temporary and saved index.
+
+FST stress checks generate compressed traces without external tools: a single
+chain with ten million timestamps, 100,000 declarations, and a wide initial
+frame. Optional block checks expand 1 GiB through each supported chain codec:
+
+```sh
+python3 tools/stress_fst.py --events 10000000 --signals 100000 --memory-mib 8 --output fst.json
+python3 tools/stress_fst.py --block-mib 1024 --output fst-blocks.json
+```
+
+Fresh reader processes verify values and report peak RSS, parse time, index
+size, and automatic storage selection. `--repo /path/to/checkout` compares
+another revision on the same generated workload. Block measurements include
+decompression and sampled reads, not full waveform indexing. Temporary files
+are removed after each run; disk space must accommodate the expanded blocks.
 
 ## License
 

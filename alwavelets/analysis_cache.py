@@ -32,7 +32,7 @@ def stamp_source(trace, path):
 @lru_cache(maxsize=1)
 def implementation_signature():
     digest = hashlib.sha256()
-    for name in ('decoders', 'instruction_store', 'parsers', 'fst', 'core', 'value_stream', 'storage'):
+    for name in ('decoders', 'instruction_store', 'parsers', 'fst', 'fst_stream', 'core', 'value_stream', 'storage'):
         digest.update(Path(__file__).with_name(name + '.py').read_bytes())
     return digest.hexdigest()
 

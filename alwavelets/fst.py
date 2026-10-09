@@ -32,11 +32,15 @@ Layout notes (from fstapi.c, the reference implementation):
   character per bit. Reals are 8 raw bytes in the writer's endianness.
   Time deltas accumulate per chain into the block's time table.
 """
+from contextlib import ExitStack, nullcontext
+import io
 import os
 import struct
 import zlib
 
 from .core import VCDSignal, AliasSignal, split_reference
+from .fst_stream import CHUNK, FileSlice, Records, decompress
+from .streaming import check_cancel
 
 # ── small decompressors ─────────────────────────────────────────────
 
@@ -217,14 +221,16 @@ class FSTReader:
         result = 0
         shift = 0
         n = len(data)
-        while pos < n:
+        while pos < n and shift < 70:
             b = data[pos]
             pos += 1
             result |= (b & 0x7f) << shift
             if not (b & 0x80):
-                break
+                if result >= 1 << 64:
+                    raise ValueError('FST varint overflow')
+                return result, pos
             shift += 7
-        return result, pos
+        raise ValueError('Truncated or oversized FST varint')
 
     @staticmethod
     def _read_svint(data, pos):
@@ -234,13 +240,15 @@ class FSTReader:
         shift = 0
         n = len(data)
         b = 0
-        while pos < n:
+        while pos < n and shift < 70:
             b = data[pos]
             pos += 1
             result |= (b & 0x7f) << shift
             shift += 7
             if not (b & 0x80):
                 break
+        else:
+            raise ValueError('Truncated or oversized signed FST varint')
         if b & 0x40:
             result -= 1 << shift
         return result, pos
@@ -256,16 +264,18 @@ class FSTReader:
     def _fst_varint_file(f):
         result = 0
         shift = 0
-        while True:
+        while shift < 70:
             b = f.read(1)
             if not b:
-                break
+                raise ValueError('Truncated FST varint')
             b = b[0]
             result |= (b & 0x7f) << shift
             if not (b & 0x80):
-                break
+                if result >= 1 << 64:
+                    raise ValueError('FST varint overflow')
+                return result
             shift += 7
-        return result
+        raise ValueError('Oversized FST varint')
 
     @staticmethod
     def is_fst(filename):
@@ -278,17 +288,83 @@ class FSTReader:
         except OSError:
             return False
 
+    @classmethod
+    def prefers_disk(cls, filename, threshold):
+        """Cheap, conservative expansion estimate; never decompress the waveform."""
+        try:
+            size = os.path.getsize(filename)
+            with open(filename, 'rb') as f:
+                magic = f.read(1)
+                # Looking through a gzip wrapper would require a full scan.
+                if magic == bytes([cls.BL_ZWRAPPER]):
+                    return True
+                f.seek(49)
+                estimate = cls._read_u64(f) * 640  # declared signal metadata
+                position = 0
+                while position < size:
+                    f.seek(position)
+                    kind = f.read(1)[0]
+                    length = cls._read_u64(f)
+                    end = position + length + 1
+                    if length < 8 or end > size:
+                        return True
+                    if kind in (cls.BL_VCDATA, cls.BL_VCDATA_DYN_ALIAS, cls.BL_VCDATA_DYN_ALIAS2):
+                        f.seek(position + 25)
+                        # Unlike the header's fixed writer budget, this field
+                        # measures actual uncompressed value-chain bytes.
+                        estimate += cls._read_u64(f) * 48
+                        estimate += cls._fst_varint_file(f)  # full initial frame
+                        f.seek(end - 8)
+                        estimate += cls._read_u64(f) * 8     # timestamp table
+                    elif kind in (cls.BL_HIER, cls.BL_HIER_LZ4, cls.BL_HIER_LZ4DUO, cls.BL_GEOM):
+                        estimate += cls._read_u64(f)
+                    if estimate > threshold:
+                        return True
+                    position = end
+                return False
+        except (OSError, ValueError, IndexError, struct.error):
+            return True  # Let the bounded parser report the malformed input.
+
     # ── top level ────────────────────────────────────────────────────
 
-    def parse(self, progress_cb=None, writer_factory=None, metadata_only=False):
+    def parse(self, progress_cb=None, writer_factory=None, metadata_only=False, *, cancel=None, memory_mib=8):
+        """Read with bounded decompression; eager output still retains all events."""
+        if memory_mib <= 0:
+            raise ValueError('FST memory budget must be positive')
+        self._cancel = cancel
+        self._limit = max(CHUNK, min(1024 * 1024, int(memory_mib * 1024 * 1024) // 16))
+        self._frame0, self._geom = None, []
+        with ExitStack() as resources:
+            self._resources = resources
+            try:
+                return self._parse(progress_cb, writer_factory, metadata_only)
+            finally:
+                # Drop references to closed spill files and partial eager data.
+                self._frame0, self._geom, self._blocks = None, [], []
+                self._times = self._vals = None
+
+    def _check(self):
+        check_cancel(self._cancel)
+
+    def _records(self, fmt='<Q', resources=None):
+        table = Records(fmt, self._limit, self._cancel)
+        return (resources or self._resources).enter_context(table)
+
+    def _decompress(self, data, codec, size, **kwargs):
+        return decompress(data, codec, size, limit=self._limit, cancel=self._cancel, **kwargs)
+
+    def _parse(self, progress_cb=None, writer_factory=None, metadata_only=False):
         from .parsers import VCDFile, build_scope_tree, _compact_times
+        self._check()
         vcd = VCDFile()
         vcd._filename = self.filename
         from .analysis_cache import stamp_source
         stamp_source(vcd, self.filename)
-        file_size = os.path.getsize(self.filename)
-
-        with open(self.filename, 'rb') as f:
+        stream = getattr(self, '_input', None)
+        with (nullcontext(stream) if stream is not None else open(self.filename, 'rb')) as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            f.seek(0)
             first = f.read(1)
             if not first:
                 return vcd
@@ -303,30 +379,34 @@ class FSTReader:
                 progress_cb(f.tell(), file_size)
 
             # Block map
-            self._blocks = []
+            self._blocks = self._records('<BQQ')
             f.seek(0)
             while True:
+                self._check()
                 pos = f.tell()
                 tb = f.read(1)
                 if not tb:
                     break
                 sec_len = self._read_u64(f)
-                if sec_len < 8:
-                    break
+                if sec_len < 8 or pos + 1 + sec_len > file_size:
+                    raise ValueError('Truncated or invalid FST section')
                 self._blocks.append((tb[0], pos, sec_len))
                 f.seek(pos + 1 + sec_len)
 
             # Hierarchy (the last one wins if a writer emitted several)
-            hier = [b for b in self._blocks
-                    if b[0] in (self.BL_HIER, self.BL_HIER_LZ4, self.BL_HIER_LZ4DUO)]
-            if not hier:
+            hierarchy = None
+            for block in self._blocks:
+                if block[0] in (self.BL_HIER, self.BL_HIER_LZ4, self.BL_HIER_LZ4DUO):
+                    hierarchy = block
+            if hierarchy is None:
                 raise ValueError("FST file has no hierarchy block")
-            btype, bpos, bslen = hier[-1]
+            btype, bpos, bslen = hierarchy
             f.seek(bpos + 9)
             compact = metadata_only or writer_factory is not None
             if compact:
                 vcd.signals = {}
-            self._parse_hierarchy(self._read_hier_block(f, btype, bslen - 8), vcd, compact)
+            with self._read_hier_block(f, btype, bslen - 8) as hierarchy:
+                self._parse_hierarchy(hierarchy, vcd, compact)
             if progress_cb:
                 progress_cb(f.tell(), file_size)
 
@@ -341,15 +421,16 @@ class FSTReader:
                 vcd.scopes = build_scope_tree(vcd)
                 return vcd
             self._writer = writer_factory(vcd) if writer_factory else None
+            if self._cancel is None and self._writer is not None:
+                self._cancel = getattr(getattr(self._writer, 'store', None), 'cancel', None)
 
             # Value changes: stream to a page writer when requested.
             self._times = {}
             self._vals = {}
-            vc_blocks = [(p, s) for t, p, s in self._blocks
-                         if t in (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS,
-                                  self.BL_VCDATA_DYN_ALIAS2)]
-            for bi, (bpos, bslen) in enumerate(vc_blocks):
-                btype = next(t for t, p, s in self._blocks if p == bpos)
+            for btype, bpos, bslen in self._blocks:
+                self._check()
+                if btype not in (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS, self.BL_VCDATA_DYN_ALIAS2):
+                    continue
                 f.seek(bpos + 9)
                 self._parse_vc_block(f, btype, bpos, bslen, vcd)
                 if progress_cb:
@@ -367,7 +448,8 @@ class FSTReader:
             for btype, bpos, bslen in self._blocks:
                 if btype == self.BL_BLACKOUT:
                     f.seek(bpos + 9)
-                    self._apply_blackouts(f.read(bslen - 8))
+                    with self._decompress(FileSlice(f, bpos + 9, bslen - 8), 'raw', bslen - 8) as blackouts:
+                        self._apply_blackouts(blackouts)
 
         if self._writer is not None:
             beg0, fvals = self._frame0 if self._frame0 else (0, {})
@@ -383,30 +465,16 @@ class FSTReader:
 
     def _parse_zwrapped(self, f, progress_cb, writer_factory=None, metadata_only=False):
         """A '-c' file: gzip of a whole FST after a 17-byte wrapper."""
-        import tempfile
-        f.seek(17)
-        decoder = zlib.decompressobj(15 + 32)
-        tmp = tempfile.NamedTemporaryFile(suffix='.fst', delete=False)
-        try:
-            while True:
-                chunk = f.read(1 << 20)
-                if not chunk:
-                    break
-                while chunk:
-                    tmp.write(decoder.decompress(chunk, 1 << 20))
-                    chunk = decoder.unconsumed_tail
-            if not decoder.eof:
-                raise ValueError('Truncated compressed FST wrapper')
-            tmp.close()
-            vcd = FSTReader(tmp.name).parse(progress_cb, writer_factory, metadata_only)
-            vcd._filename = self.filename
-            return vcd
-        finally:
-            tmp.close()
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+        f.seek(9)
+        expected = self._read_u64(f)
+        f.seek(0, os.SEEK_END)
+        compressed_size = f.tell() - 17
+        with self._decompress(FileSlice(f, 17, compressed_size), 'zlib', expected, wbits=15 + 32) as unpacked:
+            reader = FSTReader(self.filename)
+            reader._input = unpacked.file if unpacked.file is not None else self._resources.enter_context(io.BytesIO(unpacked[:]))
+            reader._input.seek(0)
+            return reader.parse(progress_cb, writer_factory, metadata_only,
+                                cancel=self._cancel, memory_mib=self._limit * 16 / 1024 ** 2)
 
     # ── header ───────────────────────────────────────────────────────
 
@@ -438,26 +506,27 @@ class FSTReader:
     def _read_hier_block(self, f, btype, data_len):
         uncomp_len = self._read_u64(f)
         if btype == self.BL_HIER:
-            comp = f.read(data_len - 8)
+            data = FileSlice(f, f.tell(), data_len - 8)
             for wbits in (15 + 32, 0, -15):
                 try:
-                    return zlib.decompress(comp, wbits) if wbits else zlib.decompress(comp)
+                    return self._decompress(data, 'zlib', uncomp_len, wbits=wbits)
                 except zlib.error:
                     continue
             raise ValueError("FST hierarchy: zlib decompression failed")
         if btype == self.BL_HIER_LZ4:
-            return lz4_block_decompress(f.read(data_len - 8), uncomp_len)
-        # LZ4DUO: lz4(lz4(data)); the second length is the middle stage
+            return self._decompress(FileSlice(f, f.tell(), data_len - 8), 'lz4', uncomp_len)
         mid_len = self._read_u64(f)
-        mid = lz4_block_decompress(f.read(data_len - 16), mid_len)
-        return lz4_block_decompress(mid, uncomp_len)
+        with self._decompress(FileSlice(f, f.tell(), data_len - 16), 'lz4', mid_len) as middle:
+            return self._decompress(middle, 'lz4', uncomp_len)
 
     def _parse_hierarchy(self, data, vcd, metadata_only=False):
+        data = data.data if data.file is None else data
         pos, n = 0, len(data)
         scope_stack = []
         next_handle = 0
         self._handles = [None]
         while pos < n:
+            self._check()
             tag = data[pos]
             if tag == self.HT_SCOPE:
                 pos += 2                                   # tag + scope type
@@ -484,6 +553,8 @@ class FSTReader:
                     next_handle += 1
                     handle = next_handle
                 else:
+                    if alias > next_handle:
+                        raise ValueError('Invalid FST hierarchy alias')
                     handle = alias
                 scope = ".".join(scope_stack)
                 type_name = _VAR_TYPE_NAMES.get(var_type, 'wire')
@@ -513,13 +584,15 @@ class FSTReader:
     def _parse_geom(self, f, data_len):
         uncomp_len = self._read_u64(f)
         count = self._read_u64(f)
-        comp = f.read(data_len - 16)
-        data = comp if len(comp) == uncomp_len else zlib.decompress(comp)
-        geom = [0]
-        pos = 0
-        for _ in range(count):
-            val, pos = self._read_varint(data, pos)
-            geom.append(0 if val == 0 else (0 if val == 0xFFFFFFFF else val))
+        codec = 'raw' if data_len - 16 == uncomp_len else 'zlib'
+        geom = self._records()
+        geom.append(0)
+        with self._decompress(FileSlice(f, f.tell(), data_len - 16), codec, uncomp_len) as data:
+            pos = 0
+            for _ in range(count):
+                self._check()
+                val, pos = self._read_varint(data, pos)
+                geom.append(0 if val in (0, 0xFFFFFFFF) else val)
         self._geom = geom
 
     def _width(self, handle):
@@ -536,110 +609,83 @@ class FSTReader:
 
     # ── value-change blocks ──────────────────────────────────────────
 
-    def _unpack_chain(self, packtype, chunk):
-        uclen, skip = self._read_varint(chunk, 0)
-        body = chunk[skip:]
-        if uclen == 0:
-            return body
-        if packtype == 0x34:                   # '4'
-            return lz4_block_decompress(body, uclen)
-        if packtype == 0x46:                   # 'F'
-            return fastlz_decompress(body, uclen)
-        return zlib.decompress(body)
-
     def _parse_vc_block(self, f, btype, bpos, bslen, vcd):
+        with ExitStack() as resources:
+            self._read_vc_block(f, btype, bpos, bslen, vcd, resources)
+
+    def _read_vc_block(self, f, btype, bpos, bslen, vcd, resources):
         block_end = bpos + 1 + bslen
         beg_time = self._read_u64(f)
         end_time = self._read_u64(f)
-        self._read_u64(f)                              # mem_required
-        if end_time > vcd.max_time:
-            vcd.max_time = end_time
-
-        # Frame: every signal's value at beg_time
+        self._read_u64(f)  # writer memory estimate; also used by the auto policy
+        vcd.max_time = max(vcd.max_time, end_time)
         frame_uclen = self._fst_varint_file(f)
         frame_clen = self._fst_varint_file(f)
         frame_maxhandle = self._fst_varint_file(f)
-        frame_comp = f.read(frame_clen)
-        frame = frame_comp if frame_clen == frame_uclen else zlib.decompress(frame_comp)
-
+        frame_start = f.tell()
+        if frame_start + frame_clen > block_end:
+            raise ValueError('Invalid FST frame range')
+        if self._frame0 is None:
+            frame = self._resources.enter_context(self._decompress(
+                FileSlice(f, frame_start, frame_clen), 'raw' if frame_clen == frame_uclen else 'zlib', frame_uclen))
+            values = _FrameValues(self, frame, min(frame_maxhandle, len(self._handles) - 1))
+            self._frame0 = (beg_time, values)
+        f.seek(frame_start + frame_clen)
         vc_maxhandle = self._fst_varint_file(f)
-        vc_start = f.tell()                            # chain offsets count from here
+        vc_start = f.tell()
         packtype = f.read(1)[0]
-
-        # Footer: time table, then (backwards) the chain table
+        if packtype not in (0x34, 0x46, 0x5a):
+            raise ValueError('Unknown FST chain compression')
         f.seek(block_end - 24)
         tsec_uclen, tsec_clen, tsec_nitems = struct.unpack('>QQQ', f.read(24))
         tsec_start = block_end - 24 - tsec_clen
-        f.seek(tsec_start)
-        tcomp = f.read(tsec_clen)
-        tdata = tcomp if tsec_clen == tsec_uclen else zlib.decompress(tcomp)
-        times = []
-        pos = 0
-        tv = 0
-        for _ in range(tsec_nitems):
-            d, pos = self._read_varint(tdata, pos)
-            tv += d
-            times.append(tv)
-
+        if tsec_start < vc_start + 8:
+            raise ValueError('Invalid FST time table range')
+        times = self._records(resources=resources)
+        with self._decompress(FileSlice(f, tsec_start, tsec_clen),
+                              'raw' if tsec_clen == tsec_uclen else 'zlib', tsec_uclen) as data:
+            pos = tv = 0
+            for _ in range(tsec_nitems):
+                delta, pos = self._read_varint(data, pos)
+                tv += delta
+                times.append(tv)
         f.seek(tsec_start - 8)
         chain_clen = self._read_u64(f)
         chain_pos = tsec_start - 8 - chain_clen
-        f.seek(chain_pos)
-        chainbuf = f.read(chain_clen)
-        offsets, lengths = self._decode_chain_table(btype, chainbuf, chain_pos - vc_start)
-
-
-        # The frame is each signal's value when the block began. For every
-        # block but the first that is the last value already stored; for the
-        # first block it carries values a writer emitted before any
-        # timestamp (a VCD's $dumpvars before '#0'), which _store applies as
-        # the initial value of signals that have no change at beg_time.
-        if self._frame0 is None:
-            fvals = {}
-            fpos = 0
-            for h in range(1, min(frame_maxhandle, len(self._handles) - 1) + 1):
-                width, is_real = self._width(h)
-                if is_real:
-                    raw = frame[fpos:fpos + 8]
-                    fpos += 8
-                    if len(raw) == 8:
-                        fvals[h] = repr(struct.unpack(self._real_fmt, raw)[0])
-                else:
-                    raw = frame[fpos:fpos + width]
-                    fpos += width
-                    if len(raw) == width:
-                        v = raw.decode('ascii', 'replace')
-                        if v.strip('xX'):                  # all-x is the default anyway
-                            fvals[h] = v
-            self._frame0 = (beg_time, fvals)
-
-        # Chains
+        if chain_pos < vc_start:
+            raise ValueError('Invalid FST chain table range')
+        with self._decompress(FileSlice(f, chain_pos, chain_clen), 'raw', chain_clen) as table:
+            offsets, lengths = self._decode_chain_table(btype, table, chain_pos - vc_start, resources)
+        codec = {0x34: 'lz4', 0x46: 'fastlz', 0x5a: 'zlib'}[packtype]
         for h in range(1, min(vc_maxhandle, len(offsets) - 1) + 1):
-            off = offsets[h]
-            if not off:
+            self._check()
+            off, size = offsets[h], lengths[h]
+            if not off or not size:
                 continue
-            ln = lengths[h]
+            if size < 0 or off < 1 or vc_start + off + size > chain_pos:
+                raise ValueError('Invalid FST chain range')
             f.seek(vc_start + off)
-            chunk = f.read(ln) if ln > 0 else b''
-            if not chunk:
-                continue
-            try:
-                mu = self._unpack_chain(packtype, chunk)
-            except Exception as e:
-                raise ValueError("FST chain for handle %d: %s" % (h, e))
-            self._decode_chain(h, mu, times, beg_time)
+            unpacked_size = self._fst_varint_file(f)
+            start = f.tell()
+            size -= start - (vc_start + off)
+            data = FileSlice(f, start, size)
+            with self._decompress(data, codec if unpacked_size else 'raw', unpacked_size or size) as chain:
+                self._decode_chain(h, chain, times, beg_time)
 
-    def _decode_chain_table(self, btype, chainbuf, end_offset):
+    def _decode_chain_table(self, btype, chainbuf, end_offset, resources=None):
         """Return (offsets, lengths) indexed by handle (index 0 unused)."""
         n = len(chainbuf)
-        offsets = [0]
-        lengths = [0]
+        offsets = self._records('<q', resources)
+        lengths = self._records('<q', resources)
+        offsets.append(0)
+        lengths.append(0)
         pnt = 0
         pval = 0
         pidx = 0
         prev_alias = 0
         if btype == self.BL_VCDATA_DYN_ALIAS2:
             while pnt < n:
+                self._check()
                 if chainbuf[pnt] & 1:
                     shval, pnt = self._read_svint(chainbuf, pnt)
                     shval >>= 1
@@ -659,11 +705,14 @@ class FSTReader:
                         lengths.append(prev_alias)
                 else:
                     val, pnt = self._read_varint(chainbuf, pnt)
+                    if len(offsets) + (val >> 1) > len(self._handles):
+                        raise ValueError('FST chain table exceeds declared handles')
                     for _ in range(val >> 1):
                         offsets.append(0)
                         lengths.append(0)
         else:
             while pnt < n:
+                self._check()
                 val, pnt = self._read_varint(chainbuf, pnt)
                 if val == 0:
                     val, pnt = self._read_varint(chainbuf, pnt)
@@ -677,6 +726,8 @@ class FSTReader:
                         lengths[pidx] = pval - offsets[pidx]
                     pidx = len(offsets) - 1
                 else:
+                    if len(offsets) + (val >> 1) > len(self._handles):
+                        raise ValueError('FST chain table exceeds declared handles')
                     for _ in range(val >> 1):
                         offsets.append(0)
                         lengths.append(0)
@@ -684,6 +735,7 @@ class FSTReader:
             lengths[pidx] = end_offset - offsets[pidx]
         # Resolve aliases: a negative length -L names handle index L-1.
         for i in range(1, len(offsets)):
+            self._check()
             if lengths[i] < 0 and offsets[i] == 0:
                 src = -lengths[i] - 1
                 if 0 < src < i:
@@ -701,21 +753,27 @@ class FSTReader:
             if info is None:
                 return
             key = info['hid']
-            for t, value in events:
+            for count, (t, value) in enumerate(events):
+                self._check()
                 if key not in writer.last_time and self._frame0:
                     beg0, fvals = self._frame0
-                    if t > beg0 and h in fvals:
-                        writer.add(key, beg0, fvals[h])
+                    initial = fvals.get(h)
+                    if t > beg0 and initial is not None:
+                        writer.add(key, beg0, initial)
                 writer.add(key, t, value)
+                if count % 4096 == 0:
+                    writer.publish()
             writer.publish()
         else:
             tl = self._times.setdefault(h, [])
             vl = self._vals.setdefault(h, [])
             for t, value in events:
+                self._check()
                 tl.append(t)
                 vl.append(value)
 
     def _chain_events(self, h, mu, times):
+        mu = mu.data if mu.file is None else mu
         width, is_real = self._width(h)
         n = len(mu)
         pos = 0
@@ -724,6 +782,8 @@ class FSTReader:
         rv = _read_varint = self._read_varint
         if width == 1 and not is_real:
             while pos < n:
+                if pos % 4096 == 0:
+                    self._check()
                 vli, pos = rv(mu, pos)
                 if vli & 1:
                     tidx += vli >> 4
@@ -738,6 +798,7 @@ class FSTReader:
         nbytes = (width + 7) >> 3
         fmt = self._real_fmt
         while pos < n:
+            self._check()
             vli, pos = rv(mu, pos)
             tidx += vli >> 1
             if is_real:
@@ -767,43 +828,37 @@ class FSTReader:
     def _apply_blackouts(self, data):
         count, pos = self._read_varint(data, 0)
         t = 0
-        events = []
-        for _ in range(count):
-            if pos >= len(data):
-                break
-            active = data[pos]
-            pos += 1
-            d, pos = self._read_varint(data, pos)
-            t += d
-            events.append((t, bool(active)))
         import bisect
         writer = getattr(self, '_writer', None)
         if writer is not None:
             writer.publish(True)
-            for t, active in events:
-                if active:
+        for _ in range(count):
+            self._check()
+            if pos >= len(data):
+                raise ValueError('Truncated FST blackout table')
+            active = data[pos]
+            delta, pos = self._read_varint(data, pos + 1)
+            t += delta
+            if active:
+                continue
+            for h in range(1, len(self._handles)):
+                self._check()
+                info = self._handles[h]
+                if info is None:
                     continue
-                for info in self._handles[1:]:
-                    if info is None:
-                        continue
+                if writer is not None:
                     sig = writer.vcd.signals[info['hid']]
                     index = sig._times.bisect(t)
                     if index >= sig.num_changes() or sig._times[index] != t:
                         writer.add(info['hid'], t, 'x')
-            return
-        for t, active in events:
-            if active:
-                continue                        # values resume via the chains
-            for h in range(1, len(self._handles)):
-                if self._handles[h] is None:
-                    continue
-                tl = self._times.setdefault(h, [])
-                vl = self._vals.setdefault(h, [])
-                i = bisect.bisect_right(tl, t)
-                if i and tl[i - 1] == t:
-                    continue                    # a real change at t wins
-                tl.insert(i, t)
-                vl.insert(i, 'x')
+                else:
+                    tl = self._times.setdefault(h, [])
+                    vl = self._vals.setdefault(h, [])
+                    index = bisect.bisect_right(tl, t)
+                    if index and tl[index - 1] == t:
+                        continue
+                    tl.insert(index, t)
+                    vl.insert(index, 'x')
 
     # ── store into VCDSignal ─────────────────────────────────────────
 
@@ -811,6 +866,7 @@ class FSTReader:
         import array
         beg0, fvals = self._frame0 if self._frame0 else (0, {})
         for h in range(1, len(self._handles)):
+            self._check()
             info = self._handles[h]
             if info is None:
                 continue
@@ -839,3 +895,36 @@ class FSTReader:
             else:
                 sig._values = list(vl)
         self._times = self._vals = None
+
+
+class _FrameValues:
+    """Initial values decoded one at a time from a retained, spillable frame."""
+    def __init__(self, reader, data, count):
+        self.reader, self.data, self.count = reader, data, count
+        self.offsets = reader._records()
+        position = 0
+        self.offsets.append(0)
+        for h in range(1, count + 1):
+            self.offsets.append(position)
+            width, real = reader._width(h)
+            position += 8 if real else width
+        if position > len(data):
+            raise ValueError('Truncated FST initial frame')
+
+    def get(self, handle, default=None):
+        if not 1 <= handle <= self.count:
+            return default
+        width, real = self.reader._width(handle)
+        start = self.offsets[handle]
+        raw = self.data[start:start + (8 if real else width)]
+        if real:
+            return repr(struct.unpack(self.reader._real_fmt, raw)[0])
+        value = raw.decode('ascii', 'replace')
+        return value if value.strip('xX') else default
+
+    def items(self):
+        for h in range(1, self.count + 1):
+            self.reader._check()
+            value = self.get(h)
+            if value is not None:
+                yield h, value

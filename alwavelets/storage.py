@@ -22,7 +22,7 @@ import zlib
 from .core import VCDSignal, AliasSignal, numeric_value, clear_pack_memos
 from .value_stream import ValueState
 
-VERSION = 3  # exact summaries also support integers beyond Python's decimal limit
+VERSION = 4  # bounded FST reader and stricter block validation
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 AUTO_THRESHOLD = 50 * 1024 * 1024
@@ -181,7 +181,8 @@ def use_disk_storage(source, mode='auto'):
         return False  # dispatcher converts first, then applies storage policy
     if mode == 'disk' and not supported:
         raise ValueError('Disk storage requires VCD or FST input')
-    return supported and (mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD)
+    return supported and (mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD or
+                          (FSTReader.is_fst(source) and FSTReader.prefers_disk(source, AUTO_THRESHOLD)))
 
 
 def _definition(sig):
@@ -602,7 +603,7 @@ def _restore(store, source):
     return vcd
 
 
-def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None):
+def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None, cancel=None):
     """Open VCD/FST into paged storage; all declarations remain available."""
     from .parsers import VCDFile
     from . import cache
@@ -610,6 +611,9 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     source = os.path.abspath(source)
     if memory_mib <= 0:
         raise ValueError('memory_mib must be positive')
+    from .streaming import check_cancel
+    cancel = cancel if cancel is not None else threading.Event()
+    check_cancel(cancel)
     memory = int(memory_mib * 1024 * 1024)
     target = index_path(source)
     if use_cache and os.path.isfile(target):
@@ -627,7 +631,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     from .fst import FSTReader
     is_fst = FSTReader.is_fst(source)
     if is_fst:
-        vcd = FSTReader(source).parse(metadata_only=True)
+        vcd = FSTReader(source).parse(metadata_only=True, cancel=cancel, memory_mib=memory_mib)
         offset = 0
     else:
         vcd, offset = VCDFile.parse_header(source, metadata_only=True)
@@ -643,6 +647,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
     path = os.path.join(temporary.name, 'trace.sqlite')
     store = TraceStore(path, memory)
+    store.cancel = cancel
     store.temporary = temporary
     writer = PageWriter(store, vcd)
     vcd._loading = True
@@ -655,7 +660,8 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                     vcd._load_progress = min(99, done * 100 // max(1, total))
                     if progress_cb:
                         progress_cb(done, total)
-                FSTReader(source).parse(progress, writer_factory=lambda _: writer)
+                FSTReader(source).parse(progress, writer_factory=lambda _: writer,
+                                        cancel=store.cancel, memory_mib=memory_mib)
             else:
                 ingest_vcd()
             writer.finish(source, signature)

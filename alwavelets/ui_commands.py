@@ -269,7 +269,12 @@ class CommandLineMixin:
     def _cmd_cancel_analysis(self):
         job = getattr(self, '_analysis_job', None)
         if job is None:
-            self._show_message('No analysis running')
+            store = getattr(self.vcd, '_store', None)
+            if store is not None and self.vcd.is_loading:
+                store.cancel.set()
+                self._show_message('Cancelling trace indexing…')
+            else:
+                self._show_message('No analysis running')
         else:
             job.cancel.set()
             self._show_message('Cancelling analysis…')
