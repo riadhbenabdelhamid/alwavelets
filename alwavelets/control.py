@@ -29,7 +29,6 @@ import queue
 import secrets
 import socket
 import stat
-import sys
 import threading
 import time
 

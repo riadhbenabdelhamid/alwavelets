@@ -6,12 +6,11 @@
 # whitespace, naming) are deliberately left off to avoid drowning real findings
 # in cosmetic noise.
 #
-# The codebase is mid-refactor from a single module into the alwavelets/ package;
-# the transitional _monolith.py re-exports submodules via `from .x import *`, so
-# F403/F405 (star-import) are ignored until the split finishes and the
-# re-exports become explicit.
+# The package re-exports its submodules via `from .x import *` (see
+# alwavelets/__init__.py and the UI mixins), so F403/F405 (star-import) are
+# ignored until those re-exports become explicit.
 
-target-version = "py39"
+target-version = "py38"
 line-length = 200
 
 [lint]

@@ -161,7 +161,8 @@ def test_xml_escape(w):
     assert w.xml_escape('a<b>&"c') == 'a&lt;b&gt;&amp;&quot;c'
     # result must round-trip through an XML parser
     import xml.etree.ElementTree as ET
-    el = ET.fromstring(f"<t>{w.xml_escape('sig<=>&\"x')}</t>")
+    raw = 'sig<=>&"x'
+    el = ET.fromstring("<t>" + w.xml_escape(raw) + "</t>")
     assert el.text == 'sig<=>&"x'
 
 

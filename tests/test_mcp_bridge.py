@@ -5,10 +5,8 @@ the user has open without implementing the socket protocol itself. The
 integration tests run a real ControlServer over a stub viewer — no curses
 terminal needed.
 """
-import json
 import os
 import threading
-import types
 
 import pytest
 
