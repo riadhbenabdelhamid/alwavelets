@@ -26,7 +26,7 @@ def load_analysis_data(viewer, start=0, end=None):
 
 
 class DebugActionsMixin:
-    def _start_decode_results(self, factory, item_type, complete, title, end=None, kind='decode'):
+    def _start_decode_results(self, factory, item_type, complete, title, end=None, kind='decode', collector=None):
         from .background import AnalysisJob
         from .results import PagedResults, close_results
         if getattr(self, '_analysis_job', None) is not None:
@@ -36,7 +36,7 @@ class DebugActionsMixin:
         end = vcd.max_time if end is None else end
         def compute(cancel, progress):
             progress(0, end)
-            return PagedResults.collect(factory(cancel), item_type, owner=vcd,
+            return (collector or PagedResults).collect(factory(cancel), item_type, owner=vcd,
                                         cancel=cancel, progress=progress, end=end)
         def apply(results):
             if self.vcd is not vcd:
@@ -84,10 +84,14 @@ class DebugActionsMixin:
         queries = getattr(self, '_queries', None)
         if queries is not None:
             queries.invalidate('decodes')
+            if all_results:
+                queries.invalidate('registers')
         for frames in getattr(self, 'decode_overlays', {}).values():
             close_results(frames)
         self.decode_overlays = {}
         if all_results:
+            close_results(getattr(self, '_instruction_query_result', None))
+            self._instruction_query_result = None
             close_results(getattr(self, 'bus_transactions', None))
             self.bus_transactions = []
             trace = getattr(self, 'instr_trace', None)
@@ -187,12 +191,18 @@ class DebugActionsMixin:
         import copy
         tags = copy.deepcopy(self.signal_tags)
         def complete(entries):
+            queries = getattr(self, '_queries', None)
+            if queries is not None:
+                queries.invalidate('registers')
+            close_results(getattr(self, '_instruction_query_result', None))
+            self._instruction_query_result = None
             close_results(trace.entries)
             trace.entries = entries
             trace.tags, trace.decoder, trace.built = tags, decoder, True
             self._show_message(f'Trace built: {len(entries)} instructions')
+        from .instruction_store import InstructionResults
         self._start_decode_results(lambda cancel: trace.iter_entries(vcd, tags, decoder, cancel=cancel),
-                                    dict, complete, 'instructions')
+                                    dict, complete, 'instructions', collector=InstructionResults)
 
     def _trace_query_prompt(self):
         """Interactive trace query."""
@@ -204,167 +214,38 @@ class DebugActionsMixin:
         if not q:
             return
 
-        # Built-in query shortcuts
-        q_low = q.strip().lower()
-        matches = None
+        self._run_instruction_query(q)
 
-        if q_low.startswith('mn ') or q_low.startswith('mnemonic '):
-            pat = q.split(None, 1)[1]
-            matches = self.instr_trace.find_mnemonic(pat)
-        elif q_low.startswith('store'):
-            parts = q.split()
-            if len(parts) >= 3:
-                lo = int(parts[1], 0)
-                hi = int(parts[2], 0)
-                matches = self.instr_trace.find_stores(lo, hi)
-            else:
-                matches = self.instr_trace.find_stores()
-        elif q_low.startswith('reg '):
-            parts = q.split()
-            reg = int(parts[1]) if parts[1].isdigit() else RV32Decoder.REG_NAMES.index(parts[1]) if parts[1] in RV32Decoder.REG_NAMES else 0
-            matches = self.instr_trace.find_reg_writes(reg)
-        elif q_low.startswith('csr '):
-            csr_name = q.split()[1]
-            csr_addr = None
-            for addr, name in CSR_NAMES.items():
-                if name == csr_name:
-                    csr_addr = addr; break
-            if csr_addr is None:
-                try: csr_addr = int(csr_name, 0)
-                except ValueError: pass
-            if csr_addr is not None:
-                matches = self.instr_trace.find_csr_changes(csr_addr)
-        elif q_low == 'stall' or q_low == 'stalled':
-            matches = self.instr_trace.find_stalled()
-        elif q_low == 'summary':
-            self._show_message(self.instr_trace.summary())
+    def _run_instruction_query(self, query):
+        from .background import AnalysisJob
+        from .instruction_ui import run_query
+        from .results import close_results
+        if getattr(self, '_analysis_job', None) is not None:
+            self._show_message('Analysis already running; use cancel before starting another')
             return
-        elif q_low.startswith('thread '):
-            parts = q.split()
-            hart = int(parts[1])
-            thread_trace = self.instr_trace.extract_thread_trace(hart)
-            n = len(thread_trace)
-            if n == 0:
-                self._show_message(f"Hart {hart}: no instructions")
-            else:
-                ipc = self.instr_trace.hart_ipc(hart)
-                self.markers.clear()
-                for e in thread_trace[:100]:
-                    self.markers.append(Marker(e['time'], f"H{hart}:{e['decoded']['asm'][:15]}"))
-                self.cursor_time = thread_trace[0]['time']
-                self._ensure_cursor_visible()
-                self._show_message(f"Hart {hart}: {n} instrs, IPC={ipc:.3f} ({min(n,100)} markers)")
-            return
-        elif q_low == 'ipc':
-            ipcs = self.instr_trace.all_hart_ipc(self.time_start, self.time_end)
-            parts = [f"H{h}:{v:.3f}" for h, v in sorted(ipcs.items())]
-            self._show_message("IPC: " + " ".join(parts[:8]))
-            return
-        elif q_low == 'fairness':
-            stats = self.instr_trace.fairness_analysis()
-            msgs = []
-            for h, s in sorted(stats.items()):
-                mark = "⚠" if s['starved'] else "✓"
-                msgs.append(f"H{h}:{mark}avg={s['avg_gap']:.0f} max={s['max_gap']}")
-            self._show_message(" ".join(msgs[:6]))
-            # Place markers at starvation events
-            events = self.instr_trace.find_starvation_events()
-            if events:
-                for ev in events[:50]:
-                    self.markers.append(Marker(ev['time'], f"H{ev['hart_id']}:starved×{ev['ratio']:.1f}"))
-                self._show_message(f"Fairness: {len(events)} starvation events marked")
-            return
-        elif q_low.startswith('diverge '):
-            parts = q.split()
-            if len(parts) >= 3:
-                ha, hb = int(parts[1]), int(parts[2])
-                after = int(parts[3]) if len(parts) > 3 else 0
-                result = self.instr_trace.thread_divergence(ha, hb, after)
-                if result['identical']:
-                    self._show_message(f"H{ha} vs H{hb}: {result['reason']}")
-                else:
-                    self.cursor_time = result['diverge_time']
-                    self._ensure_cursor_visible()
-                    msg = f"Diverge at t={result['diverge_time']}: {result['reason']}"
-                    self._show_message(msg)
-            else:
-                self._show_message("Usage: diverge <hart_a> <hart_b> [after_time]")
-            return
-        elif q_low.startswith('contention'):
-            parts = q.split()
-            lo = int(parts[1], 0) if len(parts) > 1 else 0
-            hi = int(parts[2], 0) if len(parts) > 2 else 0xFFFFFFFF
-            results = self.instr_trace.shared_resource_contention(lo, hi)
-            if not results:
-                self._show_message("No contention found")
-            else:
-                for c in results[:3]:
-                    hazards = []
-                    if c['has_waw']: hazards.append('WAW')
-                    if c['has_raw']: hazards.append('RAW')
-                    if c['has_war']: hazards.append('WAR')
-                    hz = '+'.join(hazards) if hazards else 'shared'
-                    self._show_message(f"@0x{c['addr']:x}: {c['n_harts']} harts ({hz}), {len(c['accesses'])} accesses")
-                # Mark first contention
-                if results[0]['accesses']:
-                    self.cursor_time = results[0]['accesses'][0]['time']
-                    self._ensure_cursor_visible()
-            return
-        elif q_low == 'heatmap':
-            hm = self.instr_trace.scheduling_heatmap(self.time_start, self.time_end, self.wave_width)
-            if hm and hm['harts']:
-                self._show_message(f"Heatmap: {len(hm['harts'])} harts, {len(hm['heatmap'])} buckets")
-                self._heatmap_data = hm
-            return
-        elif q_low.startswith('regs '):
-            parts = q.split()
-            hart = int(parts[1]) if len(parts) > 1 else 0
-            regs = self.instr_trace.register_snapshot(hart, self.cursor_time)
-            lines = []
-            for i in range(0, 32, 4):
-                row = []
-                for j in range(4):
-                    r = i + j
-                    v = regs[r]
-                    name = RV32Decoder.REG_NAMES[r]
-                    val = f"{v:08x}" if v is not None else "--------"
-                    row.append(f"{name}={val}")
-                lines.append(" ".join(row))
-            self._show_message(lines[0])  # show first row, rest need panel
-            return
-        elif q_low == 'harts':
-            harts = self.instr_trace.get_active_harts()
-            self._show_message(f"Active harts: {harts}")
-            return
-        elif q_low.startswith('lambda'):
-            matches, err = self.instr_trace.query_str(q)
-            if err:
-                self._show_message(f"Error: {err}")
+        trace, vcd = self.instr_trace, self.vcd
+        entries = trace.entries
+        start, end, cursor, width = self.time_start, self.time_end, self.cursor_time, self.wave_width
+        def compute(cancel, progress):
+            return run_query(trace, query, start, end, cursor, width, cancel=cancel, progress=progress)
+        def complete(result):
+            if self.vcd is not vcd or self.instr_trace.entries is not entries:
+                result.close()
                 return
-        else:
-            self._show_message("Commands: mn <pat>, store [lo hi], reg <n>, csr <name>, stall, summary, lambda e: ...")
-            return
-
-        if matches is not None:
-            n = len(matches)
-            if n == 0:
-                self._show_message("No matches")
-            elif n == 1:
-                e = matches[0]
-                self.cursor_time = e['time']
-                self._ensure_cursor_visible()
-                self._show_message(f"t={e['time']} {e['decoded']['asm']}")
-            else:
-                # Place markers at all matches, jump to first
+            close_results(getattr(self, '_instruction_query_result', None))
+            self._instruction_query_result = result
+            if result.replace_markers:
                 self.markers.clear()
-                for e in matches[:100]:
-                    self.markers.append(Marker(e['time'], e['decoded']['asm'][:20]))
-                self.cursor_time = matches[0]['time']
+            self.markers.extend(Marker(t, label) for t, label in result.markers)
+            if result.cursor is not None:
+                self.cursor_time = result.cursor
                 self._ensure_cursor_visible()
-                self._show_message(f"{n} matches ({min(n,100)} markers placed). < > to navigate.")
-
-
-
+            if result.heatmap is not None:
+                self._heatmap_data = result.heatmap
+            self._show_message(result.message)
+        self._analysis_job = AnalysisJob(compute, complete, discard=close_results)
+        self._analysis_job.kind, self._analysis_job.label = 'instruction-query', 'Query'
+        self._show_message('Query running in background; use cancel to stop')
 
     # ══ FEATURE 1: ANNOTATIONS ══
 

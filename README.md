@@ -156,10 +156,31 @@ decodes replace prior results; cancellation or failure leaves prior results
 available. Replacing/clearing results, reloading, or closing the trace releases
 their temporary storage. No frame-count limit is imposed.
 
+Instruction searches also run in the background. PC, hart, thread ID, exact
+mnemonic, time, register-write, and memory-address filters use indexed fields;
+matches retain record IDs on disk instead of duplicating instruction payloads.
+The first 100 matches become navigation markers, while the complete selection
+remains available. Regex mnemonic searches and custom Python predicates can
+require a scan. `cancel` stops scans, SQLite sorting, and index construction;
+a single user-supplied predicate must return before cancellation can proceed.
+
+The trace query prompt accepts `pc <lo> [hi]`, `time <lo> <hi>`,
+`hart <id> [start end]`, `threadid <id>`, and `mn= <exact-name>`.
+Existing `thread <id>` remains an alias for hart selection, and `mn <regex>`
+keeps its regex behavior. IPC, fairness, starvation, divergence, heatmaps, and
+register snapshots process history incrementally. The register panel reads
+indexed snapshots on a background worker. Aggregate memory scales with the
+number of harts (and heatmap dimensions), rather than retired instructions.
+The historical `ipc` formula remains count divided by elapsed trace ticks;
+it does not normalize by a separately tagged clock.
+
 Explicit materialization such as `signal.changes`, `render_svg()`, and decoder
 `decode()`/`decode_all()` result lists still uses memory proportional to the
-requested output. Library `InstructionTrace.build()` retains its index, and
-instruction-trace queries can still materialize matching entries. Prefer the
+requested output. Library `InstructionTrace.build()` defaults to memory; pass
+`storage='disk'` for indexed storage tied to the source trace's lifetime.
+Use `trace.select(...)` as a context manager for paged matches, or
+`trace.iter_matching(...)` for streaming iteration. Existing `find_*`, `query()`,
+and thread-extraction methods still return lists for compatibility. Prefer the
 streaming APIs for large captures; individual transactions still retain their
 payloads. File exports from the viewer remain synchronous.
 Live tailing requires `--storage memory`; disk indexes are snapshots.
@@ -343,6 +364,8 @@ whenever an agent is connected and acting.
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
 | `background` | Bounded UI read queue and cancellable analysis jobs |
+| `instruction_store` | Indexed instruction fields and paged record-ID selections |
+| `instruction_analysis` | Streaming instruction filters, statistics, and register snapshots |
 | `parallel` | Opt-in multi-process parsing of large VCDs (`--jobs N`) |
 | `expr` | Cross-signal boolean expression search + derived signals (`when`/`derive`) |
 | `gtkw` | GTKWave `.gtkw` save-file import/export (interop) |
@@ -433,6 +456,17 @@ Reports include process peak RSS before and after reopening, page-cache usage,
 index size, and timings. The reopening measurement retains the first closed
 trace object, so its metadata is still resident. The generated traces and
 indexes require temporary disk space and are removed after the run.
+
+Instruction query stress checks build ten million synthetic retirements,
+validate full and selective result counts, and exercise per-hart statistics
+and register reconstruction in a fresh process:
+
+```sh
+python3 tools/stress_instructions.py --records 10000000 --output instructions.json
+```
+
+The report includes index size, query/build times, and total process peak RSS.
+The synthetic workload includes repeated timestamps and unsigned 64-bit PCs.
 
 ## License
 

@@ -155,16 +155,18 @@ class DrawingMixin:
         panel_w = min(40, w // 3)
         start_x = w - panel_w
 
-        # Get current hart at cursor time
-        cur_hart = 0
-        if self.instr_trace.entries:
-            # Find nearest entry to cursor
-            for e in reversed(self.instr_trace.entries):
-                if e['time'] <= self.cursor_time:
-                    cur_hart = e.get('hart_id', 0)
-                    break
-
-        regs = self.instr_trace.register_snapshot(cur_hart, self.cursor_time)
+        from .instruction_store import InstructionResults
+        trace, cursor = self.instr_trace, self.cursor_time
+        if isinstance(trace.entries, InstructionResults):
+            from .background import BackgroundQueries
+            if not hasattr(self, '_queries'):
+                self._queries = BackgroundQueries()
+            state = self._queries.request('registers', (id(trace.entries), cursor), 'panel',
+                                          lambda cancel: trace.register_panel_state(cursor, cancel=cancel),
+                                          (0, [0] + [None] * 31, set(), None), cancellable=True)
+        else:
+            state = trace.register_panel_state(cursor)
+        cur_hart, regs, recent, current = state
 
         # Header
         hdr = f" Hart {cur_hart} Regs @t={self.cursor_time}"
@@ -193,14 +195,7 @@ class DrawingMixin:
                 val_str = f"{val:08x}"
 
             # Highlight recently-written registers
-            is_recent = False
-            recent_entries = [e for e in self.instr_trace.entries
-                            if e.get('hart_id') == cur_hart
-                            and e['time'] <= self.cursor_time
-                            and e['time'] > self.cursor_time - 100
-                            and e['rd_addr'] == i]
-            if recent_entries:
-                is_recent = True
+            is_recent = i in recent
 
             label = f"{name:>4}={val_str}"
             attr = curses.color_pair(self.C_HIGH) | curses.A_BOLD if is_recent else curses.A_NORMAL
@@ -224,11 +219,9 @@ class DrawingMixin:
         # Find current instruction
         cur_instr = "---"
         cur_pc = "---"
-        for e in reversed(self.instr_trace.entries):
-            if e.get('hart_id') == cur_hart and e['time'] <= self.cursor_time:
-                cur_instr = e['decoded']['asm'][:20]
-                cur_pc = f"0x{e['pc']:08x}"
-                break
+        if current is not None:
+            cur_instr = current['decoded']['asm'][:20]
+            cur_pc = f"0x{current['pc']:08x}"
         try:
             self.stdscr.addstr(info_row, start_x,
                               f" PC={cur_pc}"[:panel_w].ljust(panel_w),
@@ -1089,9 +1082,9 @@ class DrawingMixin:
         job = getattr(self, '_analysis_job', None)
         if job is not None:
             _sep()
-            pct = min(100, job.progress[0] * 100 // max(1, job.progress[1])) if job.progress else 0
+            pct = ('%d%%' % min(100, job.progress[0] * 100 // job.progress[1])) if job.progress and job.progress[1] else '…'
             label = getattr(job, 'label', 'Search')
-            _put(f"{label} {pct}% · cancel", curses.color_pair(self.C_PROMPT))
+            _put(f"{label} {pct} · cancel", curses.color_pair(self.C_PROMPT))
         if self.vcd.is_loading:
             _sep()
             pct = self.vcd.load_progress

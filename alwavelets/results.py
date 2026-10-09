@@ -46,19 +46,14 @@ class PagedResults(Sequence):
             check_cancel(cancel)
             for item in iterator:
                 check_cancel(cancel)
-                start = item['time'] if item_type is dict else item.t_start
-                stop = start if item_type is dict else item.t_end
+                start, stop = results._append(item)
                 last_stop = stop
-                values = item if results.fields is None else tuple(getattr(item, f) for f in results.fields)
-                results._db.execute('INSERT INTO results VALUES(?,?,?,?)',
-                                    (results._count, start, stop, marshal.dumps(values)))
-                results._count += 1
-                results._max_duration = max(results._max_duration, stop - start)
                 if results._count % 4096 == 0:
                     results._db.commit()
                     if progress is not None:
                         progress(start, end if end is not None else stop)
             results._db.commit()
+            results._finish(cancel, progress)
             if progress is not None:
                 total = last_stop if end is None else end
                 progress(total, total)
@@ -71,6 +66,19 @@ class PagedResults(Sequence):
             close = getattr(iterator, 'close', None)
             if close is not None:
                 close()
+
+    def _append(self, item):
+        start = item['time'] if self.item_type is dict else item.t_start
+        stop = start if self.item_type is dict else item.t_end
+        values = item if self.fields is None else tuple(getattr(item, f) for f in self.fields)
+        self._db.execute('INSERT INTO results VALUES(?,?,?,?)',
+                         (self._count, start, stop, marshal.dumps(values)))
+        self._count += 1
+        self._max_duration = max(self._max_duration, stop - start)
+        return start, stop
+
+    def _finish(self, cancel, progress):
+        pass
 
     def __len__(self):
         return self._count

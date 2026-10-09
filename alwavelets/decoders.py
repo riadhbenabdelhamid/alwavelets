@@ -5,11 +5,11 @@ decoder + trace index, and the bus-transaction decoders (AXI / Wishbone /
 AHB). Everything operates on duck-typed signal objects; only the standard
 library is used beyond intra-module references.
 """
-import re
 import heapq
 import itertools
 import sqlite3
 from .core import ensure_trace_loaded
+from .instruction_analysis import InstructionAnalysis
 from .streaming import iter_window, signal_times, merge_times, prefer_nonempty, check_cancel
 
 
@@ -522,7 +522,7 @@ CSR_NAMES = {
 #  STAGE 3: INSTRUCTION TRACE INDEX
 # ══════════════════════════════════════════════════════════════
 
-class InstructionTrace:
+class InstructionTrace(InstructionAnalysis):
     """Pre-computed index of all retired instructions for fast queries."""
 
     def __init__(self):
@@ -533,12 +533,22 @@ class InstructionTrace:
         self.thread_id = 0
         self.built = False
 
-    def build(self, vcd, tags, decoder=None):
-        """Build an in-memory index; use iter_entries() for streaming exports."""
-        self.tags = tags
-        self.decoder = decoder or RV32Decoder()
-        self.built = False
-        self.entries = list(self.iter_entries(vcd, tags, self.decoder))
+    def build(self, vcd, tags, decoder=None, *, storage='memory', cancel=None, progress=None):
+        """Build an eager index by default, or an indexed temporary disk store."""
+        if storage not in ('memory', 'disk'):
+            raise ValueError('instruction storage must be memory or disk')
+        selected_decoder = decoder or RV32Decoder()
+        items = self.iter_entries(vcd, tags, selected_decoder, cancel=cancel)
+        if storage == 'disk':
+            from .instruction_store import InstructionResults
+            result = InstructionResults.collect(items, dict, owner=vcd, cancel=cancel,
+                                                 progress=progress, end=vcd.max_time)
+        else:
+            result = list(items)
+        from .results import close_results
+        close_results(self.entries)
+        self.entries = result
+        self.tags, self.decoder = tags, selected_decoder
         self.built = True
         return len(self.entries)
 
@@ -631,212 +641,6 @@ class InstructionTrace:
             yield entry
 
 
-    def query(self, filter_fn):
-        """Apply a filter function to all entries. Returns matching entries."""
-        return [e for e in self.entries if filter_fn(e)]
-
-    # Names available to a query expression. __builtins__ is blanked so a
-    # typo cannot reach open()/__import__ by accident — but this is a
-    # convenience, not a sandbox: Python's eval cannot be made safe against a
-    # hostile expression (object introspection reaches everything). The
-    # prompt runs with the user's own authority, like a Tcl script would,
-    # and is not reachable from the agent control channel.
-    _QUERY_NAMESPACE = {
-        "__builtins__": {},
-        "len": len, "int": int, "str": str, "abs": abs, "min": min, "max": max,
-        "any": any, "all": all, "sum": sum, "range": range, "sorted": sorted,
-        "hex": hex, "bin": bin, "oct": oct, "ord": ord, "bool": bool,
-        "round": round, "float": float,
-    }
-
-    def query_str(self, expr_str):
-        """Apply a string expression as filter. Returns (matches, error_str).
-
-        The expression is a Python lambda evaluated with the user's
-        authority (see _QUERY_NAMESPACE): treat it like a script, not a
-        sandbox.
-        """
-        try:
-            fn = eval(expr_str, dict(self._QUERY_NAMESPACE), {})
-            if callable(fn):
-                return self.query(fn), None
-            return [], "Expression must be callable (use lambda e: ...)"
-        except Exception as ex:
-            return [], str(ex)
-
-    def find_mnemonic(self, pattern):
-        """Find all instructions matching mnemonic pattern (regex)."""
-        pat = re.compile(pattern, re.I)
-        return [e for e in self.entries if pat.search(e['decoded']['mnemonic'])]
-
-    def find_pc_range(self, pc_lo, pc_hi):
-        """Find all instructions with PC in [pc_lo, pc_hi]."""
-        return [e for e in self.entries if pc_lo <= e['pc'] <= pc_hi]
-
-    def find_reg_writes(self, reg_num, pc_lo=0, pc_hi=0xFFFFFFFF):
-        """Find all writes to register reg_num in PC range."""
-        return [e for e in self.entries
-                if e['rd_addr'] == reg_num and pc_lo <= e['pc'] <= pc_hi]
-
-    def find_stores(self, addr_lo=0, addr_hi=0xFFFFFFFF):
-        """Find all stores to address range."""
-        return [e for e in self.entries
-                if e['decoded']['is_store'] and
-                e['mem_addr'] is not None and
-                addr_lo <= e['mem_addr'] <= addr_hi]
-
-    def find_csr_changes(self, csr_addr):
-        """Find all CSR writes to a specific CSR."""
-        return [e for e in self.entries
-                if e['decoded']['is_csr'] and e.get('csr_addr') == csr_addr]
-
-    def find_stalled(self):
-        """Find all instructions retired during stall."""
-        return [e for e in self.entries if e.get('stall')]
-
-
-
-    # ══ MULTI-HART / BARREL PROCESSOR DEBUG ══
-
-    def extract_thread_trace(self, hart_id):
-        """Extract a clean single-thread trace from the interleaved stream."""
-        return [e for e in self.entries if e.get('hart_id') == hart_id]
-
-    def extract_thread_trace_range(self, hart_id, t_start=0, t_end=None):
-        """Extract thread trace within a time range."""
-        if t_end is None:
-            t_end = float('inf')
-        return [e for e in self.entries
-                if e.get('hart_id') == hart_id and t_start <= e['time'] <= t_end]
-
-    def get_active_harts(self):
-        """Get sorted list of all hart IDs seen in the trace."""
-        return sorted(set(e.get('hart_id', 0) for e in self.entries))
-
-    def get_hart_count(self):
-        """Number of distinct harts in the trace."""
-        return len(self.get_active_harts())
-
-    def hart_ipc(self, hart_id, t_start=0, t_end=None):
-        """Compute IPC for a specific hart in a time window."""
-        thread_entries = self.extract_thread_trace_range(hart_id, t_start, t_end)
-        if len(thread_entries) < 2:
-            return 0.0
-        span = thread_entries[-1]['time'] - thread_entries[0]['time']
-        if span <= 0:
-            return 0.0
-        return len(thread_entries) / span
-
-    def all_hart_ipc(self, t_start=0, t_end=None):
-        """Compute IPC for all harts. Returns dict {hart_id: ipc}."""
-        result = {}
-        for h in self.get_active_harts():
-            result[h] = self.hart_ipc(h, t_start, t_end)
-        return result
-
-    def fairness_analysis(self):
-        """Analyze scheduling fairness. Returns per-hart stats."""
-        harts = self.get_active_harts()
-        if not harts or not self.entries:
-            return {}
-
-        results = {}
-        for h in harts:
-            times = [e['time'] for e in self.entries if e.get('hart_id') == h]
-            if len(times) < 2:
-                results[h] = {'count': len(times), 'avg_gap': 0, 'max_gap': 0,
-                              'max_gap_time': 0, 'starved': False}
-                continue
-
-            gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
-            avg_gap = sum(gaps) / len(gaps)
-            max_gap = max(gaps)
-            max_gap_idx = gaps.index(max_gap)
-            max_gap_time = times[max_gap_idx]
-
-            # Starvation = max gap > 3× average (heuristic)
-            starved = max_gap > avg_gap * 3 if avg_gap > 0 else False
-
-            results[h] = {
-                'count': len(times),
-                'avg_gap': avg_gap,
-                'max_gap': max_gap,
-                'max_gap_time': max_gap_time,
-                'starved': starved,
-            }
-        return results
-
-    def find_starvation_events(self, threshold_multiplier=3.0):
-        """Find all times where a hart was starved (gap > threshold × avg)."""
-        harts = self.get_active_harts()
-        events = []
-        for h in harts:
-            times = [e['time'] for e in self.entries if e.get('hart_id') == h]
-            if len(times) < 3:
-                continue
-            gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
-            avg = sum(gaps) / len(gaps)
-            threshold = avg * threshold_multiplier
-            for i, g in enumerate(gaps):
-                if g > threshold:
-                    events.append({
-                        'hart_id': h, 'time': times[i],
-                        'gap': g, 'avg_gap': avg,
-                        'ratio': g / avg if avg > 0 else 0,
-                    })
-        return sorted(events, key=lambda e: e['time'])
-
-    def thread_divergence(self, hart_a, hart_b, after_time=0):
-        """Compare two hart traces and find where they diverge."""
-        trace_a = self.extract_thread_trace_range(hart_a, after_time)
-        trace_b = self.extract_thread_trace_range(hart_b, after_time)
-
-        if not trace_a or not trace_b:
-            return {'identical': False, 'reason': 'Empty trace(s)',
-                    'diverge_time': after_time, 'details': []}
-
-        min_len = min(len(trace_a), len(trace_b))
-        for i in range(min_len):
-            ea, eb = trace_a[i], trace_b[i]
-            da, db = ea['decoded'], eb['decoded']
-
-            if da['mnemonic'] != db['mnemonic']:
-                return {
-                    'identical': False,
-                    'diverge_time': ea['time'],
-                    'diverge_index': i,
-                    'hart_a_entry': ea,
-                    'hart_b_entry': eb,
-                    'reason': f"Mnemonic: {da['asm']} vs {db['asm']}",
-                    'details': self._divergence_details(trace_a, trace_b, i, 5),
-                }
-            if ea['pc'] != eb['pc']:
-                return {
-                    'identical': False,
-                    'diverge_time': ea['time'],
-                    'diverge_index': i,
-                    'hart_a_entry': ea,
-                    'hart_b_entry': eb,
-                    'reason': f"PC: 0x{ea['pc']:x} vs 0x{eb['pc']:x}",
-                    'details': self._divergence_details(trace_a, trace_b, i, 5),
-                }
-
-        return {'identical': True, 'compared': min_len,
-                'reason': f'Identical for {min_len} instructions', 'details': []}
-
-    def _divergence_details(self, trace_a, trace_b, start_idx, count):
-        """Get side-by-side details around divergence point."""
-        details = []
-        for i in range(start_idx, min(start_idx + count, len(trace_a), len(trace_b))):
-            ea, eb = trace_a[i], trace_b[i]
-            details.append({
-                'index': i,
-                'a_time': ea['time'], 'a_pc': ea['pc'], 'a_asm': ea['decoded']['asm'],
-                'b_time': eb['time'], 'b_pc': eb['pc'], 'b_asm': eb['decoded']['asm'],
-                'match': ea['decoded']['mnemonic'] == eb['decoded']['mnemonic'] and ea['pc'] == eb['pc'],
-            })
-        return details
-
     def shared_resource_contention(self, addr_lo=0, addr_hi=0xFFFFFFFF):
         """Find memory accesses to same address from different harts."""
         # Group by address
@@ -901,57 +705,6 @@ class InstructionTrace:
                     if rh != a['hart_id'] and ra['time'] < a['time']:
                         return True
         return False
-
-    def scheduling_heatmap(self, t_start, t_end, n_buckets=80):
-        """Build a heatmap: which hart is active in each time bucket."""
-        if not self.entries:
-            return []
-        bucket_size = max(1, (t_end - t_start) // n_buckets)
-        harts = self.get_active_harts()
-        hart_to_idx = {h: i for i, h in enumerate(harts)}
-        n_harts = len(harts)
-
-        # heatmap[bucket][hart_idx] = count
-        heatmap = [[0] * n_harts for _ in range(n_buckets)]
-
-        for e in self.entries:
-            if t_start <= e['time'] <= t_end:
-                bucket = min(n_buckets - 1, (e['time'] - t_start) // bucket_size)
-                h_idx = hart_to_idx.get(e.get('hart_id', 0), 0)
-                heatmap[bucket][h_idx] += 1
-
-        return {'heatmap': heatmap, 'harts': harts, 'bucket_size': bucket_size,
-                't_start': t_start, 't_end': t_end}
-
-    def register_snapshot(self, hart_id, time, n_regs=32):
-        """Reconstruct register file state for a hart at a given time.
-        Walks backward through the trace to find the last write to each register."""
-        regs = [None] * n_regs
-        regs[0] = 0  # x0 is always 0
-
-        thread_entries = [e for e in self.entries
-                         if e.get('hart_id') == hart_id and e['time'] <= time]
-
-        for e in thread_entries:
-            if e['rd_addr'] is not None and 0 < e['rd_addr'] < n_regs:
-                regs[e['rd_addr']] = e['rd_data']
-
-        return regs
-
-    def summary(self):
-        """Return a summary string."""
-        if not self.entries:
-            return "No trace built"
-        n = len(self.entries)
-        mnemonics = {}
-        for e in self.entries:
-            mn = e['decoded']['mnemonic']
-            mnemonics[mn] = mnemonics.get(mn, 0) + 1
-        top5 = sorted(mnemonics.items(), key=lambda x: -x[1])[:5]
-        t0 = self.entries[0]['time']
-        t1 = self.entries[-1]['time']
-        return (f"{n} instructions [{t0}..{t1}] "
-                f"Top: {', '.join(f'{m}:{c}' for m,c in top5)}")
 
 
 # ══════════════════════════════════════════════════════════════
