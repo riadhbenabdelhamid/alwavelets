@@ -138,19 +138,48 @@ opens. `--no-cache` still uses temporary disk storage, removed on close.
 Expression searches stream only the referenced signals. `when`/`match` searches
 run in the background in disk mode, with progress and a `cancel` command. Derived
 signal output also uses temporary pages. Clock measurement uses a disk sort for
-its exact median. Explicit materialization such as `signal.changes`, some exports,
-and protocol decoder result lists can still consume memory proportional to the
-requested output; narrow those requests when working with very large traces.
+its exact median. CSV, SVG, PDF, and PNG file writers stream their input and
+output. PNG rasterization retains pixels rather than a complete event list,
+including when narrow pulses share a pixel. Protocol decoders expose iterators;
+AXI spills unmatched responses to a temporary disk queue.
+
+Explicit materialization such as `signal.changes`, `render_svg()`, and decoder
+`decode()`/`decode_all()` result lists still uses memory proportional to the
+requested output. Instruction trace `build()` also retains its index. Prefer the
+streaming APIs for large captures; individual transactions still retain their
+payloads. The viewer's decode overlays and bus results retain their decoded
+frames, and file exports from the viewer remain synchronous.
 Live tailing requires `--storage memory`; disk indexes are snapshots.
 
 Library callers can explicitly select storage and should close traces:
 
 ```python
 from alwavelets import parse_file
+from alwavelets.exporting import write_signal_csv, write_svg
+from alwavelets.graphics import write_waveform_png
+from alwavelets.decoders import SPIDecoder
 
 with parse_file("huge.vcd", storage="disk", memory_mib=64) as trace:
-    value = trace.signals[trace.signal_order[0]].value_at(1000)
+    clock = trace.signals[trace.signal_order[0]]
+    data = trace.signals[trace.signal_order[1]]
+    write_signal_csv(clock, "clock.csv")
+    write_waveform_png(trace, "clock.png", [clock.full_name])
+    write_svg(trace, "clock.svg", [clock.full_name])
+    for frame in SPIDecoder(clock, data).iter_decode(0, trace.max_time):
+        print(frame.t_start, frame.label)
 ```
+
+SPI/I²C/UART iterators accept a time range; AXI/Wishbone/AHB provide
+`iter_decode()`, and instruction traces provide `iter_entries(trace, tags)`.
+Streaming decoders and CSV/SVG/PNG writers accept `cancel=threading.Event()`.
+PNG reports progress per signal row; CSV reports processed timestamps.
+Cancelled or failed exports leave an existing destination path intact.
+Caller-supplied streams may already contain partial output.
+
+External LXT/LXT2/GHW/VZT converters and the FST converter fallback write to
+temporary files instead of capturing the converted trace in RAM. The converted
+VCD follows the selected storage policy. Converted disk indexes are temporary
+and removed when the trace closes; keep a converted VCD to reuse its index.
 
 `VCDFile.parse()` remains the explicit eager reader. The old lazy reader remains
 available through its low-level API and the benchmark's `lazy` mode.
@@ -376,6 +405,18 @@ Generation and imports are outside the timed region. The OS page cache is not
 flushed; "cold" refers to Alwavelets' loaded windows, not cold disk I/O. Use
 `--size-mib` and `--signals` to test larger files and hierarchy widths; synthetic
 results should be supplemented with representative project traces.
+
+To exercise complete workflows and many declarations in fresh processes:
+
+```sh
+python3 tools/stress_workflows.py --size-gib 10 --signals 100000 --memory-mib 8 --output stress.json
+```
+
+This generates a 4096-bit bus with a clock, verifies indexed values, streams
+PNG/CSV exports and SPI decoding, and checks reopening without loading pages.
+A separate workload checks 100,000 signal declarations. Reports include total
+process peak RSS, page-cache usage, index size, and timings. The generated traces
+and indexes require temporary disk space and are removed after the run.
 
 ## License
 

@@ -12,6 +12,7 @@ import struct
 import zlib
 
 from .snapshot import _resolve_request, parse_time
+from .streaming import iter_window, check_cancel
 
 # Palette index meanings (kept small so sixel stays compact).
 BG, HIGH, LOW, EDGE, UNDEF, HIZ, BUS, GRID = range(8)
@@ -65,12 +66,12 @@ def png_encode(width, height, indices, palette=PALETTE):
 
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0)  # 8-bit, indexed
     plte = b"".join(struct.pack("BBB", *c) for c in palette)
-    raw = bytearray()
-    stride = width
+    encoder = zlib.compressobj(6)
+    parts = []
     for y in range(height):
-        raw.append(0)                                  # filter: none
-        raw += indices[y * stride:(y + 1) * stride]
-    idat = zlib.compress(bytes(raw), 6)   # 6 is as small as 9 here, ~3x faster
+        parts.append(encoder.compress(b'\0' + indices[y * width:(y + 1) * width]))
+    parts.append(encoder.flush())
+    idat = b''.join(parts)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"PLTE", plte)
             + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
 
@@ -111,12 +112,16 @@ def sixel_encode(width, height, indices, palette=PALETTE):
 
 # ── waveform rasteriser ──────────────────────────────────────────────
 
-def render_waveform_png(vcd, signals=None, t_start=None, t_end=None,
-                        width=900, row_h=22, radix=None, arrangement=None):
-    """Rasterise selected signals over the window into an indexed PNG (bytes).
+def _png_chunk(kind, data):
+    body = kind + data
+    return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xffffffff)
 
-    Traces only (single-bit square waves + bus envelopes); names/labels stay as
-    terminal text when blitted, or are paired with a text snapshot for export."""
+
+def iter_waveform_png(vcd, signals=None, t_start=None, t_end=None,
+                       width=900, row_h=22, radix=None, arrangement=None, *,
+                       cancel=None, progress=None):
+    """Encode rows incrementally, with working memory independent of events."""
+    check_cancel(cancel)
     t_start = 0 if t_start is None else parse_time(vcd, t_start)
     t_end = vcd.max_time if t_end is None else parse_time(vcd, t_end)
     if t_end <= t_start:
@@ -126,11 +131,45 @@ def render_waveform_png(vcd, signals=None, t_start=None, t_end=None,
     sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
     if not sigs:
         raise ValueError("No signals matched; specify signals or a saved arrangement")
-    indices, w, h = _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx)
-    return png_encode(w, h, indices)
+    width, row_h = max(16, int(width)), max(8, int(row_h))
+    yield b'\x89PNG\r\n\x1a\n'
+    yield _png_chunk(b'IHDR', struct.pack('>IIBBBBB', width, row_h * len(sigs), 8, 3, 0, 0, 0))
+    yield _png_chunk(b'PLTE', b''.join(bytes(color) for color in PALETTE))
+    encoder, pending = zlib.compressobj(6), bytearray()
+    for i, sig in enumerate(sigs):
+        check_cancel(cancel)
+        indices, _, _ = _rasterise(vcd, [sig], t_start, t_end, width, row_h, rx, cancel)
+        for y in range(row_h):
+            pending.extend(encoder.compress(b'\0' + indices[y * width:(y + 1) * width]))
+            if len(pending) >= 65536:
+                yield _png_chunk(b'IDAT', pending)
+                pending.clear()
+        if progress is not None:
+            progress(i + 1, len(sigs))
+    pending.extend(encoder.flush())
+    if pending:
+        yield _png_chunk(b'IDAT', pending)
+    check_cancel(cancel)
+    yield _png_chunk(b'IEND', b'')
 
 
-def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx):
+def render_waveform_png(vcd, signals=None, t_start=None, t_end=None,
+                        width=900, row_h=22, radix=None, arrangement=None):
+    """Return PNG bytes; write_waveform_png() streams large exports to disk."""
+    return b''.join(iter_waveform_png(vcd, signals, t_start, t_end, width, row_h, radix, arrangement))
+
+
+def write_waveform_png(vcd, destination, *args, cancel=None, progress=None, **kwargs):
+    """Write PNG with at most one signal row resident; replace paths atomically."""
+    from .exporting import atomic_output
+    written = 0
+    with atomic_output(destination, binary=True) as stream:
+        for chunk in iter_waveform_png(vcd, *args, cancel=cancel, progress=progress, **kwargs):
+            written += stream.write(chunk)
+    return written
+
+
+def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx, cancel=None):
     width = max(16, int(width))
     height = max(row_h, len(sigs) * row_h)
     cv = Canvas(width, height)
@@ -146,24 +185,12 @@ def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx):
         ymid = (yhi + ylo) // 2
         scalar = sig.size == 1 and getattr(sig, "signal_type", "wire") not in ('real', 'realtime')
         levels = {"1": (yhi, HIGH), "0": (ylo, LOW), "x": (ymid, UNDEF), "z": (ymid, HIZ)}
-        tw, vw = sig.changes_in_window(t_start, t_end)
-        segments, edges = [], []
-        cursor, current = t_start, "x"
-        initialized = False
-        for t, value in zip(tw, vw):
-            value = str(value).lower()
-            if t < t_start:
-                current, initialized = value, True
-                continue
-            if t > t_end:
-                break
-            if t > cursor:
-                segments.append((cursor, t, current))
-            if value != current and (initialized or t > t_start):
-                edges.append((t, current, value))
-            cursor, current, initialized = t, value, True
-        segments.append((cursor, t_end, current))
-        for start, end, value in segments:
+        # Paint levels immediately. Edges go into a pixel-sized overlay so
+        # they still win over all levels, as in the original two-pass renderer.
+        # This retains same-tick pulses and x/z history without event lists.
+        overlay = Canvas(width, row_h, bg=255)
+        exceptional = bytearray(width)
+        def segment(start, end, value):
             xa = column(start)
             xb = width - 1 if end == t_end else max(xa, column(end) - 1)
             if scalar:
@@ -173,25 +200,39 @@ def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx):
                 color = UNDEF if "x" in value else HIZ if "z" in value else BUS
                 cv.hline(xa, xb, yhi, color)
                 cv.hline(xa, xb, ylo, color)
-        # Draw every edge, including a pulse shorter than one pixel and
-        # multiple value changes at a single timestamp. Sampling value_at()
-        # once per pixel can erase all of them.
-        exceptional = {}
-        for t, before, after in edges:
-            x = column(t)
-            if scalar:
-                ya = levels.get(before, (ymid, UNDEF))[0]
-                yb = levels.get(after, (ymid, UNDEF))[0]
-                cv.vline(x, min(ya, yb), max(ya, yb), EDGE)
-                cv.px(x, yb, levels.get(after, (ymid, UNDEF))[1])
-            else:
-                cv.vline(x, yhi, ylo, EDGE)
-            exceptional.setdefault(x, set()).update(c for c in before + after if c in "xz")
-        for x, states in exceptional.items():
-            if "x" in states:
+
+        cursor, current = t_start, "x"
+        initialized = False
+        for t, value in iter_window(sig, t_start, t_end, cancel=cancel):
+            value = str(value).lower()
+            if t < t_start:
+                current, initialized = value, True
+                continue
+            if t > cursor:
+                segment(cursor, t, current)
+            if value != current and (initialized or t > t_start):
+                x = column(t)
+                if scalar:
+                    ya = levels.get(current, (ymid, UNDEF))[0]
+                    yb = levels.get(value, (ymid, UNDEF))[0]
+                    overlay.vline(x, min(ya, yb) - y0, max(ya, yb) - y0, EDGE)
+                    overlay.px(x, yb - y0, levels.get(value, (ymid, UNDEF))[1])
+                else:
+                    overlay.vline(x, yhi - y0, ylo - y0, EDGE)
+                if 'x' in current or 'x' in value:
+                    exceptional[x] |= 1
+                if 'z' in current or 'z' in value:
+                    exceptional[x] |= 2
+            cursor, current, initialized = t, value, True
+        segment(cursor, t_end, current)
+        for pos, color in enumerate(overlay.buf):
+            if color != 255:
+                cv.buf[y0 * width + pos] = color
+        for x, states in enumerate(exceptional):
+            if states & 1:
                 cv.px(x, ymid, UNDEF)
-            if "z" in states:
-                cv.px(x, ymid + (1 if "x" in states else 0), HIZ)
+            if states & 2:
+                cv.px(x, ymid + (1 if states & 1 else 0), HIZ)
     return cv.buf, width, height
 
 

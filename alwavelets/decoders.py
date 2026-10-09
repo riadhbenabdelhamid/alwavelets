@@ -6,7 +6,11 @@ AHB). Everything operates on duck-typed signal objects; only the standard
 library is used beyond intra-module references.
 """
 import re
+import heapq
+import itertools
+import sqlite3
 from .core import ensure_trace_loaded
+from .streaming import iter_window, signal_times, merge_times, prefer_nonempty, check_cancel
 
 
 # ══════════════════════════════════════════════════════════════
@@ -44,15 +48,18 @@ def find_signal(vcd, name):
     return idx[1].get(name) or idx[2].get(name)
 
 
+def iter_edges(sig, t_start, t_end, rising=True, cancel=None):
+    """Yield edges without retaining the clock's full history."""
+    target, previous = ('1' if rising else '0'), None
+    for t, value in iter_window(sig, t_start, t_end, cancel=cancel):
+        if t >= t_start and value == target and previous is not None and previous != target:
+            yield t
+        previous = value
+
+
 def rising_edges(sig, t_start, t_end):
-    """Times in [t_start, t_end] where `sig` goes to '1' from anything else."""
-    times, values = sig.changes_in_window(t_start, t_end)
-    out, prev = [], None
-    for t, v in zip(times, values):
-        if t >= t_start and v == '1' and prev is not None and prev != '1':
-            out.append(t)
-        prev = v
-    return out
+    """Compatibility list API; streaming consumers use iter_edges()."""
+    return list(iter_edges(sig, t_start, t_end))
 
 
 def _to_int(v, default=0):
@@ -75,69 +82,51 @@ class SPIDecoder:
         self.cpha = cpha
 
     def decode(self, t_start, t_end):
-        frames = []
-        if self.cs:
-            regions = self._find_active_regions(self.cs, t_start, t_end, '0')
-        else:
-            regions = [(t_start, t_end)]
-        # Data is sampled on the clock's first edge in mode 0 (CPOL0/CPHA0)
-        # and mode 3 (CPOL1/CPHA1) — the rising edge — and on the second
-        # edge, the falling one, in modes 1 and 2.
+        return list(self.iter_decode(t_start, t_end))
+
+    def iter_decode(self, t_start, t_end, *, cancel=None):
+        regions = self._iter_active_regions(self.cs, t_start, t_end, '0', cancel) if self.cs else [(t_start, t_end)]
         rising = (self.cpol == 0) == (self.cpha == 0)
         for rs, r_end in regions:
-            edges = self._find_edges(self.clk, rs, r_end, rising=rising)
-            if not edges:
-                continue
-            mosi_v = miso_v = 0
-            nbits = 0
-            frame_start = edges[0]
-            for t in edges:
-                mosi_v = (mosi_v << 1) | (1 if self.mosi.value_at(t) == '1' else 0)
+            mosi_v = miso_v = nbits = 0
+            frame_start = last_edge = None
+            for t in iter_edges(self.clk, rs, r_end, rising, cancel):
+                if frame_start is None:
+                    frame_start = t
+                last_edge = t
+                mosi_v = (mosi_v << 1) | (self.mosi.value_at(t) == '1')
                 if self.miso is not None:
-                    miso_v = (miso_v << 1) | (1 if self.miso.value_at(t) == '1' else 0)
+                    miso_v = (miso_v << 1) | (self.miso.value_at(t) == '1')
                 nbits += 1
                 if nbits == 8:
                     data = f"miso=0x{miso_v:02X}" if self.miso is not None else ""
-                    frames.append(DecodedFrame(frame_start, t, f"0x{mosi_v:02X}", data, 6))
-                    mosi_v = miso_v = 0
-                    nbits = 0
+                    yield DecodedFrame(frame_start, t, f"0x{mosi_v:02X}", data, 6)
+                    mosi_v = miso_v = nbits = 0
                     frame_start = t
-            if nbits:                                  # residual bits
-                frames.append(DecodedFrame(frame_start, edges[-1],
-                                           f"{mosi_v:0{nbits}b}", "", 6))
-        return frames
+            if nbits:
+                yield DecodedFrame(frame_start, last_edge, f"{mosi_v:0{nbits}b}", "", 6)
 
-    def _find_active_regions(self, sig, t_start, t_end, active_val):
-        regions = []
-        times, values = sig.changes_in_window(t_start, t_end)
-        in_active = (sig.value_at(t_start) == active_val)
+    def _iter_active_regions(self, sig, t_start, t_end, active_val, cancel=None):
+        in_active = sig.value_at(t_start) == active_val
         start = t_start if in_active else None
-        for t, v in zip(times, values):
+        for t, value in iter_window(sig, t_start, t_end, cancel=cancel):
             if t < t_start:
-                in_active = (v == active_val)
+                in_active = value == active_val
                 start = t_start if in_active else None
                 continue
-            if v == active_val and not in_active:
-                start = t
-                in_active = True
-            elif v != active_val and in_active:
-                regions.append((start, t))
+            if value == active_val and not in_active:
+                start, in_active = t, True
+            elif value != active_val and in_active:
+                yield start, t
                 in_active = False
         if in_active and start is not None:
-            regions.append((start, t_end))
-        return regions
+            yield start, t_end
+
+    def _find_active_regions(self, sig, t_start, t_end, active_val):
+        return list(self._iter_active_regions(sig, t_start, t_end, active_val))
 
     def _find_edges(self, sig, t_start, t_end, rising=True):
-        """Times where `sig` becomes '1' (rising) or '0' (falling)."""
-        edges = []
-        times, values = sig.changes_in_window(t_start, t_end)
-        target = '1' if rising else '0'
-        prev = None
-        for t, v in zip(times, values):
-            if t >= t_start and v == target and prev is not None and prev != target:
-                edges.append(t)
-            prev = v
-        return edges
+        return list(iter_edges(sig, t_start, t_end, rising))
 
 
 class I2CDecoder:
@@ -155,31 +144,45 @@ class I2CDecoder:
         self.scl = scl_sig
 
     def decode(self, t_start, t_end):
-        frames = []
-        events = []                      # (time, order, kind): kind S/P/C
-        for t in rising_edges(self.scl, t_start, t_end):
-            events.append((t, 1, 'C'))
-        sda_t, sda_v = self.sda.changes_in_window(t_start, t_end)
-        prev = None
-        for t, v in zip(sda_t, sda_v):
-            if t >= t_start and prev is not None and self.scl.value_at(t) == '1':
-                if prev == '1' and v == '0':
-                    events.append((t, 0, 'S'))
-                elif prev == '0' and v == '1':
-                    events.append((t, 0, 'P'))
-            prev = v
-        events.sort()
+        return list(self.iter_decode(t_start, t_end))
 
+    def iter_decode(self, t_start, t_end, *, cancel=None):
+        clocks = ((t, 1, 'C') for t in iter_edges(self.scl, t_start, t_end, cancel=cancel))
+        data = ((t, 0, value) for t, value in iter_window(self.sda, t_start, t_end, cancel=cancel))
+        def ordered_events():
+            previous = None
+            merged = heapq.merge(data, clocks, key=lambda event: event[:2])
+            for t, group in itertools.groupby(merged, key=lambda event: event[0]):
+                starts = stops = nclocks = 0
+                high = t >= t_start and self.scl.value_at(t) == '1'
+                for _, channel, value in group:
+                    if channel:
+                        nclocks += 1
+                    else:
+                        if high:
+                            starts += previous == '1' and value == '0'
+                            stops += previous == '0' and value == '1'
+                        previous = value
+                # Match the legacy (time, order, kind) sort, including deltas,
+                # without searching ahead to the capture's next STOP first.
+                for kind, count in (('P', stops), ('S', starts), ('C', nclocks)):
+                    for _ in range(count):
+                        check_cancel(cancel)
+                        yield t, 0, kind
+        events = ordered_events()
         bits = []
         byte_start = None
         after_start = False
         awaiting_ack = None              # the byte frame whose ACK clock is next
         for t, _, kind in events:
+            if kind in ('S', 'P') and awaiting_ack is not None:
+                yield awaiting_ack
+                awaiting_ack = None
             if kind == 'S':
-                frames.append(DecodedFrame(t, t, 'S', 'START', 5))
+                yield DecodedFrame(t, t, 'S', 'START', 5)
                 bits, awaiting_ack, after_start = [], None, True
             elif kind == 'P':
-                frames.append(DecodedFrame(t, t, 'P', 'STOP', 5))
+                yield DecodedFrame(t, t, 'P', 'STOP', 5)
                 bits, awaiting_ack, after_start = [], None, False
             else:
                 bit = 1 if self.sda.value_at(t) == '1' else 0
@@ -187,6 +190,7 @@ class I2CDecoder:
                     ack = 'ACK' if bit == 0 else 'NAK'
                     awaiting_ack.data = f"{awaiting_ack.data} {ack}".strip()
                     awaiting_ack.t_end = t
+                    yield awaiting_ack
                     awaiting_ack = None
                     continue
                 if not bits:
@@ -201,9 +205,9 @@ class I2CDecoder:
                         data = f"addr 0x{val >> 1:02X} {'R' if val & 1 else 'W'}"
                         after_start = False
                     awaiting_ack = DecodedFrame(byte_start, t, f"0x{val:02X}", data, 6)
-                    frames.append(awaiting_ack)
                     bits = []
-        return frames
+        if awaiting_ack is not None:
+            yield awaiting_ack
 
 
 class UARTDecoder:
@@ -224,15 +228,19 @@ class UARTDecoder:
         self.stop_bits = max(1, int(stop_bits))
 
     def decode(self, t_start, t_end):
-        frames = []
+        return list(self.iter_decode(t_start, t_end))
+
+    def iter_decode(self, t_start, t_end, *, cancel=None):
+        check_cancel(cancel)
         baud = int(self.baud_period)
         if baud <= 0:
-            return frames
+            return
         half = baud // 2
         n_par = 1 if self.parity else 0
         frame_len = (1 + self.data_bits + n_par + self.stop_bits) * baud
         t = t_start - 1
         while t < t_end:
+            check_cancel(cancel)
             nxt = self.data.next_edge_after(t)
             if nxt is None or nxt >= t_end:
                 break
@@ -256,7 +264,7 @@ class UARTDecoder:
             stop_ok = all(self.data.value_at(sample + k * baud) == '1'
                           for k in range(self.stop_bits))
             if not stop_ok:
-                frames.append(DecodedFrame(nxt, min(nxt + baud, t_end), 'FRAME ERR', '', 1))
+                yield DecodedFrame(nxt, min(nxt + baud, t_end), 'FRAME ERR', '', 1)
                 t = nxt
                 continue
             if 32 <= val < 127:
@@ -264,10 +272,10 @@ class UARTDecoder:
             else:
                 label = f"0x{val:02X}"
             frame_end = nxt + frame_len
-            frames.append(DecodedFrame(nxt, min(frame_end, t_end), label, ' '.join(errs), 6))
+            yield DecodedFrame(nxt, min(frame_end, t_end), label, ' '.join(errs), 6)
             # The next start bit may coincide with the end of this stop bit.
             t = frame_end - 1
-        return frames
+        return
 
 
 # ══════════════════════════════════════════════════════════════
@@ -526,19 +534,25 @@ class InstructionTrace:
         self.built = False
 
     def build(self, vcd, tags, decoder=None):
-        """Build trace from VCD + tag store. Returns number of entries."""
-        ensure_trace_loaded(vcd)
+        """Build an in-memory index; use iter_entries() for streaming exports."""
         self.tags = tags
         self.decoder = decoder or RV32Decoder()
-        self.entries = []
+        self.built = False
+        self.entries = list(self.iter_entries(vcd, tags, self.decoder))
+        self.built = True
+        return len(self.entries)
 
+    def iter_entries(self, vcd, tags, decoder=None, *, cancel=None):
+        ensure_trace_loaded(vcd)
+        check_cancel(cancel)
+        decoder = decoder or RV32Decoder()
         # Resolve tagged signals
         instr_name = tags.get_signal('isa.instr.writeback')
         valid_name = tags.get_signal('isa.valid.writeback')
         pc_name = tags.get_signal('isa.pc.writeback')
 
         if not instr_name:
-            return 0
+            return
 
         def find_sig(name):
             return find_signal(vcd, name)
@@ -560,7 +574,7 @@ class InstructionTrace:
         thread_id_sig = find_sig(tags.get_signal('isa.thread_id'))
 
         if not instr_sig:
-            return 0
+            return
 
         def safe_int(sig, t, default=None):
             if not sig:
@@ -582,12 +596,12 @@ class InstructionTrace:
         # walking only the instruction's changes missed a repeated
         # instruction retired again on a later valid pulse.
         clk_sig = find_sig(tags.get_signal('clock'))
-        cands = rising_edges(clk_sig, 0, vcd.max_time) if clk_sig is not None else []
-        if not cands:
-            cand_set = set(instr_sig._times)
+        def fallback():
+            streams = [signal_times(instr_sig, getattr(vcd, 'min_time', 0), vcd.max_time)]
             if valid_sig is not None:
-                cand_set.update(rising_edges(valid_sig, 0, vcd.max_time))
-            cands = sorted(cand_set)
+                streams.append(iter_edges(valid_sig, 0, vcd.max_time, cancel=cancel))
+            return merge_times(streams, cancel)
+        cands = prefer_nonempty(iter_edges(clk_sig, 0, vcd.max_time, cancel=cancel), fallback) if clk_sig is not None else fallback()
         for t in cands:
             if valid_sig is not None and valid_sig.value_at(t) != '1':
                 continue
@@ -597,7 +611,7 @@ class InstructionTrace:
                 continue
 
             pc_val = safe_int(pc_sig, t, 0)
-            decoded = self.decoder.decode(instr_bits, pc_val)
+            decoded = decoder.decode(instr_bits, pc_val)
 
             entry = {
                 'time': t,
@@ -614,10 +628,8 @@ class InstructionTrace:
                 'hart_id': safe_int(hart_id_sig, t, tags.hart_id),
                 'thread_id': safe_int(thread_id_sig, t, tags.thread_id),
             }
-            self.entries.append(entry)
+            yield entry
 
-        self.built = True
-        return len(self.entries)
 
     def query(self, filter_fn):
         """Apply a filter function to all entries. Returns matching entries."""
@@ -990,142 +1002,183 @@ class _BusDecoder:
                 return sig
         return None
 
-    def _sample_points(self, sigs, clock=None):
+    def _sample_points(self, sigs, clock=None, cancel=None):
         ensure_trace_loaded(self.vcd)
         clock = clock or self._clock()
+        def fallback():
+            return merge_times((signal_times(sig, getattr(self.vcd, 'min_time', 0), self.vcd.max_time)
+                                for sig in sigs if sig is not None), cancel)
         if clock is not None:
-            edges = rising_edges(clock, 0, self.vcd.max_time)
-            if edges:
-                return edges
-        times = set()
-        for sg in sigs:
-            if sg is not None:
-                times.update(sg._times)
-        return sorted(times)
+            return prefer_nonempty(iter_edges(clock, 0, self.vcd.max_time, cancel=cancel), fallback)
+        return fallback()
+
+    @staticmethod
+    def _iter_handshakes(valid_sig, ready_sig, clock=None, max_time=None, cancel=None):
+        if valid_sig is None or ready_sig is None:
+            return
+        end = max_time if max_time is not None else max(
+            valid_sig._times[-1] if len(valid_sig._times) else 0,
+            ready_sig._times[-1] if len(ready_sig._times) else 0)
+        if clock is not None:
+            points = iter_edges(clock, 0, end, cancel=cancel)
+        else:
+            points = merge_times((signal_times(sig, 0, end) for sig in (valid_sig, ready_sig)), cancel)
+        for t in points:
+            if valid_sig.value_at(t) == '1' and ready_sig.value_at(t) == '1':
+                yield t
 
     @staticmethod
     def _handshake_times(valid_sig, ready_sig, clock=None, max_time=None):
-        """Times at which valid and ready are both high: each clock rising
-        edge with a clock, else each change event of either signal."""
-        if not valid_sig or not ready_sig:
-            return []
-        if clock is not None:
-            end = max_time if max_time is not None else max(
-                valid_sig._times[-1] if len(valid_sig._times) else 0,
-                ready_sig._times[-1] if len(ready_sig._times) else 0)
-            pts = rising_edges(clock, 0, end)
-        else:
-            pts = sorted(set(valid_sig._times) | set(ready_sig._times))
-        return [t for t in pts
-                if valid_sig.value_at(t) == '1' and ready_sig.value_at(t) == '1']
+        """Compatibility list API for handshake timestamps."""
+        return list(_BusDecoder._iter_handshakes(valid_sig, ready_sig, clock, max_time))
+
+
+class _PendingResponses:
+    """Spill unmatched AXI responses to disk instead of retaining the trace.
+
+    AXI IDs may complete out of order. An indexed temporary spool preserves
+    address-order output and handles missing responses without an unbounded
+    Python backlog. The spool is deleted when its iterator closes.
+    """
+    def __init__(self, events, cancel=None):
+        self.events, self.cancel = iter(events), cancel
+        self.db = sqlite3.connect('')
+        self.db.execute('PRAGMA cache_size=-1024')
+        self.db.execute('PRAGMA temp_store=FILE')
+        self.db.execute('CREATE TABLE pending(seq INTEGER PRIMARY KEY,t INTEGER,k TEXT)')
+        self.db.execute('CREATE INDEX by_key_time ON pending(k,t,seq)')
+        self.writes = 0
+
+    def take(self, minimum, key=None):
+        check_cancel(self.cancel)
+        key = str(key)
+        row = self.db.execute('SELECT seq,t FROM pending WHERE k=? AND t>=? ORDER BY t,seq LIMIT 1',
+                              (key, minimum)).fetchone()
+        if row is not None:
+            self.db.execute('DELETE FROM pending WHERE seq=?', (row[0],))
+            return row[1]
+        for t, event_key in self.events:
+            check_cancel(self.cancel)
+            event_key = str(event_key)
+            if t >= minimum and event_key == key:
+                return t
+            self.db.execute('INSERT INTO pending(t,k) VALUES(?,?)', (t, event_key))
+            self.writes += 1
+            if self.writes % 1024 == 0:
+                self.db.commit()
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.db.close()
 
 
 class AXIDecoder(_BusDecoder):
     BURST_NAMES = {0: 'FIXED', 1: 'INCR', 2: 'WRAP'}
     RESP_NAMES = {0: 'OKAY', 1: 'EXOKAY', 2: 'SLVERR', 3: 'DECERR'}
 
-    def _hs(self, v, r, clk):
+    def _hs(self, v, r, clk, cancel=None):
         ensure_trace_loaded(self.vcd)
-        return self._handshake_times(v, r, clk, self.vcd.max_time) if v and r else []
+        return self._iter_handshakes(v, r, clk, self.vcd.max_time, cancel) if v and r else iter(())
 
     def decode_writes(self):
+        return list(self.iter_writes())
+
+    def iter_writes(self, *, cancel=None):
         aw_v, aw_r, aw_a = (self._find_sig(k) for k in ('axi.aw.valid', 'axi.aw.ready', 'axi.aw.addr'))
         aw_id, aw_len, aw_burst = (self._find_sig(k) for k in ('axi.aw.id', 'axi.aw.len', 'axi.aw.burst'))
         w_v, w_r, w_d = (self._find_sig(k) for k in ('axi.w.valid', 'axi.w.ready', 'axi.w.data'))
         b_v, b_r, b_resp, b_id = (self._find_sig(k) for k in ('axi.b.valid', 'axi.b.ready', 'axi.b.resp', 'axi.b.id'))
         if not (aw_v and aw_r and aw_a):
-            return []
+            return
         clk = self._clock()
-        aw_times = self._hs(aw_v, aw_r, clk)
-        w_times = self._hs(w_v, w_r, clk)
-        b_times = self._hs(b_v, b_r, clk)
+        aw_times = self._hs(aw_v, aw_r, clk, cancel)
+        w_times = self._hs(w_v, w_r, clk, cancel)
+        b_times = self._hs(b_v, b_r, clk, cancel)
 
         # W beats arrive in AW order (AXI4 has no WID), so they are consumed
         # from one cursor; the write-data channel may even lead AW. B
         # responses are matched by BID when it is tagged, else in order.
-        txns = []
-        wi = 0
-        b_left = list(b_times)
-        for t_aw in aw_times:
-            txn = BusTransaction('AXI4', 'write', t_aw)
-            txn.addr = self._to_int(aw_a.value_at(t_aw))
-            if aw_id: txn.id = self._to_int(aw_id.value_at(t_aw))
-            txn.length = (self._to_int(aw_len.value_at(t_aw)) + 1) if aw_len else 1
-            if aw_burst:
-                txn.burst = self.BURST_NAMES.get(self._to_int(aw_burst.value_at(t_aw)), '?')
-            for _ in range(txn.length):
-                if wi >= len(w_times):
-                    break
-                t_w = w_times[wi]
-                wi += 1
-                if w_d:
-                    txn.data.append(self._to_int(w_d.value_at(t_w)))
-                txn.t_end = max(txn.t_end, t_w)
-            for i, t_b in enumerate(b_left):
-                if t_b < txn.t_end:
-                    continue
-                if b_id and aw_id and self._to_int(b_id.value_at(t_b)) != txn.id:
-                    continue
-                if b_resp:
-                    txn.resp = self.RESP_NAMES.get(self._to_int(b_resp.value_at(t_b)), '?')
-                txn.t_end = t_b
-                del b_left[i]
-                break
-            txns.append(txn)
-        return txns
+        responses = ((t, self._to_int(b_id.value_at(t)) if b_id and aw_id else None) for t in b_times)
+        with _PendingResponses(responses, cancel) as pending:
+            for t_aw in aw_times:
+                txn = BusTransaction('AXI4', 'write', t_aw)
+                txn.addr = self._to_int(aw_a.value_at(t_aw))
+                if aw_id: txn.id = self._to_int(aw_id.value_at(t_aw))
+                txn.length = (self._to_int(aw_len.value_at(t_aw)) + 1) if aw_len else 1
+                if aw_burst:
+                    txn.burst = self.BURST_NAMES.get(self._to_int(aw_burst.value_at(t_aw)), '?')
+                for _ in range(txn.length):
+                    check_cancel(cancel)
+                    t_w = next(w_times, None)
+                    if t_w is None:
+                        break
+                    if w_d:
+                        txn.data.append(self._to_int(w_d.value_at(t_w)))
+                    txn.t_end = max(txn.t_end, t_w)
+                t_b = pending.take(txn.t_end, txn.id if b_id and aw_id else None)
+                if t_b is not None:
+                    if b_resp:
+                        txn.resp = self.RESP_NAMES.get(self._to_int(b_resp.value_at(t_b)), '?')
+                    txn.t_end = t_b
+                yield txn
 
     def decode_reads(self):
+        return list(self.iter_reads())
+
+    def iter_reads(self, *, cancel=None):
         ar_v, ar_r, ar_a = (self._find_sig(k) for k in ('axi.ar.valid', 'axi.ar.ready', 'axi.ar.addr'))
         ar_id, ar_len = (self._find_sig(k) for k in ('axi.ar.id', 'axi.ar.len'))
         r_v, r_r, r_d, r_resp, r_id = (self._find_sig(k) for k in
                                        ('axi.r.valid', 'axi.r.ready', 'axi.r.data', 'axi.r.resp', 'axi.r.id'))
         if not (ar_v and ar_r and ar_a):
-            return []
+            return
         clk = self._clock()
-        ar_times = self._hs(ar_v, ar_r, clk)
-        r_times = self._hs(r_v, r_r, clk)
-        # R beats can interleave between IDs; with RID tagged each ID has its
-        # own queue, otherwise beats are consumed in order.
-        by_id = {}
-        for t_r in r_times:
-            key = self._to_int(r_id.value_at(t_r)) if (r_id and ar_id) else None
-            by_id.setdefault(key, []).append(t_r)
-        txns = []
-        for t_ar in ar_times:
-            txn = BusTransaction('AXI4', 'read', t_ar)
-            txn.addr = self._to_int(ar_a.value_at(t_ar))
-            if ar_id: txn.id = self._to_int(ar_id.value_at(t_ar))
-            txn.length = (self._to_int(ar_len.value_at(t_ar)) + 1) if ar_len else 1
-            queue = by_id.get(txn.id if (r_id and ar_id) else None, [])
-            for _ in range(txn.length):
-                while queue and queue[0] < t_ar:
-                    queue.pop(0)
-                if not queue:
-                    break
-                t_r = queue.pop(0)
-                if r_d:
-                    txn.data.append(self._to_int(r_d.value_at(t_r)))
-                if r_resp:
-                    txn.resp = self.RESP_NAMES.get(self._to_int(r_resp.value_at(t_r)), '?')
-                txn.t_end = t_r
-            txns.append(txn)
-        return txns
+        ar_times = self._hs(ar_v, ar_r, clk, cancel)
+        r_times = self._hs(r_v, r_r, clk, cancel)
+        responses = ((t, self._to_int(r_id.value_at(t)) if r_id and ar_id else None) for t in r_times)
+        with _PendingResponses(responses, cancel) as pending:
+            for t_ar in ar_times:
+                txn = BusTransaction('AXI4', 'read', t_ar)
+                txn.addr = self._to_int(ar_a.value_at(t_ar))
+                if ar_id: txn.id = self._to_int(ar_id.value_at(t_ar))
+                txn.length = (self._to_int(ar_len.value_at(t_ar)) + 1) if ar_len else 1
+                for _ in range(txn.length):
+                    t_r = pending.take(t_ar, txn.id if r_id and ar_id else None)
+                    if t_r is None:
+                        break
+                    if r_d:
+                        txn.data.append(self._to_int(r_d.value_at(t_r)))
+                    if r_resp:
+                        txn.resp = self.RESP_NAMES.get(self._to_int(r_resp.value_at(t_r)), '?')
+                    txn.t_end = t_r
+                yield txn
 
     def decode_all(self):
-        all_txns = self.decode_writes() + self.decode_reads()
-        all_txns.sort(key=lambda t: t.t_start)
-        return all_txns
+        return list(self.iter_decode())
+
+    def iter_decode(self, *, cancel=None):
+        writes, reads = self.iter_writes(cancel=cancel), self.iter_reads(cancel=cancel)
+        try:
+            yield from heapq.merge(writes, reads, key=lambda txn: txn.t_start)
+        finally:
+            writes.close()
+            reads.close()
 
 
 class WishboneDecoder(_BusDecoder):
     def decode_all(self):
+        return list(self.iter_decode())
+
+    def iter_decode(self, *, cancel=None):
         cyc, stb, we, ack = (self._find_sig(k) for k in ('wb.cyc', 'wb.stb', 'wb.we', 'wb.ack'))
         addr, dat_i, dat_o = (self._find_sig(k) for k in ('wb.addr', 'wb.dat_i', 'wb.dat_o'))
         if not (cyc and stb and ack):
-            return []
-        txns = []
+            return
         cur = None
-        for t in self._sample_points([cyc, stb, ack]):
+        for t in self._sample_points([cyc, stb, ack], cancel=cancel):
             c = cyc.value_at(t) == '1'
             s_ = stb.value_at(t) == '1'
             a = ack.value_at(t) == '1'
@@ -1140,9 +1193,9 @@ class WishboneDecoder(_BusDecoder):
                     cur.data.append(self._to_int(dat_o.value_at(t)))
                 cur.t_end = t
                 cur.resp = 'OK'
-                txns.append(cur)
+                yield cur
                 cur = None
-        return txns
+
 
 
 class AHBDecoder(_BusDecoder):
@@ -1150,15 +1203,17 @@ class AHBDecoder(_BusDecoder):
     HRESP = {0: 'OKAY', 1: 'ERROR'}
 
     def decode_all(self):
+        return list(self.iter_decode())
+
+    def iter_decode(self, *, cancel=None):
         hready, hwrite, haddr = (self._find_sig(k) for k in ('ahb.hready', 'ahb.hwrite', 'ahb.haddr'))
         hwdata, hrdata, hresp, htrans = (self._find_sig(k) for k in
                                          ('ahb.hwdata', 'ahb.hrdata', 'ahb.hresp', 'ahb.htrans'))
         if not (hready and haddr and htrans):
-            return []
-        txns = []
+            return
         cur = None          # open burst (NONSEQ + following SEQ beats)
         pending = None      # beat whose data phase completes at the next ready
-        for t in self._sample_points([haddr, htrans, hready]):
+        for t in self._sample_points([haddr, htrans, hready], cancel=cancel):
             if hready.value_at(t) != '1':
                 continue
             if pending is not None:
@@ -1173,7 +1228,7 @@ class AHBDecoder(_BusDecoder):
             trans = self._to_int(htrans.value_at(t))
             if trans == 2:                                   # NONSEQ: new transfer
                 if cur is not None:
-                    txns.append(cur)
+                    yield cur
                 is_w = hwrite.value_at(t) == '1' if hwrite else False
                 cur = BusTransaction('AHB', 'write' if is_w else 'read', t)
                 cur.addr = self._to_int(haddr.value_at(t))
@@ -1183,8 +1238,7 @@ class AHBDecoder(_BusDecoder):
                 cur.length += 1
                 pending = cur
             elif trans == 0 and cur is not None:             # IDLE ends the burst
-                txns.append(cur)
+                yield cur
                 cur = None
         if cur is not None:
-            txns.append(cur)
-        return txns
+            yield cur

@@ -1392,11 +1392,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             return
         fname = f"/tmp/vcd_export_{sig.name}.csv"
         try:
-            with open(fname, 'w') as f:
-                f.write("time,value\n")
-                for t, v in sig.changes:          # decodes packed scalar values
-                    f.write(f"{t},{v}\n")
-            self._show_message(f"Exported {sig.num_changes()} rows → {fname}")
+            from .exporting import write_signal_csv
+            self.vcd.require_loaded()
+            count = write_signal_csv(sig, fname, self.vcd.min_time, self.vcd.max_time)
+            self._show_message(f"Exported {count} rows → {fname}")
         except Exception as e:
             self._show_message(f"Export error: {e}")
 

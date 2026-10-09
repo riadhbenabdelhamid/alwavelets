@@ -34,6 +34,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import *  # noqa: F401,F403
 from .manual import *  # noqa: F401,F403
 from .snapshot import *  # noqa: F401,F403
+from .exporting import write_signal_csv, write_svg  # noqa: F401
 from .graphics import *  # noqa: F401,F403
 
 # The curses viewer and the CLI import `curses`, which is missing on Windows

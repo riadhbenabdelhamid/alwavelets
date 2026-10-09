@@ -22,7 +22,7 @@ import zlib
 from .core import VCDSignal, AliasSignal, numeric_value, clear_pack_memos
 from .value_stream import ValueState
 
-VERSION = 2  # includes the persistent min/max hierarchy
+VERSION = 3  # exact summaries also support integers beyond Python's decimal limit
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 AUTO_THRESHOLD = 50 * 1024 * 1024
@@ -30,6 +30,16 @@ AUTO_THRESHOLD = 50 * 1024 * 1024
 
 class Cancelled(ValueError):
     pass
+
+
+def _encode_number(value):
+    # Very wide logic vectors can exceed Python's decimal conversion limit.
+    return json.dumps({'hex': hex(value)}) if isinstance(value, int) else json.dumps(value)
+
+
+def _decode_number(value):
+    value = json.loads(value)
+    return int(value['hex'], 16) if isinstance(value, dict) else value
 
 
 class SequenceView(Sequence):
@@ -156,6 +166,8 @@ def use_disk_storage(source, mode='auto'):
     from .fst import FSTReader
     with open(source, 'rb') as f:
         supported = f.read(1) == b'$' or FSTReader.is_fst(source)
+    if not supported and os.path.splitext(source)[1].lower() in ('.lxt', '.lxt2', '.ghw', '.vzt'):
+        return False  # dispatcher converts first, then applies storage policy
     if mode == 'disk' and not supported:
         raise ValueError('Disk storage requires VCD or FST input')
     return supported and (mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD)
@@ -259,7 +271,7 @@ class TraceStore:
                                       (sig.key, index, stop - index)).fetchone()
                 if row is not None:
                     n, vmin, vmax = row
-                    candidates = (json.loads(vmin), json.loads(vmax))
+                    candidates = (_decode_number(vmin), _decode_number(vmax))
                     index += n
                 else:
                     page, lo = self.page_at(sig.key, index)
@@ -399,13 +411,13 @@ class PageWriter:
         with self.store.lock:
             self.store.db.execute('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)',
                                   (key, lo, n, min(sig._times), max(sig._times),
-                                   json.dumps(minimum), json.dumps(maximum), data))
+                                   _encode_number(minimum), _encode_number(maximum), data))
             self.add_summary(key, lo, n, 0, minimum, maximum)
         self.totals[key] = lo + n
 
     def add_summary(self, key, lo, n, level, minimum, maximum):
         self.store.db.execute('INSERT INTO summaries VALUES(?,?,?,?,?,?)',
-                              (key, lo, n, level, json.dumps(minimum), json.dumps(maximum)))
+                              (key, lo, n, level, _encode_number(minimum), _encode_number(maximum)))
         group_key = key, level
         group = self.summary_groups.get(group_key)
         if group is None:

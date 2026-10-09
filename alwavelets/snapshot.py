@@ -266,10 +266,19 @@ def render_signal_rows(vcd, rows, t_start, t_end, width=100, name_width=None,
 
 def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
                row_h=26, name_w=140, radix=None, theme=None, arrangement=None):
-    """Render selected signals over the window as a standalone SVG string.
+    """Return an SVG string; write_svg() streams large exports to a file."""
+    return '\n'.join(iter_svg(vcd, signals, t_start, t_end, width, row_h, name_w,
+                              radix, theme, arrangement))
+
+
+def iter_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
+             row_h=26, name_w=140, radix=None, theme=None, arrangement=None, *, cancel=None):
+    """Yield a standalone SVG document one line at a time.
 
     `theme` may be a built-in name (dark/light/phosphor) or a theme-JSON path;
     `arrangement` is a saved-view file supplying signals + radix."""
+    from .streaming import iter_segments, check_cancel
+    check_cancel(cancel)
     t_start = 0 if t_start is None else parse_time(vcd, t_start)
     t_end = vcd.max_time if t_end is None else parse_time(vcd, t_end)
     if t_end <= t_start:
@@ -284,7 +293,7 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
     total_h = margin * 2 + row_h * (len(sigs) + 1)
     total_w = margin * 2 + name_w + wave_w
 
-    out = [
+    yield from [
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d">' % (total_w, total_h),
         '<rect width="%d" height="%d" fill="%s"/>' % (total_w, total_h, pal["bg"]),
         '<style>text{font-family:monospace;font-size:12px;fill:%(val)s}'
@@ -295,16 +304,17 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
     ]
     # ruler
     ry = margin + 12
-    out.append('<text x="%d" y="%d" class="rl">%s</text>'
+    yield ('<text x="%d" y="%d" class="rl">%s</text>'
                % (margin, ry, xml_escape(vcd.time_to_str(t_start))))
-    out.append('<text x="%d" y="%d" class="rl" text-anchor="end">%s</text>'
+    yield ('<text x="%d" y="%d" class="rl" text-anchor="end">%s</text>'
                % (total_w - margin, ry, xml_escape(vcd.time_to_str(t_end))))
 
     for i, sig in enumerate(sigs):
+        check_cancel(cancel)
         y0 = margin + row_h * (i + 1)
         ytop, ybot, ymid = y0 + 4, y0 + row_h - 6, y0 + row_h // 2
         x0 = margin + name_w
-        out.append('<text x="%d" y="%d" class="nm">%s</text>'
+        yield ('<text x="%d" y="%d" class="nm">%s</text>'
                    % (margin, ymid + 4, xml_escape(sig.full_name[-22:])))
         if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
             pts, cls = [], "hi"
@@ -314,27 +324,21 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
                 y = ytop if v == "1" else ybot if v == "0" else ymid
                 cls = "ud" if v in ("x", "z") else "hi" if v == "1" else "lo"
                 pts.append("%d,%d" % (x0 + c, y))
-            out.append('<polyline points="%s" class="hi"/>' % " ".join(pts))
+            yield ('<polyline points="%s" class="hi"/>' % " ".join(pts))
         else:
-            tw, vw = sig.changes_in_window(t_start, t_end)
-            for j in range(len(tw)):
-                # The first entry can predate the window (changes_in_window
-                # returns one-before for the initial value): clamp it to the
-                # wave area or the segment and its label land on the name.
-                xa = x0 + max(0, int((tw[j] - t_start) / span * wave_w))
-                xb = x0 + (int((tw[j + 1] - t_start) / span * wave_w)
-                           if j + 1 < len(tw) else wave_w)
-                cls = "ud" if any(c in vw[j] for c in "xXzZ") else "bus"
-                out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" class="%s"/>'
+            for begin, end, value in iter_segments(sig, t_start, t_end, cancel):
+                xa = x0 + max(0, int((begin - t_start) / span * wave_w))
+                xb = x0 + int((end - t_start) / span * wave_w)
+                cls = "ud" if any(c in value for c in "xXzZ") else "bus"
+                yield ('<line x1="%d" y1="%d" x2="%d" y2="%d" class="%s"/>'
                            % (xa, ytop, xb, ytop, cls))
-                out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" class="%s"/>'
+                yield ('<line x1="%d" y1="%d" x2="%d" y2="%d" class="%s"/>'
                            % (xa, ybot, xb, ybot, cls))
                 if xb - xa > 22:
-                    lbl = format_typed_value(sig, vw[j], rx)
-                    out.append('<text x="%d" y="%d" font-size="10">%s</text>'
+                    lbl = format_typed_value(sig, value, rx)
+                    yield ('<text x="%d" y="%d" font-size="10">%s</text>'
                                % (xa + 3, ymid + 3, xml_escape(lbl)))
-    out.append("</svg>")
-    return "\n".join(out)
+    yield "</svg>"
 
 
 # ── Measurements ─────────────────────────────────────────────────────

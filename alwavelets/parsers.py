@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import threading
+import tempfile
 from collections import OrderedDict
 
 from .core import VCDSignal, AliasSignal, clear_pack_memos, split_reference
@@ -77,51 +78,47 @@ def _compact_times(vcd):
             sig._times = array.array('i', t)
 
 
-def _fst_via_converter(filename, progress_cb=None):
-    """Convert FST to VCD using fst2vcd, then parse the VCD."""
+def _convert_trace(filename, converter, progress_cb=None, *, timeout=120,
+                   storage='auto', memory_mib=256, jobs=None):
+    """Spool converter output to private files, never PIPE-sized RAM buffers."""
+    try:
+        with tempfile.TemporaryDirectory(prefix='alwavelets-convert-') as directory:
+            converted = os.path.join(directory, 'trace.vcd')
+            with open(converted, 'wb') as output, tempfile.TemporaryFile() as errors:
+                result = subprocess.run([converter, os.fspath(filename)], stdout=output,
+                                        stderr=errors, timeout=timeout)
+                if result.returncode:
+                    errors.seek(0)
+                    detail = errors.read(65537)
+                    suffix = ' [stderr truncated]' if len(detail) > 65536 else ''
+                    raise ConverterError('%s failed: %s%s' % (
+                        os.path.basename(converter), detail[:65536].decode('utf-8', 'replace').strip(), suffix))
+            if os.path.getsize(converted) < 10:
+                raise ConverterError('%s produced empty output' % os.path.basename(converter))
+            # A disk index is self-contained when parsing returns. It survives
+            # deletion of the converted source until the returned trace closes.
+            trace = parse_file(converted, progress_cb, use_cache=False, jobs=jobs,
+                               storage=storage, memory_mib=memory_mib)
+            trace._filename = os.fspath(filename)
+            return trace
+    except subprocess.TimeoutExpired as exc:
+        raise ConverterError('%s timed out (>%ds)' % (os.path.basename(converter), timeout)) from exc
+    except ConverterError:
+        raise
+    except Exception as exc:
+        raise ConverterError('%s: %s' % (os.path.basename(converter), exc)) from exc
+
+
+def _fst_via_converter(filename, progress_cb=None, storage='auto', memory_mib=256):
+    """Convert FST to VCD using fst2vcd, then parse with the chosen storage."""
     converter = shutil.which('fst2vcd')
     if not converter:
         raise ConverterError(
             "'fst2vcd' not found. Install GTKWave tools for FST support "
             "(Ubuntu/Debian: sudo apt install gtkwave), or convert first: "
             "fst2vcd input.fst > output.vcd")
-
-    import tempfile
-    _fd, vcd_file = tempfile.mkstemp(suffix='.vcd', prefix='alwavelets_fst_')
-    os.close(_fd)
-    print(f"  [fst2vcd converter: {os.path.basename(filename)} → VCD]")
-    try:
-        result = subprocess.run(
-            [converter, filename],
-            capture_output=True, timeout=300
-        )
-        if result.returncode != 0:
-            err_msg = result.stderr.decode('utf-8', errors='replace').strip()
-            raise ConverterError(f"fst2vcd failed: {err_msg}")
-
-        # fst2vcd writes VCD to stdout
-        vcd_data = result.stdout
-        if not vcd_data or len(vcd_data) < 10:
-            raise ConverterError("fst2vcd produced empty output")
-
-        with open(vcd_file, 'wb') as f:
-            f.write(vcd_data)
-
-        print(f"  [Converted: {len(vcd_data)/1024:.0f} KB VCD, parsing...]")
-        vcd = VCDFile.parse(vcd_file, progress_cb)
-        vcd._filename = filename  # Keep original FST filename for sidecar files
-        return vcd
-    except subprocess.TimeoutExpired:
-        raise ConverterError("fst2vcd timed out (>5 min)")
-    except ConverterError:
-        raise
-    except Exception as e:
-        raise ConverterError(f"converting FST: {e}")
-    finally:
-        try:
-            os.unlink(vcd_file)
-        except OSError:
-            pass
+    return _convert_trace(filename, converter, progress_cb, timeout=300,
+                          storage=storage, memory_mib=memory_mib)
 
 
 def parse_file(filename, progress_cb=None, use_cache=True, jobs=None,
@@ -138,13 +135,17 @@ def parse_file(filename, progress_cb=None, use_cache=True, jobs=None,
     if use_disk_storage(filename, storage):
         return open_trace(filename, memory_mib=memory_mib, use_cache=use_cache,
                           progress_cb=progress_cb)
-    if use_cache:
+    # Converted size is unknown until the converter finishes. An old eager
+    # cache must not bypass auto/disk storage for these formats.
+    converted_format = os.path.splitext(filename)[1].lower() in ('.lxt', '.lxt2', '.ghw', '.vzt')
+    eager_cache = use_cache and (storage == 'memory' or not converted_format)
+    if eager_cache:
         from . import cache
         cached = cache.load_cache(filename)
         if cached is not None:
             return cached
-    vcd = _parse_file_uncached(filename, progress_cb, jobs)
-    if use_cache and vcd is not None and getattr(vcd, 'signal_order', None):
+    vcd = _parse_file_uncached(filename, progress_cb, jobs, storage, memory_mib)
+    if eager_cache and vcd is not None and getattr(vcd, 'signal_order', None):
         from . import cache
         cache.save_cache(vcd, filename)
     return vcd
@@ -164,7 +165,7 @@ def _parse_vcd(filename, progress_cb, jobs):
     return VCDFile.parse(filename, progress_cb)
 
 
-def _parse_file_uncached(filename, progress_cb=None, jobs=None):
+def _parse_file_uncached(filename, progress_cb=None, jobs=None, storage='auto', memory_mib=256):
     """
     Universal file parser: auto-detects VCD vs FST by content magic bytes.
     Falls back to external converters for LXT/GHW/VZT.
@@ -191,7 +192,7 @@ def _parse_file_uncached(filename, progress_cb=None, jobs=None):
             print(f"  [Native FST failed: {e}, trying fst2vcd converter...]")
 
         # ── Fallback: use fst2vcd converter ──
-        return _fst_via_converter(filename, progress_cb)
+        return _fst_via_converter(filename, progress_cb, storage, memory_mib)
 
     # ── Native VCD (fallback for unknown extensions) ──
     if ext in ('.vcd', '') or ext not in ('.lxt', '.lxt2', '.ghw', '.vzt'):
@@ -207,26 +208,8 @@ def _parse_file_uncached(filename, progress_cb=None, jobs=None):
     if not converter_path:
         raise ConverterError(f"'{converter}' not found (needed for {ext} files)")
 
-    import tempfile
-    _fd, vcd_file = tempfile.mkstemp(suffix='.vcd', prefix='vcd_viewer_')
-    os.close(_fd)
-    print(f"  Converting {ext} → VCD via {converter}...")
-    try:
-        result = subprocess.run([converter_path, filename], capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            raise ConverterError(f"{converter} failed: {result.stderr.strip()}")
-        with open(vcd_file, 'w') as f:
-            f.write(result.stdout)
-        return VCDFile.parse(vcd_file, progress_cb)
-    except ConverterError:
-        raise
-    except Exception as e:
-        raise ConverterError(f"{converter}: {e}")
-    finally:
-        try:
-            os.unlink(vcd_file)
-        except OSError:
-            pass
+    return _convert_trace(filename, converter_path, progress_cb, storage=storage,
+                          memory_mib=memory_mib, jobs=jobs)
 
 
 # ══════════════════════════════════════════════════════════════

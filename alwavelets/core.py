@@ -668,6 +668,9 @@ class VirtualBitSignal:
         for t, value in self.parent.iter_changes(start, end):
             yield t, self._extract_bit(value)
 
+    def value_str(self, index):
+        return self._extract_bit(self.parent.value_str(index))
+
     def prev_edge_before(self, time):
         if not self.parent._times:
             return None

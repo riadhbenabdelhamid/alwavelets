@@ -4,6 +4,8 @@ import os
 import sys
 
 from .graphics import render_inline
+from .exporting import atomic_output, write_pdf
+from .streaming import iter_segments, iter_window
 
 from .core import *  # noqa: F401,F403
 from .rendering import *  # noqa: F401,F403
@@ -77,6 +79,12 @@ class ExportMixin:
             self._show_message(f"SVG error: {e}")
 
     def _generate_svg(self, filename):
+        self.vcd.require_loaded(self.time_start, self.time_end)
+        with atomic_output(filename) as stream:
+            for line in self._iter_svg_lines():
+                stream.write(line + '\n')
+
+    def _iter_svg_lines(self):
         """Generate SVG with waveform rendering."""
         margin = 20
         name_w = 140
@@ -86,28 +94,27 @@ class ExportMixin:
         visible = self.display_order[self.sig_offset:self.sig_offset + self.visible_signals]
         total_h = margin * 2 + row_h * (len(visible) + 2)  # +2 for header/ruler
 
-        lines = []
-        lines.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{total_h}">')
-        lines.append(f'<rect width="{total_w}" height="{total_h}" fill="#1a1a2e"/>')
-        lines.append('<style>')
-        lines.append('  text { font-family: monospace; font-size: 11px; fill: #e0e0e0; }')
-        lines.append('  .sig-name { fill: #a0a0c0; }')
-        lines.append('  .sig-val { fill: #75b8ff; font-weight: bold; }')
-        lines.append('  .high { stroke: #2fd85e; stroke-width: 2; fill: none; }')
-        lines.append('  .low { stroke: #1a8a3a; stroke-width: 2; fill: none; }')
-        lines.append('  .edge { stroke: #e85050; stroke-width: 2; fill: none; }')
-        lines.append('  .bus { stroke: #6faaff; stroke-width: 2; fill: none; }')
-        lines.append('  .undef { stroke: #e8c840; stroke-width: 2; fill: none; stroke-dasharray: 3,2; }')
-        lines.append('  .hiz { stroke: #5588cc; stroke-width: 1; fill: none; stroke-dasharray: 5,3; }')
-        lines.append('  .cursor { stroke: #4080ff; stroke-width: 1; stroke-dasharray: 4,2; }')
-        lines.append('  .ruler { fill: #606080; font-size: 9px; }')
-        lines.append('  .header { fill: #c0c0e0; font-size: 12px; font-weight: bold; }')
-        lines.append('  .grid { stroke: #252540; stroke-width: 0.5; }')
-        lines.append('</style>')
+        yield (f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{total_h}">')
+        yield (f'<rect width="{total_w}" height="{total_h}" fill="#1a1a2e"/>')
+        yield ('<style>')
+        yield ('  text { font-family: monospace; font-size: 11px; fill: #e0e0e0; }')
+        yield ('  .sig-name { fill: #a0a0c0; }')
+        yield ('  .sig-val { fill: #75b8ff; font-weight: bold; }')
+        yield ('  .high { stroke: #2fd85e; stroke-width: 2; fill: none; }')
+        yield ('  .low { stroke: #1a8a3a; stroke-width: 2; fill: none; }')
+        yield ('  .edge { stroke: #e85050; stroke-width: 2; fill: none; }')
+        yield ('  .bus { stroke: #6faaff; stroke-width: 2; fill: none; }')
+        yield ('  .undef { stroke: #e8c840; stroke-width: 2; fill: none; stroke-dasharray: 3,2; }')
+        yield ('  .hiz { stroke: #5588cc; stroke-width: 1; fill: none; stroke-dasharray: 5,3; }')
+        yield ('  .cursor { stroke: #4080ff; stroke-width: 1; stroke-dasharray: 4,2; }')
+        yield ('  .ruler { fill: #606080; font-size: 9px; }')
+        yield ('  .header { fill: #c0c0e0; font-size: 12px; font-weight: bold; }')
+        yield ('  .grid { stroke: #252540; stroke-width: 0.5; }')
+        yield ('</style>')
 
         # Header
         title = f"Alwavelets — {os.path.basename(self.vcd._filename)} [{self.vcd.time_to_str(self.time_start)}..{self.vcd.time_to_str(self.time_end)}]"
-        lines.append(f'<text x="{margin}" y="{margin + 12}" class="header">{xml_escape(title)}</text>')
+        yield (f'<text x="{margin}" y="{margin + 12}" class="header">{xml_escape(title)}</text>')
 
         # Ruler
         ruler_y = margin + row_h
@@ -116,26 +123,28 @@ class ExportMixin:
             t = self.col_to_time(int(c / wave_w * self.wave_width))
             x = margin + name_w + c
             label = self.format_ruler_time(t)
-            lines.append(f'<text x="{x}" y="{ruler_y + 10}" class="ruler">{xml_escape(label)}</text>')
-            lines.append(f'<line x1="{x}" y1="{ruler_y + 14}" x2="{x}" y2="{total_h - margin}" class="grid"/>')
+            yield (f'<text x="{x}" y="{ruler_y + 10}" class="ruler">{xml_escape(label)}</text>')
+            yield (f'<line x1="{x}" y1="{ruler_y + 14}" x2="{x}" y2="{total_h - margin}" class="grid"/>')
 
         # Cursor
         if self.cursor_on:
             cx = margin + name_w + int((self.cursor_time - self.time_start) / max(self.time_end - self.time_start, 1) * wave_w)
-            lines.append(f'<line x1="{cx}" y1="{ruler_y + 14}" x2="{cx}" y2="{total_h - margin}" class="cursor"/>')
+            yield (f'<line x1="{cx}" y1="{ruler_y + 14}" x2="{cx}" y2="{total_h - margin}" class="cursor"/>')
 
         # Signals
         for idx, sig_id in enumerate(visible):
             sig = self.get_signal(sig_id)
+            if sig is None:
+                continue
             y_base = margin + row_h * (idx + 2)
             y_mid = y_base + row_h // 2
             y_top = y_base + 4
             y_bot = y_base + row_h - 4
 
             # Name
-            val = format_typed_value(sig, sig.value_at(self.cursor_time), self.get_radix(sig_id))
-            lines.append(f'<text x="{margin}" y="{y_mid + 4}" class="sig-name">{xml_escape(sig.name)}</text>')
-            lines.append(f'<text x="{margin + name_w - 40}" y="{y_mid + 4}" class="sig-val">{xml_escape(val)}</text>')
+            val = format_typed_value(sig, sig.value_at(self.cursor_time), self.get_signal_radix(sig_id))
+            yield (f'<text x="{margin}" y="{y_mid + 4}" class="sig-name">{xml_escape(sig.name)}</text>')
+            yield (f'<text x="{margin + name_w - 40}" y="{y_mid + 4}" class="sig-val">{xml_escape(val)}</text>')
 
             # Waveform
             if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
@@ -161,33 +170,27 @@ class ExportMixin:
                         path_parts.append(f'M{x},{y}')
                     else:
                         path_parts.append(f'L{x},{y}')
-                lines.append(f'<path d="{" ".join(path_parts)}" class="high"/>')
+                yield (f'<path d="{" ".join(path_parts)}" class="high"/>')
             else:
                 # Bus: simple rectangles with transitions
-                times_w, values_w = sig.changes_in_window(self.time_start, self.time_end)
-                if times_w:
-                    span = max(self.time_end - self.time_start, 1)
-                    for ti in range(len(times_w)):
-                        x1 = margin + name_w + int((times_w[ti] - self.time_start) / span * wave_w)
-                        x2 = margin + name_w + (int((times_w[ti+1] - self.time_start) / span * wave_w) if ti + 1 < len(times_w) else wave_w)
-                        v = values_w[ti]
-                        if any(c in v for c in 'xXzZ'):
-                            cls = 'undef'
-                        else:
-                            cls = 'bus'
-                        lines.append(f'<line x1="{x1}" y1="{y_top}" x2="{x2}" y2="{y_top}" class="{cls}"/>')
-                        lines.append(f'<line x1="{x1}" y1="{y_bot}" x2="{x2}" y2="{y_bot}" class="{cls}"/>')
-                        if ti > 0:
-                            lines.append(f'<line x1="{x1}" y1="{y_top}" x2="{x1}" y2="{y_bot}" class="edge"/>')
-                        # Label
-                        lbl = format_typed_value(sig, v, self.get_radix(sig_id))
-                        if x2 - x1 > 20:
-                            lines.append(f'<text x="{x1 + 3}" y="{y_mid + 4}" class="sig-val" font-size="9">{xml_escape(lbl)}</text>')
+                span = max(self.time_end - self.time_start, 1)
+                for ti, (begin, end, v) in enumerate(iter_segments(sig, self.time_start, self.time_end)):
+                    x1 = margin + name_w + int((begin - self.time_start) / span * wave_w)
+                    x2 = margin + name_w + int((end - self.time_start) / span * wave_w)
+                    if any(c in v for c in 'xXzZ'):
+                        cls = 'undef'
+                    else:
+                        cls = 'bus'
+                    yield (f'<line x1="{x1}" y1="{y_top}" x2="{x2}" y2="{y_top}" class="{cls}"/>')
+                    yield (f'<line x1="{x1}" y1="{y_bot}" x2="{x2}" y2="{y_bot}" class="{cls}"/>')
+                    if ti > 0:
+                        yield (f'<line x1="{x1}" y1="{y_top}" x2="{x1}" y2="{y_bot}" class="edge"/>')
+                    # Label
+                    lbl = format_typed_value(sig, v, self.get_signal_radix(sig_id))
+                    if x2 - x1 > 20:
+                        yield (f'<text x="{x1 + 3}" y="{y_mid + 4}" class="sig-val" font-size="9">{xml_escape(lbl)}</text>')
 
-        lines.append('</svg>')
-
-        with open(filename, 'w') as f:
-            f.write('\n'.join(lines))
+        yield ('</svg>')
 
     # ── PDF Export ──
 
@@ -201,6 +204,10 @@ class ExportMixin:
             self._show_message(f"PDF error: {e}")
 
     def _generate_pdf(self, filename):
+        self.vcd.require_loaded(self.time_start, self.time_end)
+        write_pdf(filename, self._iter_pdf_content())
+
+    def _iter_pdf_content(self):
         """Generate a PDF file with waveform rendering."""
         # Minimal PDF generation without external libraries
         page_w, page_h = 842, 595  # A4 landscape in points
@@ -211,17 +218,15 @@ class ExportMixin:
         font_size = 8
 
         visible = self.display_order[self.sig_offset:self.sig_offset + self.visible_signals]
-        n_signals = len(visible)
 
         # Build PDF content
-        content_lines = []
         y = page_h - margin - 30  # start below title
 
         # Title
         title = (f"{os.path.basename(self.vcd._filename)} — "
                  f"[{self.format_ruler_time(self.time_start)}.."
                  f"{self.format_ruler_time(self.time_end)}]")
-        content_lines.append(f"BT /F1 12 Tf {margin} {y + 10} Td ({pdf_escape(title)}) Tj ET")
+        yield (f"BT /F1 12 Tf {margin} {y + 10} Td ({pdf_escape(title)}) Tj ET")
         y -= 20
 
         for sig_id in visible:
@@ -234,8 +239,8 @@ class ExportMixin:
 
             # Signal name
             name = sig.name[:18]
-            val = self.format_signal_value(sig, sig_id)
-            content_lines.append(f"BT /F1 {font_size} Tf {margin} {y - font_size} Td ({pdf_escape(name + ' = ' + str(val))}) Tj ET")
+            val = format_typed_value(sig, sig.value_at(self.cursor_time), self.get_signal_radix(sig_id))
+            yield (f"BT /F1 {font_size} Tf {margin} {y - font_size} Td ({pdf_escape(name + ' = ' + str(val))}) Tj ET")
 
             # Waveform path
             x_start = margin + name_w
@@ -246,51 +251,22 @@ class ExportMixin:
 
             if sig.size == 1 and not sig.analog_mode and sig_id not in self.analog_signals:
                 # Digital waveform
-                content_lines.append(f"0.2 0.8 0.2 RG 0.5 w")  # green stroke
-                times, values = sig.changes_in_window(self.time_start, self.time_end)
-                if times:
-                    trans = [(int((t - self.time_start) / span * wave_w), v) for t, v in zip(times, values)]
-                    cur_val = sig.value_at(self.time_start)
-                    path = f"{x_start} {y - (0 if cur_val == '0' else height - 4)} m"
-                    for px, v in trans:
-                        h_pos = y - (0 if v == '0' else height - 4)
-                        path += f" {x_start + px} {y - (0 if cur_val == '0' else height - 4)} l"
-                        path += f" {x_start + px} {h_pos} l"
-                        cur_val = v
-                    path += f" {x_start + wave_w} {y - (0 if cur_val == '0' else height - 4)} l S"
-                    content_lines.append(path)
+                yield (f"0.2 0.8 0.2 RG 0.5 w")  # green stroke
+                cur_val = sig.value_at(self.time_start)
+                yield f"{x_start} {y - (0 if cur_val == '0' else height - 4)} m"
+                for t, value in iter_window(sig, self.time_start, self.time_end, baseline=False):
+                    px = int((t - self.time_start) / span * wave_w)
+                    h_pos = y - (0 if value == '0' else height - 4)
+                    yield f"{x_start + px} {y - (0 if cur_val == '0' else height - 4)} l"
+                    yield f"{x_start + px} {h_pos} l"
+                    cur_val = value
+                yield f"{x_start + wave_w} {y - (0 if cur_val == '0' else height - 4)} l S"
             else:
                 # Bus/analog — draw box
-                content_lines.append(f"0.3 0.5 0.9 RG 0.5 w")
-                content_lines.append(f"{x_start} {y - height + 4} {wave_w} {height - 8} re S")
+                yield (f"0.3 0.5 0.9 RG 0.5 w")
+                yield (f"{x_start} {y - height + 4} {wave_w} {height - 8} re S")
 
             y -= height + 4
 
-        # Assemble PDF
-        stream = '\n'.join(content_lines)
-        stream_bytes = stream.encode('latin-1', errors='replace')
-
-        pdf = b"%PDF-1.4\n"
-        offsets = []
-
-        offsets.append(len(pdf))
-        pdf += b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-        offsets.append(len(pdf))
-        pdf += b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
-        offsets.append(len(pdf))
-        pdf += f"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 {page_w} {page_h}]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n".encode()
-        offsets.append(len(pdf))
-        pdf += f"4 0 obj<</Length {len(stream_bytes)}>>stream\n".encode() + stream_bytes + b"\nendstream\nendobj\n"
-        offsets.append(len(pdf))
-        pdf += b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
-
-        xref_pos = len(pdf)
-        pdf += f"xref\n0 6\n0000000000 65535 f \n".encode()
-        for off in offsets:
-            pdf += f"{off:010d} 00000 n \n".encode()
-        pdf += f"trailer<</Size 6/Root 1 0 R>>\nstartxref\n{xref_pos}\n%%EOF".encode()
-
-        with open(filename, 'wb') as f:
-            f.write(pdf)
 
     # ── Live Reload ──
