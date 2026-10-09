@@ -1,6 +1,8 @@
 """Bounded FST block storage, numeric tables and streaming decompression."""
 from collections.abc import Sequence
+import array
 import struct
+import sys
 import tempfile
 import zlib
 
@@ -130,6 +132,15 @@ class Records(Sequence):
     def append(self, value):
         self.buffer.write(self.record.pack(*value if isinstance(value, tuple) else (value,)))
 
+    def extend(self, values):
+        """Append a bounded batch of unsigned 64-bit entries without per-item I/O."""
+        if self.record.format != '<Q' or not isinstance(values, array.array) or values.typecode != 'Q':
+            raise TypeError('Records.extend requires a uint64 array and <Q records')
+        if sys.byteorder != 'little':
+            values = array.array('Q', values)
+            values.byteswap()
+        self.buffer.write(values.tobytes())
+
     def __getitem__(self, index):
         if index < 0:
             index += len(self)
@@ -211,6 +222,27 @@ class Cursor:
         self.index += 1
         self.pos += 1
         return value
+
+    def varint(self):
+        """Read a LEB128 integer, with a fast path for single-byte deltas."""
+        if self.index >= len(self.chunk):
+            first = self.byte()
+        else:
+            first = self.chunk[self.index]
+            self.index += 1
+            self.pos += 1
+        if first < 128:
+            return first
+        value, shift = first & 127, 7
+        while shift < 70:
+            byte = self.byte()
+            value |= (byte & 127) << shift
+            if byte < 128:
+                if value >= 1 << 64:
+                    raise ValueError('FST varint overflow')
+                return value
+            shift += 7
+        raise ValueError('Oversized FST varint')
 
 
 class Output:

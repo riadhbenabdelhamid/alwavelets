@@ -8,6 +8,7 @@ import array
 import bisect
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 import heapq
 import json
 import math
@@ -433,15 +434,54 @@ class PageWriter:
     def flush(self, key):
         sig = self.builders.pop(key)
         self.buffer_bytes -= self.sizes.pop(key)
+        self._write_page(key, sig)
+
+    def add_batch(self, key, timestamps, values):
+        """Write one bounded FST batch, preserving every event and delta order.
+
+        The decoder limits batches to PAGE_EVENTS and PAGE_BYTES (except an
+        individual wide value), and supplies ordered timestamps and normalized
+        scalar bytes. Arrays belong to the batch and are not mutated afterward.
+        """
+        if self.store.cancel.is_set():
+            raise Cancelled('Indexing cancelled')
+        if len(timestamps) != len(values) or len(timestamps) > PAGE_EVENTS:
+            raise ValueError('Invalid waveform batch size')
+        metadata = self.vcd.signals.get(key)
+        if not timestamps or metadata is None or not metadata.owns_storage:
+            return
+        if key in self.builders:
+            self.flush(key)
+        if timestamps[0] < self.last_time.get(key, timestamps[0]):
+            self.disordered = True
+        self.last_time[key] = timestamps[-1]
+        sig = _signal(_definition(metadata))
+        sig._memo = None
+        sig._times = timestamps
+        if sig._scalar:
+            sig._values = values
+        else:
+            packed = sig._encode_values(values) if sig._packed else None
+            sig._packed = packed is not None
+            sig._values = packed if sig._packed else values
+        self._write_page(key, sig)
+        self.changes += len(timestamps)
+
+    def _write_page(self, key, sig):
         kind = 1 if sig._scalar else (2 if type(sig._values) is bytearray else 0)
         values = bytes(sig._values) if kind else json.dumps(sig._values, separators=(',', ':')).encode()
         data = zlib.compress(bytes([kind]) + sig._times.tobytes() + values, 1)
         minimum = maximum = None
-        for i in range(len(sig._times)):
-            value = numeric_value(sig.value_str(i), sig.signal_type)
-            if value is not None:
-                minimum = value if minimum is None else min(minimum, value)
-                maximum = value if maximum is None else max(maximum, value)
+        if sig._scalar:
+            zero, one = 48 in sig._values, 49 in sig._values
+            minimum = 0 if zero else (1 if one else None)
+            maximum = 1 if one else (0 if zero else None)
+        else:
+            for i in range(len(sig._times)):
+                value = numeric_value(sig.value_str(i), sig.signal_type)
+                if value is not None:
+                    minimum = value if minimum is None else min(minimum, value)
+                    maximum = value if maximum is None else max(maximum, value)
         lo = self.totals.get(key, 0)
         n = len(sig._times)
         with self.store.lock:
@@ -630,40 +670,51 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     signature = _signature(source)
     from .fst import FSTReader
     is_fst = FSTReader.is_fst(source)
-    if is_fst:
-        vcd = FSTReader(source).parse(metadata_only=True, cancel=cancel, memory_mib=memory_mib)
-        offset = 0
-    else:
-        vcd, offset = VCDFile.parse_header(source, metadata_only=True)
-    if not vcd.signal_order:
-        raise ValueError('Trace has no signal declarations')
-    if use_cache:
-        try:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
-        except OSError:
-            use_cache = False
-    if not use_cache:
-        temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
-    path = os.path.join(temporary.name, 'trace.sqlite')
-    store = TraceStore(path, memory)
-    store.cancel = cancel
-    store.temporary = temporary
-    writer = PageWriter(store, vcd)
-    vcd._loading = True
-    vcd._extent_known = False
+    preparation = ExitStack()
+    store = temporary = None
+    try:
+        if is_fst:
+            reader = FSTReader(source)
+            vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib))
+            offset = 0
+        else:
+            vcd, offset = VCDFile.parse_header(source, metadata_only=True)
+        if not vcd.signal_order:
+            raise ValueError('Trace has no signal declarations')
+        if use_cache:
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
+            except OSError:
+                use_cache = False
+        if not use_cache:
+            temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
+        path = os.path.join(temporary.name, 'trace.sqlite')
+        store = TraceStore(path, memory)
+        store.cancel = cancel
+        store.temporary = temporary
+        writer = PageWriter(store, vcd)
+        vcd._loading = True
+        vcd._extent_known = False
+    except BaseException:
+        preparation.close()
+        if store is not None:
+            store.close()
+        elif temporary is not None:
+            temporary.cleanup()
+        raise
 
     def build():
         try:
-            if is_fst:
-                def progress(done, total):
-                    vcd._load_progress = min(99, done * 100 // max(1, total))
-                    if progress_cb:
-                        progress_cb(done, total)
-                FSTReader(source).parse(progress, writer_factory=lambda _: writer,
-                                        cancel=store.cancel, memory_mib=memory_mib)
-            else:
-                ingest_vcd()
+            with preparation:
+                if is_fst:
+                    def progress(done, total):
+                        vcd._load_progress = min(99, done * 100 // max(1, total))
+                        if progress_cb:
+                            progress_cb(done, total)
+                    reader.read_values(vcd, writer, progress)
+                else:
+                    ingest_vcd()
             writer.finish(source, signature)
             if use_cache:
                 try:
@@ -700,7 +751,13 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         vcd.max_time = state.max_time
     if background:
         store.thread = threading.Thread(target=build, daemon=True, name='wavelet-index')
-        store.thread.start()
+        try:
+            store.thread.start()
+        except BaseException:
+            store.thread = None
+            preparation.close()
+            store.close()
+            raise
     else:
         build()
         if vcd._load_error:

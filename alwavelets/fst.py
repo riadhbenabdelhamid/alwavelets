@@ -32,14 +32,15 @@ Layout notes (from fstapi.c, the reference implementation):
   character per bit. Reals are 8 raw bytes in the writer's endianness.
   Time deltas accumulate per chain into the block's time table.
 """
-from contextlib import ExitStack, nullcontext
+import array
+from contextlib import ExitStack, contextmanager
 import io
 import os
 import struct
 import zlib
 
 from .core import VCDSignal, AliasSignal, split_reference
-from .fst_stream import CHUNK, FileSlice, Records, decompress
+from .fst_stream import CHUNK, Cursor, FileSlice, Records, decompress
 from .streaming import check_cancel
 
 # ── small decompressors ─────────────────────────────────────────────
@@ -329,6 +330,20 @@ class FSTReader:
 
     def parse(self, progress_cb=None, writer_factory=None, metadata_only=False, *, cancel=None, memory_mib=8):
         """Read with bounded decompression; eager output still retains all events."""
+        with self.prepare(progress_cb, cancel=cancel, memory_mib=memory_mib,
+                          compact=metadata_only or writer_factory is not None) as vcd:
+            if not metadata_only:
+                writer = writer_factory(vcd) if writer_factory else None
+                self.read_values(vcd, writer, progress_cb)
+            return vcd
+
+    @contextmanager
+    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True):
+        """Keep metadata and input open until value loading finishes or is cancelled.
+
+        The context may be handed to a background worker after preparation;
+        only that worker may read values, and it must close the context.
+        """
         if memory_mib <= 0:
             raise ValueError('FST memory budget must be positive')
         self._cancel = cancel
@@ -337,11 +352,12 @@ class FSTReader:
         with ExitStack() as resources:
             self._resources = resources
             try:
-                return self._parse(progress_cb, writer_factory, metadata_only)
+                yield self._prepare(progress_cb, compact)
             finally:
                 # Drop references to closed spill files and partial eager data.
                 self._frame0, self._geom, self._blocks = None, [], []
                 self._times = self._vals = None
+                self._handles, self._writer, self._file = [], None, None
 
     def _check(self):
         check_cancel(self._cancel)
@@ -353,25 +369,26 @@ class FSTReader:
     def _decompress(self, data, codec, size, **kwargs):
         return decompress(data, codec, size, limit=self._limit, cancel=self._cancel, **kwargs)
 
-    def _parse(self, progress_cb=None, writer_factory=None, metadata_only=False):
-        from .parsers import VCDFile, build_scope_tree, _compact_times
+    def _prepare(self, progress_cb, compact):
+        from .parsers import VCDFile, build_scope_tree
         self._check()
         vcd = VCDFile()
         vcd._filename = self.filename
         from .analysis_cache import stamp_source
         stamp_source(vcd, self.filename)
-        stream = getattr(self, '_input', None)
-        with (nullcontext(stream) if stream is not None else open(self.filename, 'rb')) as f:
+        f = self._resources.enter_context(open(self.filename, 'rb'))
+        while True:
             f.seek(0, os.SEEK_END)
             file_size = f.tell()
             f.seek(0)
             first = f.read(1)
             if not first:
+                self._file, self._file_size = f, file_size
+                vcd.scopes = build_scope_tree(vcd)
                 return vcd
             if first[0] == self.BL_ZWRAPPER:
-                wrapped = self._parse_zwrapped(f, progress_cb, writer_factory, metadata_only)
-                wrapped._analysis_source = vcd._analysis_source
-                return wrapped
+                f = self._unwrap(f)
+                continue
             if first[0] != self.BL_HDR:
                 raise ValueError("Not an FST file (first byte: 0x%02x)" % first[0])
             self._parse_header(f, vcd)
@@ -402,7 +419,6 @@ class FSTReader:
                 raise ValueError("FST file has no hierarchy block")
             btype, bpos, bslen = hierarchy
             f.seek(bpos + 9)
-            compact = metadata_only or writer_factory is not None
             if compact:
                 vcd.signals = {}
             with self._read_hier_block(f, btype, bslen - 8) as hierarchy:
@@ -417,64 +433,55 @@ class FSTReader:
                     self._parse_geom(f, bslen - 8)
                     break
 
-            if metadata_only:
-                vcd.scopes = build_scope_tree(vcd)
-                return vcd
-            self._writer = writer_factory(vcd) if writer_factory else None
-            if self._cancel is None and self._writer is not None:
-                self._cancel = getattr(getattr(self._writer, 'store', None), 'cancel', None)
+            self._file, self._file_size = f, file_size
+            vcd.scopes = build_scope_tree(vcd)
+            return vcd
 
-            # Value changes: stream to a page writer when requested.
-            self._times = {}
-            self._vals = {}
-            for btype, bpos, bslen in self._blocks:
-                self._check()
-                if btype not in (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS, self.BL_VCDATA_DYN_ALIAS2):
-                    continue
-                f.seek(bpos + 9)
-                self._parse_vc_block(f, btype, bpos, bslen, vcd)
-                if progress_cb:
-                    progress_cb(min(file_size, bpos + bslen), file_size)
-
-            if self._writer is not None and self._frame0:
-                beg0, fvals = self._frame0
-                for h, value in fvals.items():
-                    key = self._handles[h]['hid']
-                    if key not in self._writer.last_time:
-                        self._writer.add(key, beg0, value)
-
-            # Blackouts ($dumpoff regions): every signal goes 'x' there, as the
-            # VCD parser does for $dumpoff.
-            for btype, bpos, bslen in self._blocks:
-                if btype == self.BL_BLACKOUT:
-                    f.seek(bpos + 9)
-                    with self._decompress(FileSlice(f, bpos + 9, bslen - 8), 'raw', bslen - 8) as blackouts:
-                        self._apply_blackouts(blackouts)
-
+    def read_values(self, vcd, writer=None, progress_cb=None):
+        """Consume a prepared reader without rebuilding declarations or hierarchy."""
+        from .parsers import _compact_times
+        self._check()
+        self._writer = writer
+        if self._cancel is None and writer is not None:
+            self._cancel = getattr(getattr(writer, 'store', None), 'cancel', None)
+        f, file_size = self._file, self._file_size
+        self._times, self._vals = {}, {}
+        for btype, bpos, bslen in self._blocks:
+            self._check()
+            if btype not in (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS, self.BL_VCDATA_DYN_ALIAS2):
+                continue
+            f.seek(bpos + 9)
+            self._parse_vc_block(f, btype, bpos, bslen, vcd)
+            if progress_cb:
+                progress_cb(min(file_size, bpos + bslen), file_size)
         if self._writer is not None:
             beg0, fvals = self._frame0 if self._frame0 else (0, {})
             for h, value in fvals.items():
                 key = self._handles[h]['hid']
                 if key not in self._writer.last_time:
                     self._writer.add(key, beg0, value)
-        else:
+
+        # Insert blackout changes after initial values, preserving same-tick
+        # changes already present in the waveform.
+        for btype, bpos, bslen in self._blocks:
+            if btype == self.BL_BLACKOUT:
+                f.seek(bpos + 9)
+                with self._decompress(FileSlice(f, bpos + 9, bslen - 8), 'raw', bslen - 8) as blackouts:
+                    self._apply_blackouts(blackouts)
+        if self._writer is None:
             self._store(vcd)
             _compact_times(vcd)
-        vcd.scopes = build_scope_tree(vcd)
         return vcd
 
-    def _parse_zwrapped(self, f, progress_cb, writer_factory=None, metadata_only=False):
+    def _unwrap(self, f):
         """A '-c' file: gzip of a whole FST after a 17-byte wrapper."""
         f.seek(9)
         expected = self._read_u64(f)
         f.seek(0, os.SEEK_END)
         compressed_size = f.tell() - 17
-        with self._decompress(FileSlice(f, 17, compressed_size), 'zlib', expected, wbits=15 + 32) as unpacked:
-            reader = FSTReader(self.filename)
-            reader._input = unpacked.file if unpacked.file is not None else self._resources.enter_context(io.BytesIO(unpacked[:]))
-            reader._input.seek(0)
-            return reader.parse(progress_cb, writer_factory, metadata_only,
-                                cancel=self._cancel, memory_mib=self._limit * 16 / 1024 ** 2)
+        unpacked = self._resources.enter_context(self._decompress(
+            FileSlice(f, 17, compressed_size), 'zlib', expected, wbits=15 + 32))
+        return unpacked.file if unpacked.file is not None else self._resources.enter_context(io.BytesIO(unpacked[:]))
 
     # ── header ───────────────────────────────────────────────────────
 
@@ -644,11 +651,15 @@ class FSTReader:
         times = self._records(resources=resources)
         with self._decompress(FileSlice(f, tsec_start, tsec_clen),
                               'raw' if tsec_clen == tsec_uclen else 'zlib', tsec_uclen) as data:
-            pos = tv = 0
+            cursor, tv = Cursor(data, self._cancel), 0
+            batch = array.array('Q')
             for _ in range(tsec_nitems):
-                delta, pos = self._read_varint(data, pos)
-                tv += delta
-                times.append(tv)
+                tv += cursor.varint()
+                batch.append(tv)
+                if len(batch) == CHUNK // 8:
+                    times.extend(batch)
+                    batch = array.array('Q')
+            times.extend(batch)
         f.seek(tsec_start - 8)
         chain_clen = self._read_u64(f)
         chain_pos = tsec_start - 8 - chain_clen
@@ -746,78 +757,86 @@ class FSTReader:
         return offsets, lengths
 
     def _decode_chain(self, h, mu, times, beg_time):
-        events = self._chain_events(h, mu, times)
         writer = getattr(self, '_writer', None)
         if writer is not None:
             info = self._handles[h] if h < len(self._handles) else None
             if info is None:
                 return
             key = info['hid']
-            for count, (t, value) in enumerate(events):
+            for timestamps, values in self._chain_batches(h, mu, times):
                 self._check()
                 if key not in writer.last_time and self._frame0:
                     beg0, fvals = self._frame0
                     initial = fvals.get(h)
-                    if t > beg0 and initial is not None:
+                    if timestamps[0] > beg0 and initial is not None:
                         writer.add(key, beg0, initial)
-                writer.add(key, t, value)
-                if count % 4096 == 0:
-                    writer.publish()
+                writer.add_batch(key, timestamps, values)
+                writer.publish()
             writer.publish()
         else:
             tl = self._times.setdefault(h, [])
             vl = self._vals.setdefault(h, [])
-            for t, value in events:
+            for t, value in self._chain_events(h, mu, times):
                 self._check()
                 tl.append(t)
                 vl.append(value)
 
-    def _chain_events(self, h, mu, times):
-        mu = mu.data if mu.file is None else mu
+    def _chain_batches(self, h, mu, times):
+        """Decode bounded pages; scalar values stay bytes throughout ingestion."""
+        from .storage import PAGE_BYTES, PAGE_EVENTS
         width, is_real = self._width(h)
-        n = len(mu)
-        pos = 0
+        scalar = width == 1 and not is_real
+        count = min(PAGE_EVENTS, max(1, PAGE_BYTES // (17 if scalar else (96 if is_real else width + 64))))
+        timestamps = array.array('q')
+        values = bytearray() if scalar else []
+        for t, value in self._chain_events(h, mu, times, scalar_bytes=scalar):
+            timestamps.append(t)
+            values.append(value)
+            if len(timestamps) == count:
+                self._check()
+                yield timestamps, values
+                timestamps = array.array('q')
+                values = bytearray() if scalar else []
+        if timestamps:
+            self._check()
+            yield timestamps, values
+
+    def _chain_events(self, h, mu, times, scalar_bytes=False):
+        cursor = Cursor(mu, self._cancel)
+        width, is_real = self._width(h)
         tidx = 0
         ntimes = len(times)
-        rv = _read_varint = self._read_varint
+        rv = cursor.varint
         if width == 1 and not is_real:
-            while pos < n:
-                if pos % 4096 == 0:
+            rcv = b'xzxxxxxx' if scalar_bytes else _RCV
+            while cursor:
+                if cursor.pos % 4096 == 0:
                     self._check()
-                vli, pos = rv(mu, pos)
+                vli = rv()
                 if vli & 1:
                     tidx += vli >> 4
-                    val = _RCV[(vli >> 1) & 7]
+                    val = rcv[(vli >> 1) & 7]
                 else:
                     tidx += vli >> 2
-                    val = '1' if (vli >> 1) & 1 else '0'
+                    val = (48 + ((vli >> 1) & 1)) if scalar_bytes else ('1' if (vli >> 1) & 1 else '0')
                 if tidx >= ntimes:
                     break
                 yield times[tidx], val
             return
         nbytes = (width + 7) >> 3
         fmt = self._real_fmt
-        while pos < n:
+        while cursor:
             self._check()
-            vli, pos = rv(mu, pos)
+            vli = rv()
             tidx += vli >> 1
             if is_real:
-                raw = mu[pos:pos + 8]
-                pos += 8
-                if len(raw) < 8:
-                    break
+                raw = cursor.read(8)
                 val = repr(struct.unpack(fmt, raw)[0])
             elif vli & 1:                              # one char per bit
-                raw = mu[pos:pos + width]
-                pos += width
-                if len(raw) < width:
-                    break
+                raw = cursor.read(width)
                 val = raw.decode('ascii', 'replace')
             else:                                      # packed bits, MSB first
-                raw = mu[pos:pos + nbytes]
-                pos += nbytes
-                if len(raw) < nbytes:
-                    break
+                raw = cursor.read(nbytes)
                 val = format(int.from_bytes(raw, 'big'), '0%db' % (nbytes * 8))[:width]
             if tidx >= ntimes:
                 break

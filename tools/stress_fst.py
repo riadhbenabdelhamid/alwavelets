@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate deep/wide compressed FSTs and check paged loading in fresh processes."""
 import argparse
+import gzip
 import json
 from pathlib import Path
 import shutil
@@ -93,13 +94,33 @@ def create_fst(path, events=10000000, signals=1, width=1):
         shutil.copyfileobj(hier, output)
 
 
-def worker(path, events, signals, width, memory_mib, repo):
+def wrap_fst(source, destination):
+    with open(source, 'rb') as incoming, open(destination, 'wb') as output:
+        output.write(b'\xfe' + U64.pack(0) + U64.pack(Path(source).stat().st_size))
+        with gzip.GzipFile(fileobj=output, mode='wb', mtime=0) as wrapped:
+            shutil.copyfileobj(incoming, wrapped)
+        end = output.tell()
+        output.seek(1)
+        output.write(U64.pack(end - 1))
+
+
+def worker(path, events, signals, width, memory_mib, repo, background=False):
     sys.path.insert(0, repo)
     from alwavelets.storage import open_trace, use_disk_storage
     from tools.stress_workflows import peak_rss
     before = time.perf_counter()
     auto = use_disk_storage(path)
-    with open_trace(path, memory_mib=memory_mib, use_cache=False) as trace:
+    with open_trace(path, memory_mib=memory_mib, use_cache=False, background=background) as trace:
+        metadata_s = time.perf_counter() - before
+        first_waveform_s = None
+        if background:
+            first_signal = trace.signals[trace.signal_order[0]]
+            while trace.is_loading:
+                if first_waveform_s is None and first_signal.num_changes():
+                    assert first_signal.value_at(0) == '0' * width
+                    first_waveform_s = time.perf_counter() - before
+                trace._store.thread.join(0.005)
+        trace.require_loaded()
         elapsed = time.perf_counter() - before
         assert len(trace.signal_order) == signals
         for ordinal in sorted({0, signals // 2, signals - 1}):
@@ -113,6 +134,8 @@ def worker(path, events, signals, width, memory_mib, repo):
                   'input_bytes': Path(path).stat().st_size, 'auto_disk': auto,
                   'load_s': elapsed, 'peak_rss_mib': peak_rss(),
                   'index_bytes': index_path.stat().st_size, 'page_cache_bytes': trace._store.cache_bytes}
+        if background:
+            result.update(metadata_s=metadata_s, first_waveform_s=first_waveform_s or elapsed)
     assert not index_path.exists()
     return result
 
@@ -152,6 +175,8 @@ def main():
     parser.add_argument('--memory-mib', type=int, default=8)
     parser.add_argument('--repo', default=ROOT)
     parser.add_argument('--block-mib', type=int, default=0, help='Also stress large zlib/LZ4/FastLZ blocks (e.g. 1024)')
+    parser.add_argument('--background', action='store_true', help='Also measure metadata readiness and first readable waveform')
+    parser.add_argument('--wrapped', action='store_true', help='Repeat each trace check with an outer gzip wrapper')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--worker', nargs=4, metavar=('PATH', 'EVENTS', 'SIGNALS', 'WIDTH'))
     parser.add_argument('--block-worker', nargs=3, metavar=('PATH', 'CODEC', 'SIZE'))
@@ -162,7 +187,7 @@ def main():
         parser.error('--block-mib must be nonnegative')
     if args.worker:
         path, events, signals, width = args.worker
-        print(json.dumps(worker(path, int(events), int(signals), int(width), args.memory_mib, args.repo)))
+        print(json.dumps(worker(path, int(events), int(signals), int(width), args.memory_mib, args.repo, args.background)))
         return
     if args.block_worker:
         path, codec, size = args.block_worker
@@ -174,10 +199,17 @@ def main():
             print('Generating and checking ' + name + ' FST…', file=sys.stderr, flush=True)
             path = Path(directory) / (name + '.fst')
             create_fst(path, events, signals, width)
-            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--repo', args.repo,
-                                  '--worker', str(path), str(events), str(signals), str(width),
-                                  '--memory-mib', str(args.memory_mib)], check=True, stdout=subprocess.PIPE, text=True)
-            results[name] = json.loads(run.stdout)
+            paths = [(name, path)]
+            if args.wrapped:
+                wrapped = path.with_suffix('.wrapped.fst')
+                wrap_fst(path, wrapped)
+                paths.append((name + '_wrapped', wrapped))
+            for label, source in paths:
+                run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--repo', args.repo,
+                                      '--worker', str(source), str(events), str(signals), str(width),
+                                      '--memory-mib', str(args.memory_mib)] + (['--background'] if args.background else []),
+                                     check=True, stdout=subprocess.PIPE, text=True)
+                results[label] = json.loads(run.stdout)
         for codec in ('zlib', 'lz4', 'fastlz') if args.block_mib else ():
             print('Checking large ' + codec + ' block…', file=sys.stderr, flush=True)
             path = Path(directory) / (codec + '.block')

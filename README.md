@@ -153,7 +153,11 @@ also cancels it. Partial indexes are never published, and spill files close on
 completion, cancellation, or failure. Library callers can pass a cancellation
 event to `FSTReader.parse(cancel=event)` or `storage.open_trace(cancel=event)`.
 FST metadata is parsed before the viewer opens; library cancellation also covers
-this stage. Disk spilling reduces memory at the cost of additional I/O and can
+this stage. The prepared reader shares metadata with the viewer and retains
+unwrapped input for background indexing, so declarations and outer gzip data
+are processed once. Value chains and timestamp tables feed bounded batches;
+same-timestamp transitions remain distinct and in their original order.
+Disk spilling reduces memory at the cost of additional I/O and can
 make the first parse slower. Eager FST parsing still retains decoded history.
 
 Expression searches stream only the referenced signals. `when`/`match` searches
@@ -531,6 +535,7 @@ frame. Optional block checks expand 1 GiB through each supported chain codec:
 ```sh
 python3 tools/stress_fst.py --events 10000000 --signals 100000 --memory-mib 8 --output fst.json
 python3 tools/stress_fst.py --block-mib 1024 --output fst-blocks.json
+python3 tools/stress_fst.py --background --wrapped --output fst-startup.json
 ```
 
 Fresh reader processes verify values and report peak RSS, parse time, index
@@ -538,6 +543,9 @@ size, and automatic storage selection. `--repo /path/to/checkout` compares
 another revision on the same generated workload. Block measurements include
 decompression and sampled reads, not full waveform indexing. Temporary files
 are removed after each run; disk space must accommodate the expanded blocks.
+`--background` also measures when metadata is ready and when the first signal
+has readable waveform data (not terminal rendering time). `--wrapped` repeats
+the trace checks with outer gzip compression.
 
 ## License
 
