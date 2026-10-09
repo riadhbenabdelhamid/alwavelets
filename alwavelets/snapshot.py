@@ -6,6 +6,7 @@ useful on its own (tests, scripting, embedding).
 """
 import fnmatch
 import json
+import re
 
 from .core import Radix, format_value, xml_escape
 from .rendering import draw_single_bit_culled, draw_bus_culled
@@ -60,8 +61,12 @@ _XTERM_BASE16 = ["#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee",
 
 
 def _xterm_to_hex(idx):
-    """Convert an xterm-256 colour index to '#rrggbb' (None for default -1)."""
-    if idx is None or idx < 0:
+    """Convert an xterm-256 colour index to '#rrggbb' (None for default -1).
+    A true-colour '#rrggbb' string (theme JSON) passes through unchanged."""
+    if isinstance(idx, str):
+        s = idx.strip()
+        return s if re.fullmatch(r'#[0-9a-fA-F]{6}', s) else None
+    if idx is None or isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
         return None
     if idx < 16:
         return _XTERM_BASE16[idx]
@@ -86,13 +91,17 @@ def _resolve_palette(theme):
     except (OSError, ValueError):
         return _BUILTIN_PALETTES.get(str(theme).lower(), _DEFAULT_PALETTE)
 
+    def slot(key, i):
+        v = t.get(key) if isinstance(t, dict) else None
+        if isinstance(v, (list, tuple)) and len(v) > i:
+            return _xterm_to_hex(v[i])
+        return None                       # wrong shape: keep the default
+
     def fg(key, default):
-        c = _xterm_to_hex(t.get(key, [None])[0]) if key in t else None
-        return c or default
+        return slot(key, 0) or default
 
     def bg(key, default):
-        c = _xterm_to_hex(t.get(key, [None, None])[1]) if key in t else None
-        return c or default
+        return slot(key, 1) or default
 
     return {"bg": bg("HEADER", _DEFAULT_PALETTE["bg"]), "hi": fg("HIGH", _DEFAULT_PALETTE["hi"]),
             "lo": fg("LOW", _DEFAULT_PALETTE["lo"]), "bus": fg("BUS", _DEFAULT_PALETTE["bus"]),
@@ -286,7 +295,10 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
         else:
             tw, vw = sig.changes_in_window(t_start, t_end)
             for j in range(len(tw)):
-                xa = x0 + int((tw[j] - t_start) / span * wave_w)
+                # The first entry can predate the window (changes_in_window
+                # returns one-before for the initial value): clamp it to the
+                # wave area or the segment and its label land on the name.
+                xa = x0 + max(0, int((tw[j] - t_start) / span * wave_w))
                 xb = x0 + (int((tw[j + 1] - t_start) / span * wave_w)
                            if j + 1 < len(tw) else wave_w)
                 cls = "ud" if any(c in vw[j] for c in "xXzZ") else "bus"

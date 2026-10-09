@@ -5,6 +5,24 @@ import os
 import re
 
 
+def _write_json_atomic(path, data):
+    """Serialise first, write a temp file beside `path`, then rename it over.
+    A failure (unserialisable value, disk full, crash mid-write) leaves the
+    previous sidecar untouched instead of a truncated one."""
+    text = json.dumps(data, indent=2)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, 'w') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ══════════════════════════════════════════════════════════════
 #  STAGE 1: SIGNAL TAG SYSTEM
 # ══════════════════════════════════════════════════════════════
@@ -56,8 +74,7 @@ class SignalTagStore:
             'tags': self.tags,
             'hart_tags': {f"{h}:{t}:{r}": v for (h, t, r), v in self.hart_tags.items()},
         }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        _write_json_atomic(path, data)
 
     @staticmethod
     def load(path):
@@ -179,8 +196,7 @@ class AnnotationStore:
         if not path: return False
         try:
             data = {'version': 1, 'annotations': [a.to_dict() for a in self.annotations]}
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+            _write_json_atomic(path, data)
             self.path = path
             return True
         except Exception:
@@ -203,7 +219,11 @@ class AnnotationStore:
                   base + '.wavelet_notes.json']:      # pre-rename sidecar
             if os.path.isfile(c):
                 n = self.load(c)
-                if n > 0: return c, n
+                if n > 0:
+                    # Loaded from a shared/legacy file; later saves still go
+                    # to this trace's own sidecar, never into the shared one.
+                    self.path = self.default_path(vcd_path)
+                    return c, n
         return None, 0
 
     def default_path(self, vcd_path):
@@ -271,8 +291,7 @@ class BookmarkStore:
         if not path: return False
         try:
             data = {'version': 1, 'bookmarks': [b.to_dict() for b in self.bookmarks.values()]}
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+            _write_json_atomic(path, data)
             self.path = path
             return True
         except Exception:
@@ -298,7 +317,9 @@ class BookmarkStore:
                   base + '.wavelet_bookmarks.json']:  # pre-rename sidecar
             if os.path.isfile(c):
                 n = self.load(c)
-                if n > 0: return c, n
+                if n > 0:
+                    self.path = self.default_path(vcd_path)   # see annotations
+                    return c, n
         return None, 0
 
     def default_path(self, vcd_path):

@@ -1,5 +1,6 @@
 """Static analyses over a parsed trace: formal counter-example assertion
 detection and switching-activity (power) estimation."""
+import bisect
 import re
 
 
@@ -66,17 +67,12 @@ class FormalAnalyzer:
         for sid, sig in self.vcd.signals.items():
             if sig.full_name == start_sig.full_name:
                 continue
-            n_trans = 0
-            last_val = None
-            last_change = 0
-            for i in range(len(sig._times)):
-                t = sig._times[i]
-                if t_lo <= t <= t_hi:
-                    n_trans += 1
-                    last_val = sig.value_str(i)
-                    last_change = t
-                elif t > t_hi:
-                    break
+            times = sig._times
+            lo = bisect.bisect_left(times, t_lo)
+            hi = bisect.bisect_right(times, t_hi)
+            n_trans = hi - lo
+            last_val = sig.value_str(hi - 1) if n_trans else None
+            last_change = times[hi - 1] if n_trans else 0
             if n_trans > 0:
                 contributors.append({
                     'signal': sig, 'transitions': n_trans,
@@ -102,12 +98,7 @@ class PowerEstimator:
         self.signal_activity = {}
         span = max(1, t_end - t_start)
         for sid, sig in self.vcd.signals.items():
-            n_trans = 0
-            for t in sig._times:
-                if t_start <= t <= t_end:
-                    n_trans += 1
-                elif t > t_end:
-                    break
+            n_trans = sig.transition_count_in_window(t_start, t_end)   # O(log n)
             activity = n_trans * sig.size / span * 1000
             self.signal_activity[sid] = activity
             if sig.scope:
@@ -155,6 +146,7 @@ def find_anomalies(signals, t_start, t_end, max_pulse=None, limit=10000):
             thr = period // 3 if period else 0
         times, values = sig.changes_in_window(t_start, t_end)
         prev_t = prev_v = None
+        n_before = len(events)
         for i in range(len(times)):
             t = times[i]
             v = values[i]
@@ -168,10 +160,11 @@ def find_anomalies(signals, t_start, t_end, max_pulse=None, limit=10000):
             elif scalar and thr and prev_t is not None and 0 < (t - prev_t) <= thr:
                 events.append((prev_t, sig.full_name, "glitch", "%d-wide pulse" % (t - prev_t)))
             prev_t, prev_v = t, v
-            if len(events) >= limit:
-                break
-        if len(events) >= limit:
-            break
+            if len(events) - n_before >= limit:
+                break              # this signal alone already fills the cap
+    # Every signal was scanned up to `limit` events, so the global first
+    # `limit` by time is exact (an early global break favoured the first
+    # signals in list order instead).
     events.sort(key=lambda e: e[0])
     return events[:limit]
 

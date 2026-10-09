@@ -17,6 +17,7 @@ Evaluation only happens at times where a referenced signal changes, so a search
 touches O(transitions in window) points, not every tick.
 """
 import bisect
+import heapq
 import fnmatch
 import operator
 import re
@@ -309,14 +310,23 @@ def _prepare(vcd, expr):
 
 
 def _candidate_times(resolved, start, end):
-    """Sorted times in (start, end] where any referenced signal changes, plus start."""
-    cand = {start}
+    """Yield `start`, then every time in (start, end] where any referenced
+    signal changes, ascending and deduplicated. A lazy k-way merge of the
+    per-signal slices: a first-match search stops at the hit instead of
+    first building a set of every change time in the trace."""
+    yield start
+    slices = []
     for s in resolved.values():
         ts = s._times
         lo = bisect.bisect_right(ts, start)
         hi = bisect.bisect_right(ts, end)
-        cand.update(ts[lo:hi])
-    return sorted(t for t in cand if start <= t <= end)
+        if hi > lo:
+            slices.append(ts[lo:hi])
+    prev = start
+    for t in heapq.merge(*slices):
+        if t != prev:
+            yield t
+            prev = t
 
 
 def find_expression(vcd, expr, start_time=0, end_time=None):

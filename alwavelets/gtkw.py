@@ -67,7 +67,9 @@ def load_gtkw(path):
                 continue
             if t.startswith('['):                       # any other [key] — ignore
                 continue
-            if t.startswith('#') or t.startswith('('):   # group/comment forms
+            if t[0] in '#(-+^>!':
+                # '-comment', '+{group}', '^filters', '>n' blank rows,
+                # '!' ... : GTKWave trace lines that are not signals.
                 continue
             out['signals'].append((t, _flag_to_radix(cur_flags)))
     return out
@@ -89,7 +91,8 @@ def save_gtkw(path, dumpfile, signals, time_start=None, time_end=None):
     `signals` is an iterable of (full_name, radix, size) — `size > 1` signals
     get a [n-1:0] range suffix like GTKWave; flags carry the radix.
     """
-    lines = ["[*] Alwavelets save file", '[dumpfile] "%s"' % (dumpfile or "")]
+    lines = ["[*] Alwavelets save file",
+             '[dumpfile] "%s"' % (dumpfile or "").replace('"', "'")]
     if time_start is not None and time_end is not None:
         lines.append("[timestart] %d" % time_start)
     last_flag = None

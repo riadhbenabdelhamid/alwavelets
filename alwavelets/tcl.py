@@ -57,7 +57,8 @@ class TclEngine:
                     i += 1
                     block_lines.append(lines[i])
                     brace_count += lines[i].count('{') - lines[i].count('}')
-                self._execute_line(' '.join(block_lines))
+                # Keep the body's newlines: foreach splits it into lines.
+                self._execute_line('\n'.join(block_lines))
             else:
                 self._execute_line(line)
             i += 1
@@ -68,14 +69,15 @@ class TclEngine:
         line = line.strip()
         if not line or line.startswith('#'):
             return
-        # Variable substitution
-        line = re.sub(r'\$(\w+)', lambda m: self.variables.get(m.group(1), m.group(0)), line)
-        # Parse command and arguments
-        parts = self._parse_args(line)
-        if not parts:
+        # Parse first, then substitute $vars per argument. A brace-quoted
+        # argument is left verbatim, as in Tcl — so a foreach body sees the
+        # loop variable's value at each iteration, not the value it had when
+        # the foreach line was read.
+        tagged = self._parse_args_tagged(line)
+        if not tagged:
             return
-        cmd = parts[0]
-        args = parts[1:]
+        cmd = self._subst(tagged[0][0])
+        args = [text if braced else self._subst(text) for text, braced in tagged[1:]]
         if cmd in self.commands:
             try:
                 self.commands[cmd](args)
@@ -84,12 +86,20 @@ class TclEngine:
         else:
             self.output.append(f"Unknown command: {cmd}")
 
+    def _subst(self, text):
+        return re.sub(r'\$(\w+)', lambda m: self.variables.get(m.group(1), m.group(0)), text)
+
     def _parse_args(self, line):
         """Parse command line respecting braces and quotes."""
+        return [text for text, _ in self._parse_args_tagged(line)]
+
+    def _parse_args_tagged(self, line):
+        """Like _parse_args, returning (text, brace_quoted) pairs."""
         parts = []
         i = 0
+        ws = ' \t\n'
         while i < len(line):
-            while i < len(line) and line[i] == ' ':
+            while i < len(line) and line[i] in ws:
                 i += 1
             if i >= len(line):
                 break
@@ -100,17 +110,17 @@ class TclEngine:
                     if line[j] == '{': depth += 1
                     elif line[j] == '}': depth -= 1
                     j += 1
-                parts.append(line[i+1:j-1])
+                parts.append((line[i+1:j-1], True))
                 i = j
             elif line[i] == '"':
                 j = line.index('"', i + 1) if '"' in line[i+1:] else len(line)
-                parts.append(line[i+1:j])
+                parts.append((line[i+1:j], False))
                 i = j + 1
             else:
                 j = i
-                while j < len(line) and line[j] != ' ':
+                while j < len(line) and line[j] not in ws:
                     j += 1
-                parts.append(line[i:j])
+                parts.append((line[i:j], False))
                 i = j
         return parts
 
