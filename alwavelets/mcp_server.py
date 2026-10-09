@@ -74,12 +74,15 @@ def _h_render_svg(file, signals=None, start=None, end=None, width=900,
 
 def _h_render_png(file, signals=None, start=None, end=None, width=900,
                   radix=None, arrangement=None):
-    png = render_waveform_png(_load(file), signals, start, end,
+    trace = _load(file)
+    png = render_waveform_png(trace, signals, start, end,
                               width=int(width), radix=radix, arrangement=arrangement)
     data = base64.b64encode(png).decode("ascii")
     return [
         {"type": "image", "data": data, "mimeType": "image/png"},
         {"type": "text", "text": "PNG waveform snapshot (%d bytes)" % len(png)},
+        {"type": "text", "text": render_text(trace, signals, start, end,
+             width=100, radix=radix, arrangement=arrangement)},
     ]
 
 

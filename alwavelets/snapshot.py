@@ -203,7 +203,10 @@ def _apply_bus_labels(chars, labels):
         avail = nxt - col - 1
         if avail <= 0:
             continue
-        for k, ch in enumerate(labels[col][:avail]):
+        # A clipped hex/signed label can be mistaken for a different value.
+        # Omit it visibly instead; zooming or a value query reveals all bits.
+        label = labels[col] if len(labels[col]) <= avail else "…"
+        for k, ch in enumerate(label):
             if col + k < n:
                 row[col + k] = ch
     return "".join(row)

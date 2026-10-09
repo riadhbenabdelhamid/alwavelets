@@ -21,7 +21,7 @@ PALETTE = [
     (31, 122, 58),    # LOW   logic 0
     (232, 80, 80),    # EDGE  transitions
     (232, 200, 64),   # UNDEF x (unknown)
-    (111, 170, 255),  # HIZ   z / bus body
+    (192, 149, 255),  # HIZ   high impedance (distinct from unknown and bus)
     (111, 170, 255),  # BUS   bus body
     (60, 64, 84),     # GRID  faint guide
 ]
@@ -124,6 +124,8 @@ def render_waveform_png(vcd, signals=None, t_start=None, t_end=None,
     from .core import ensure_trace_loaded
     ensure_trace_loaded(vcd, t_start, t_end)
     sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
+    if not sigs:
+        raise ValueError("No signals matched; specify signals or a saved arrangement")
     indices, w, h = _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx)
     return png_encode(w, h, indices)
 
@@ -133,38 +135,63 @@ def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx):
     height = max(row_h, len(sigs) * row_h)
     cv = Canvas(width, height)
     span = t_end - t_start
+    def column(t):
+        # Avoid float rounding at large absolute timestamps; the final tick
+        # belongs to the final pixel rather than falling beyond the canvas.
+        return max(0, min(width - 1, (t - t_start) * width // span))
+
     for i, sig in enumerate(sigs):
         y0 = i * row_h
         yhi, ylo = y0 + 3, y0 + row_h - 4
         ymid = (yhi + ylo) // 2
-        if sig.size == 1 and getattr(sig, "signal_type", "wire") not in ('real', 'realtime'):
-            prev_y = None
-            for x in range(width):
-                v = sig.value_at(int(t_start + x * span / width))
-                if v == "1":
-                    y, c = yhi, HIGH
-                elif v == "0":
-                    y, c = ylo, LOW
-                elif v == "x":
-                    y, c = ymid, UNDEF
-                else:
-                    y, c = ymid, HIZ
-                if prev_y is not None and prev_y != y:
-                    cv.vline(x, prev_y, y, EDGE)
-                cv.px(x, y, c)
-                prev_y = y
-        else:
-            tw, vw = sig.changes_in_window(t_start, t_end)
-            for j in range(len(tw)):
-                xa = int((tw[j] - t_start) / span * width)
-                xb = (int((tw[j + 1] - t_start) / span * width)
-                      if j + 1 < len(tw) else width)
-                undef = any(ch in vw[j] for ch in "xXzZ")
-                col = UNDEF if undef else BUS
-                cv.hline(xa, xb, yhi, col)
-                cv.hline(xa, xb, ylo, col)
-                if j > 0:
-                    cv.vline(xa, yhi, ylo, EDGE)
+        scalar = sig.size == 1 and getattr(sig, "signal_type", "wire") not in ('real', 'realtime')
+        levels = {"1": (yhi, HIGH), "0": (ylo, LOW), "x": (ymid, UNDEF), "z": (ymid, HIZ)}
+        tw, vw = sig.changes_in_window(t_start, t_end)
+        segments, edges = [], []
+        cursor, current = t_start, "x"
+        initialized = False
+        for t, value in zip(tw, vw):
+            value = str(value).lower()
+            if t < t_start:
+                current, initialized = value, True
+                continue
+            if t > t_end:
+                break
+            if t > cursor:
+                segments.append((cursor, t, current))
+            if value != current and (initialized or t > t_start):
+                edges.append((t, current, value))
+            cursor, current, initialized = t, value, True
+        segments.append((cursor, t_end, current))
+        for start, end, value in segments:
+            xa = column(start)
+            xb = width - 1 if end == t_end else max(xa, column(end) - 1)
+            if scalar:
+                y, color = levels.get(value, (ymid, UNDEF))
+                cv.hline(xa, xb, y, color)
+            else:
+                color = UNDEF if "x" in value else HIZ if "z" in value else BUS
+                cv.hline(xa, xb, yhi, color)
+                cv.hline(xa, xb, ylo, color)
+        # Draw every edge, including a pulse shorter than one pixel and
+        # multiple value changes at a single timestamp. Sampling value_at()
+        # once per pixel can erase all of them.
+        exceptional = {}
+        for t, before, after in edges:
+            x = column(t)
+            if scalar:
+                ya = levels.get(before, (ymid, UNDEF))[0]
+                yb = levels.get(after, (ymid, UNDEF))[0]
+                cv.vline(x, min(ya, yb), max(ya, yb), EDGE)
+                cv.px(x, yb, levels.get(after, (ymid, UNDEF))[1])
+            else:
+                cv.vline(x, yhi, ylo, EDGE)
+            exceptional.setdefault(x, set()).update(c for c in before + after if c in "xz")
+        for x, states in exceptional.items():
+            if "x" in states:
+                cv.px(x, ymid, UNDEF)
+            if "z" in states:
+                cv.px(x, ymid + (1 if "x" in states else 0), HIZ)
     return cv.buf, width, height
 
 
