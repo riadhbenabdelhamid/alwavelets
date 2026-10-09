@@ -1,7 +1,7 @@
 """Waveform rendering — pure functions that turn signal data into
 character/attribute arrays (single-bit, bus, analog). No curses.
 """
-import bisect
+from .core import time_bisect_left
 
 from .core import _B2S, format_typed_value
 
@@ -75,7 +75,7 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
     # O(window) per frame at full zoom-out).
     if getattr(sig, '_scalar', False) and \
             sig.transition_count_in_window(t_start, t_end) > width:
-        _bisect_left = bisect.bisect_left
+        _bisect_left = time_bisect_left
         inv_width = span / width  # float division for consistent column widths
         # Packed-scalar storage: read byte codes from the full arrays and
         # decode via _B2S.
@@ -124,7 +124,7 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
     # values (so the byte-code fast path above would misread them). Bucket
     # over the already bit-extracted windowed (times, values).
     if len(times) > width:
-        _bisect_left = bisect.bisect_left
+        _bisect_left = time_bisect_left
         inv_width = span / width
         start_val = sig.value_at(t_start)
         for col in range(width):
@@ -219,7 +219,7 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
             sig.transition_count_in_window(t_start, t_end) > n:
         # Per sub-column binary search, half-open [start, end) float bounds;
         # packed-scalar byte codes decoded via _B2S.
-        _bl = bisect.bisect_left
+        _bl = time_bisect_left
         inv = span / n
         first_val = sig.value_at(t_start)
         all_t = sig._times
@@ -249,7 +249,7 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
         # LOD generic path: non-packed single-bit signals (expanded-bus
         # VirtualBitSignal) — bucket over the already bit-extracted windowed
         # (times, values), which are strings, not byte codes.
-        _bl = bisect.bisect_left
+        _bl = time_bisect_left
         inv = span / n
         first_val = sig.value_at(t_start)
         for s in range(n):
@@ -296,7 +296,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
 
     # ── LOD path (activate when transitions > pixels for symmetry) ──
     if n_changes > width:
-        _bl = bisect.bisect_left
+        _bl = time_bisect_left
         at = sig._times
         vstr = sig.value_str            # decodes packed bus storage
         prev = sig.value_at(t_start)

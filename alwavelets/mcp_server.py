@@ -45,6 +45,8 @@ def _load(path):
         raise FileNotFoundError("file not found: %s" % path)
     key = (os.path.abspath(path), os.path.getmtime(path))
     if key not in _cache:
+        for trace in _cache.values():
+            trace.close()
         _cache.clear()
         # parse_file may print (e.g. FST reader); keep stdout clean for JSON-RPC.
         with contextlib.redirect_stdout(sys.stderr):

@@ -1,0 +1,632 @@
+"""Disk-backed waveform pages with bounded decoding and persistent indexes.
+
+All declarations remain available. Signal selection is a query option, never
+a requirement for opening a trace. SQLite stores independently compressed
+pages; sequence views preserve the existing read-only signal API.
+"""
+import array
+import bisect
+from collections import OrderedDict
+from collections.abc import Sequence
+import heapq
+import json
+import math
+import os
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import zlib
+
+from .core import VCDSignal, AliasSignal, numeric_value, clear_pack_memos
+from .value_stream import ValueState
+
+VERSION = 2  # includes the persistent min/max hierarchy
+PAGE_BYTES = 64 * 1024
+PAGE_EVENTS = 4096
+AUTO_THRESHOLD = 50 * 1024 * 1024
+
+
+class Cancelled(ValueError):
+    pass
+
+
+class SequenceView(Sequence):
+    """Slices stay views, including for legacy consumers of _times/_values."""
+    def __init__(self, source, indices=None, transform=None):
+        self.source = source
+        self.indices = range(len(source)) if indices is None else indices
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return SequenceView(self.source, self.indices[index], self.transform)
+        value = self.source[self.indices[index]]
+        return self.transform(value) if self.transform else value
+
+    def __eq__(self, other):
+        return len(self) == len(other) and all(a == b for a, b in zip(self, other))
+
+    def __iter__(self):
+        if self.indices.step == 1 and hasattr(self.source, 'iter_range'):
+            values = self.source.iter_range(self.indices.start, self.indices.stop)
+        else:
+            values = (self.source[i] for i in self.indices)
+        return map(self.transform, values) if self.transform else iter(values)
+
+
+class PageSequence(Sequence):
+    typecode = 'q'
+
+    def __init__(self, signal, values=False):
+        self.signal, self.values = signal, values
+
+    def __len__(self):
+        return self.signal.num_changes()
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return SequenceView(self, range(*index.indices(len(self))))
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        page, lo = self.signal.store.page_at(self.signal.key, index)
+        index -= lo
+        if not self.values:
+            return page._times[index]
+        return page._values[index] if self.signal._scalar else page.value_str(index)
+
+    def bisect(self, timestamp, right=False):
+        return self.signal.store.bisect(self.signal.key, timestamp, right)
+
+    def iter_range(self, start, end):
+        while start < end:
+            page, lo = self.signal.store.page_at(self.signal.key, start)
+            stop = min(end - lo, len(page._times))
+            for i in range(start - lo, stop):
+                yield (page._values[i] if self.signal._scalar else page.value_str(i)) if self.values else page._times[i]
+            start = lo + stop
+
+    def __iter__(self):
+        return self.iter_range(0, len(self))
+
+
+class StoredSignal(VCDSignal):
+    __slots__ = ('store', 'key', '_time_view', '_value_view')
+
+    def __init__(self, metadata, key, store):
+        # The metadata object owns no event data. Do not call the mutable
+        # base constructor: these arrays are read-only page-backed views.
+        for name in ('name', 'full_name', 'identifier', 'size', 'reference',
+                     'declared_range', 'signal_type', 'scope', 'analog_mode',
+                     'is_dumped', '_parent_sig', '_bit_idx', '_scalar'):
+            setattr(self, name, getattr(metadata, name))
+        self._packed, self._stride, self._memo = False, 0, None
+        self.key, self.store = key, store
+        self._time_view, self._value_view = PageSequence(self), PageSequence(self, True)
+
+    _times = property(lambda self: self._time_view)
+    _values = property(lambda self: self._value_view)
+
+    def num_changes(self):
+        return self.store.counts.get(self.key, 0)
+
+    def changes_in_window(self, start, end):
+        lo = max(0, self._times.bisect(start) - 1)
+        hi = self._times.bisect(end, True)
+        return self._times[lo:hi], SequenceView(self._values, range(lo, hi),
+                                               chr if self._scalar else None)
+
+    def iter_changes(self, start=0, end=None):
+        lo = self._times.bisect(start)
+        hi = len(self._times) if end is None else self._times.bisect(end, True)
+        values = self._values.iter_range(lo, hi)
+        return zip(self._times.iter_range(lo, hi), map(chr, values) if self._scalar else values)
+
+    def numeric_range_in_window(self, start, end):
+        low, high = self.store.numeric_range(self, start, end)
+        if low is None:
+            return 0, 1
+        return (low - 1, high + 1) if low == high else (low, high)
+
+    def add_change(self, time, value):
+        raise TypeError('disk-backed signals are read-only')
+
+
+def _signature(path):
+    st = os.stat(path)
+    return [st.st_size, st.st_mtime_ns, sys.byteorder]
+
+
+def index_path(path):
+    from .cache import cache_path
+    return cache_path(path) + '.sqlite'
+
+
+def use_disk_storage(source, mode='auto'):
+    if mode not in ('auto', 'memory', 'disk'):
+        raise ValueError('storage must be auto, memory, or disk')
+    if mode == 'memory':
+        return False
+    from .fst import FSTReader
+    with open(source, 'rb') as f:
+        supported = f.read(1) == b'$' or FSTReader.is_fst(source)
+    if mode == 'disk' and not supported:
+        raise ValueError('Disk storage requires VCD or FST input')
+    return supported and (mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD)
+
+
+def _definition(sig):
+    return [sig.reference, sig.identifier, sig.size, sig.signal_type,
+            sig.scope, sig.declared_range]
+
+
+def _signal(definition):
+    name, identifier, size, kind, scope, bounds = definition
+    return VCDSignal(name, identifier, size, kind, scope, tuple(bounds) if bounds is not None else None)
+
+
+class TraceStore:
+    """A cache budget covers decoded pages; metadata and SQLite are separate."""
+    def __init__(self, path, memory_bytes=256 * 1024 * 1024):
+        self.path = path
+        self.memory_bytes = max(64 * 1024, int(memory_bytes))
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute('PRAGMA cache_size=-2048')
+        self.db.execute('PRAGMA temp_store=FILE')
+        self.pages = OrderedDict()
+        self.cache_bytes = self.peak_cache_bytes = self.page_reads = 0
+        self.counts, self.definitions = {}, {}
+        self.generation = 0
+        self.cancel = threading.Event()
+        self.thread = None
+        self.temporary = None
+        self.closed = False
+
+    def bisect(self, key, timestamp, right=False):
+        with self.lock:
+            n = self.counts.get(key, 0)
+            # SQLite binds integers, not Fraction (used by cross-timescale
+            # comparisons). Round the lookup bound without losing precision.
+            bound = math.floor(timestamp) if right else math.ceil(timestamp)
+            if bound > (1 << 63) - 1:
+                return n
+            if bound < -(1 << 63):
+                return 0
+            op = '>' if right else '>='
+            row = self.db.execute(f'SELECT lo FROM pages WHERE sid=? AND t1{op}? '
+                                  'AND lo<? ORDER BY t1,lo LIMIT 1', (key, bound, n)).fetchone()
+            if row is None:
+                return n
+            page, lo = self.page_at(key, row[0])
+            return lo + (bisect.bisect_right if right else bisect.bisect_left)(page._times, timestamp)
+
+    def page_at(self, key, index):
+        with self.lock:
+            # A lookup in the compact SQL index avoids keeping all page
+            # offsets in Python for files with millions of blocks.
+            row = self.db.execute('SELECT id,lo,n FROM pages WHERE sid=? AND lo<=? '
+                                  'ORDER BY lo DESC LIMIT 1', (key, index)).fetchone()
+            if row is None or index >= row[1] + row[2]:
+                raise IndexError(index)
+            pid, lo, count = row
+            cached = self.pages.get(pid)
+            if cached is not None:
+                self.pages.move_to_end(pid)
+                return cached[0], lo
+            blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
+            data = zlib.decompress(blob)
+            kind = data[0]
+            sig = _signal(self.definitions[key])
+            sig._times = array.array('q')
+            sig._times.frombytes(data[1:1 + count * 8])
+            raw = data[1 + count * 8:]
+            if kind in (1, 2):
+                sig._values = bytearray(raw)
+            else:
+                sig._packed = False
+                sig._values = json.loads(raw)
+            size = sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
+            if kind == 0:
+                size += sum(sys.getsizeof(v) for v in sig._values)
+            while self.pages and self.cache_bytes + size > self.memory_bytes:
+                _, (_, old_size) = self.pages.popitem(last=False)
+                self.cache_bytes -= old_size
+            if size <= self.memory_bytes:
+                self.pages[pid] = (sig, size)
+                self.cache_bytes += size
+                self.peak_cache_bytes = max(self.peak_cache_bytes, self.cache_bytes)
+            self.page_reads += 1
+            return sig, lo
+
+    def numeric_range(self, sig, start, end):
+        # Match changes_in_window, including the preceding baseline event.
+        index = max(0, self.bisect(sig.key, start) - 1)
+        stop = self.bisect(sig.key, end, True)
+        low = high = None
+        with self.lock:
+            while index < stop:
+                if self.cancel.is_set():
+                    raise Cancelled('Read cancelled')
+                row = self.db.execute('SELECT n,vmin,vmax FROM summaries WHERE sid=? '
+                                      'AND lo=? AND n<=? ORDER BY level DESC LIMIT 1',
+                                      (sig.key, index, stop - index)).fetchone()
+                if row is not None:
+                    n, vmin, vmax = row
+                    candidates = (json.loads(vmin), json.loads(vmax))
+                    index += n
+                else:
+                    page, lo = self.page_at(sig.key, index)
+                    end_index = min(stop, lo + len(page._times))
+                    candidates = (numeric_value(page.value_str(i), sig.signal_type)
+                                  for i in range(index - lo, end_index - lo))
+                    index = end_index
+                for value in candidates:
+                    if value is not None:
+                        low = value if low is None else min(low, value)
+                        high = value if high is None else max(high, value)
+        return low, high
+
+    def iter_events(self, signal_ids, start=0, end=None, cancel=None, progress=None):
+        """Merge referenced signals lazily; memory is bounded by their heads."""
+        def stream(sid):
+            sig = self.vcd.signals[sid]
+            for ordinal, (t, value) in enumerate(sig.iter_changes(start, end)):
+                yield t, sid, ordinal, value
+        streams = [stream(sid) for sid in signal_ids]
+        count = 0
+        for event in heapq.merge(*streams):
+            if self.cancel.is_set() or (cancel is not None and cancel.is_set()):
+                raise Cancelled('Analysis cancelled')
+            count += 1
+            if progress is not None and count % 4096 == 0:
+                progress(event[0], end if end is not None else self.vcd.max_time)
+            yield event[0], event[1], event[3]
+
+    def close(self):
+        self.cancel.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join()
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.db.close()
+            self.pages.clear()
+            self.cache_bytes = 0
+            if self.temporary:
+                self.temporary.cleanup()
+
+
+class PageWriter:
+    def __init__(self, store, vcd):
+        self.store, self.vcd = store, vcd
+        self.builders = OrderedDict()
+        self.summary_groups = {}
+        self.sizes, self.totals, self.last_time = {}, {}, {}
+        self.buffer_bytes = 0
+        self.buffer_limit = min(32 * 1024 * 1024, max(PAGE_BYTES, store.memory_bytes // 4))
+        self.disordered = False
+        self.changes = 0
+        self.last_publish = time.monotonic()
+        self._initialize(vcd)
+
+    def _initialize(self, vcd):
+        from .parsers import build_scope_tree
+        store = self.store
+        store.vcd = vcd
+        db = store.db
+        db.executescript('''
+            CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE signals(sid TEXT PRIMARY KEY,definition TEXT,master TEXT,n INTEGER);
+            CREATE TABLE pages(id INTEGER PRIMARY KEY,sid TEXT,lo INTEGER,n INTEGER,
+                               t0 INTEGER,t1 INTEGER,vmin TEXT,vmax TEXT,data BLOB);
+            CREATE TABLE summaries(sid TEXT,lo INTEGER,n INTEGER,level INTEGER,vmin TEXT,vmax TEXT,
+                                   PRIMARY KEY(sid,lo,level));
+            CREATE INDEX page_lookup ON pages(sid,lo);
+            CREATE INDEX page_time ON pages(sid,t0,t1);
+            CREATE INDEX page_end ON pages(sid,t1,lo);
+        ''')
+        master_keys = {id(sig): sid for sid, sig in vcd.signals.items() if sig.owns_storage}
+        old = list(vcd.signals.items())
+        for sid, sig in old:
+            definition = _definition(sig)
+            master = sid if sig.owns_storage else master_keys[id(sig.master)]
+            db.execute('INSERT INTO signals VALUES(?,?,?,0)', (sid, json.dumps(definition), master))
+            if sig.owns_storage:
+                store.definitions[sid] = definition
+                store.counts[sid] = 0
+                vcd.signals[sid] = StoredSignal(sig, sid, store)
+            else:
+                vcd.signals[sid] = AliasSignal(sig.reference, sig.identifier, sig.size,
+                                               sig.signal_type, sig.scope, vcd.signals[master], sig.declared_range)
+        db.commit()
+        vcd._store = store
+        vcd._lazy_mode = False
+        vcd.scopes = build_scope_tree(vcd)
+
+    def add(self, key, timestamp, value):
+        if self.store.cancel.is_set():
+            raise Cancelled('Indexing cancelled')
+        definition = self.store.definitions.get(key)
+        if definition is None:
+            return
+        if timestamp < self.last_time.get(key, timestamp):
+            self.disordered = True
+        self.last_time[key] = timestamp
+        sig = self.builders.get(key)
+        if sig is None:
+            sig = self.builders[key] = _signal(definition)
+            sig._memo = None
+            self.sizes[key] = 256
+            self.buffer_bytes += 256
+        before = len(sig._values)
+        if sig._scalar:
+            value = value[-1:].lower()
+            sig._values.append(ord(value) if value in ('0', '1', 'x', 'z') else 120)
+        else:
+            sig._append_value(value, intern=False)
+        sig._times.append(timestamp)
+        cost = 16 + (len(sig._values) - before if type(sig._values) is bytearray else sys.getsizeof(value) + 8)
+        self.sizes[key] += cost
+        self.buffer_bytes += cost
+        self.changes += 1
+        if len(sig._times) >= PAGE_EVENTS or self.sizes[key] >= PAGE_BYTES:
+            self.flush(key)
+        while self.builders and self.buffer_bytes > self.buffer_limit:
+            self.flush(next(iter(self.builders)))
+
+    def flush(self, key):
+        sig = self.builders.pop(key)
+        self.buffer_bytes -= self.sizes.pop(key)
+        kind = 1 if sig._scalar else (2 if type(sig._values) is bytearray else 0)
+        values = bytes(sig._values) if kind else json.dumps(sig._values, separators=(',', ':')).encode()
+        data = zlib.compress(bytes([kind]) + sig._times.tobytes() + values, 1)
+        minimum = maximum = None
+        for i in range(len(sig._times)):
+            value = numeric_value(sig.value_str(i), sig.signal_type)
+            if value is not None:
+                minimum = value if minimum is None else min(minimum, value)
+                maximum = value if maximum is None else max(maximum, value)
+        lo = self.totals.get(key, 0)
+        n = len(sig._times)
+        with self.store.lock:
+            self.store.db.execute('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)',
+                                  (key, lo, n, min(sig._times), max(sig._times),
+                                   json.dumps(minimum), json.dumps(maximum), data))
+            self.add_summary(key, lo, n, 0, minimum, maximum)
+        self.totals[key] = lo + n
+
+    def add_summary(self, key, lo, n, level, minimum, maximum):
+        self.store.db.execute('INSERT INTO summaries VALUES(?,?,?,?,?,?)',
+                              (key, lo, n, level, json.dumps(minimum), json.dumps(maximum)))
+        group_key = key, level
+        group = self.summary_groups.get(group_key)
+        if group is None:
+            group = [lo, 0, None, None, 0]
+            self.summary_groups[group_key] = group
+        group[1] += n
+        if minimum is not None:
+            group[2] = minimum if group[2] is None else min(group[2], minimum)
+            group[3] = maximum if group[3] is None else max(group[3], maximum)
+        group[4] += 1
+        if group[4] == 16:
+            del self.summary_groups[group_key]
+            self.add_summary(key, group[0], group[1], level + 1, group[2], group[3])
+
+    def publish(self, force=False):
+        if not force and time.monotonic() - self.last_publish < 0.25:
+            return
+        for key in list(self.builders):
+            self.flush(key)
+        with self.store.lock:
+            self.store.db.executemany('UPDATE signals SET n=? WHERE sid=?',
+                                      ((n, key) for key, n in self.totals.items()))
+            self.store.db.commit()
+            if not self.disordered:
+                self.store.counts.update(self.totals)
+            self.store.generation += 1
+        self.vcd._load_changes = self.changes
+        self.last_publish = time.monotonic()
+
+    def reorder(self):
+        """Malformed out-of-order VCD: external sort with SQLite's disk temp store."""
+        self.publish(True)
+        db = self.store.db
+        db.execute('CREATE TABLE reordered(sid TEXT,t INTEGER,ordinal INTEGER,value TEXT)')
+        for key, n in self.totals.items():
+            index = 0
+            while index < n:
+                page, lo = self.store.page_at(key, index)
+                db.executemany('INSERT INTO reordered VALUES(?,?,?,?)',
+                               ((key, t, lo + i, page.value_str(i)) for i, t in enumerate(page._times)))
+                index = lo + len(page._times)
+        db.commit()
+        db.execute('DELETE FROM pages')
+        db.execute('DELETE FROM summaries')
+        self.summary_groups.clear()
+        self.store.pages.clear()
+        self.store.cache_bytes = 0
+        self.totals.clear()
+        self.last_time.clear()
+        self.disordered = False
+        self.changes = 0
+        cursor = db.execute('SELECT sid,t,value FROM reordered ORDER BY sid,t,ordinal')
+        for key, t, value in cursor:
+            self.add(key, t, value)
+        self.publish(True)
+        db.execute('DROP TABLE reordered')
+
+    def finish(self, source, signature):
+        if self.store.cancel.is_set():
+            raise Cancelled('Indexing cancelled')
+        self.publish(True)
+        if self.disordered:
+            with self.store.lock:
+                self.reorder()
+        if _signature(source) != signature:
+            raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
+        meta = {'version': VERSION, 'signature': signature, 'complete': True,
+                'timescale': self.vcd.timescale, 'timescale_number': self.vcd.timescale_number,
+                'timescale_unit': self.vcd.timescale_unit, 'date': self.vcd.date,
+                'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
+                'min_time': self.vcd.min_time}
+        with self.store.lock:
+            self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
+            self.store.db.commit()
+        self.vcd._extent_known = True
+        self.vcd._load_progress = 100
+        clear_pack_memos()
+
+
+def create_derived_store(parent, signal):
+    """A derived trace shares its parent's lifetime but is never persisted."""
+    from .parsers import VCDFile
+    temporary = tempfile.TemporaryDirectory(prefix='alwavelets-derived-')
+    store = TraceStore(os.path.join(temporary.name, 'trace.sqlite'),
+                       min(parent._store.memory_bytes, 8 * 1024 * 1024))
+    store.temporary = temporary
+    trace = VCDFile()
+    trace.signals[signal.identifier] = signal
+    trace.signal_order = [signal.identifier]
+    writer = PageWriter(store, trace)
+    if not hasattr(parent, '_derived_stores'):
+        parent._derived_stores = []
+    parent._derived_stores.append(store)
+    return trace.signals[signal.identifier], writer
+
+
+def _restore(store, source):
+    from .parsers import VCDFile, build_scope_tree
+    row = store.db.execute('SELECT value FROM meta WHERE key="trace"').fetchone()
+    if row is None:
+        return None
+    meta = json.loads(row[0])
+    if meta['version'] != VERSION or meta['signature'] != _signature(source) or not meta['complete']:
+        return None
+    vcd = VCDFile()
+    vcd._filename = source
+    for field in ('timescale', 'timescale_number', 'timescale_unit', 'date', 'max_time', 'min_time'):
+        setattr(vcd, field, meta[field])
+    vcd.version = meta['simulator_version']
+    for key, definition, master, count in store.db.execute('SELECT sid,definition,master,n FROM signals ORDER BY rowid'):
+        sig = _signal(json.loads(definition))
+        if master == key:
+            store.definitions[key] = json.loads(definition)
+            store.counts[key] = count
+            sig = StoredSignal(sig, key, store)
+        else:
+            sig = AliasSignal(sig.reference, sig.identifier, sig.size, sig.signal_type,
+                              sig.scope, vcd.signals[master], sig.declared_range)
+        vcd.signals[key] = sig
+        vcd.signal_order.append(key)
+    store.vcd, vcd._store = vcd, store
+    vcd.scopes = build_scope_tree(vcd)
+    return vcd
+
+
+def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None):
+    """Open VCD/FST into paged storage; all declarations remain available."""
+    from .parsers import VCDFile
+    from . import cache
+    use_cache = use_cache and cache.ENABLED
+    source = os.path.abspath(source)
+    if memory_mib <= 0:
+        raise ValueError('memory_mib must be positive')
+    memory = int(memory_mib * 1024 * 1024)
+    target = index_path(source)
+    if use_cache and os.path.isfile(target):
+        store = None
+        try:
+            store = TraceStore(target, memory)
+            vcd = _restore(store, source)
+            if vcd is not None:
+                return vcd
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
+            pass
+        if store is not None:
+            store.close()
+    signature = _signature(source)
+    from .fst import FSTReader
+    is_fst = FSTReader.is_fst(source)
+    if is_fst:
+        vcd = FSTReader(source).parse(metadata_only=True)
+        offset = 0
+    else:
+        vcd, offset = VCDFile.parse_header(source)
+    if not vcd.signal_order:
+        raise ValueError('Trace has no signal declarations')
+    if use_cache:
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
+        except OSError:
+            use_cache = False
+    if not use_cache:
+        temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
+    path = os.path.join(temporary.name, 'trace.sqlite')
+    store = TraceStore(path, memory)
+    store.temporary = temporary
+    writer = PageWriter(store, vcd)
+    vcd._loading = True
+    vcd._extent_known = False
+
+    def build():
+        try:
+            if is_fst:
+                def progress(done, total):
+                    vcd._load_progress = min(99, done * 100 // max(1, total))
+                    if progress_cb:
+                        progress_cb(done, total)
+                FSTReader(source).parse(progress, writer_factory=lambda _: writer)
+            else:
+                ingest_vcd()
+            writer.finish(source, signature)
+            if use_cache:
+                try:
+                    os.replace(path, target)
+                    store.path = target
+                except OSError:
+                    pass  # the complete temporary index remains usable
+        except Exception as exc:
+            vcd._load_error = str(exc)
+        finally:
+            vcd._loading = False
+
+    def ingest_vcd():
+        state = ValueState()
+        pos = offset
+        with open(source, 'rb', buffering=1 << 20) as f:
+            f.seek(offset)
+            for raw in f:
+                if store.cancel.is_set():
+                    raise Cancelled('Indexing cancelled')
+                pos += len(raw)
+                event = state.feed(raw)
+                if event is not None:
+                    bid, value = event
+                    keys = store.definitions if bid is None else (bid.decode('ascii', 'ignore'),)
+                    for key in keys:
+                        writer.add(key, state.time, value)
+                if pos % (1 << 16) < len(raw):
+                    vcd.max_time = state.max_time
+                    vcd._load_progress = min(99, pos * 100 // max(1, signature[0]))
+                    writer.publish()
+                    if progress_cb:
+                        progress_cb(pos, signature[0])
+        vcd.max_time = state.max_time
+    if background:
+        store.thread = threading.Thread(target=build, daemon=True, name='wavelet-index')
+        store.thread.start()
+    else:
+        build()
+        if vcd._load_error:
+            store.close()
+            raise ValueError(vcd._load_error)
+    return vcd

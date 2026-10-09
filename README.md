@@ -22,7 +22,7 @@ stdlib, original artwork, no third-party assets.
 
 ## Features
 
-- **Formats:** VCD (streaming, background, and lazy on-demand loading for large
+- **Formats:** VCD (streaming, background, and disk-backed loading for large
   files; aliased identifier codes and `b`-form 1-bit values included) and FST
   read natively — zlib, LZ4 and FastLZ chains and hierarchies, gzip-wrapped
   files, aliases, `$dumpoff` blackouts — with pure-Python block decoders, so
@@ -85,6 +85,8 @@ Flags:
 | --- | --- |
 | `--signals`, `-s` | Comma-separated name/glob filters |
 | `--sync` | Force synchronous parse (disable background loading) |
+| `--storage auto\|memory\|disk` | Use disk storage above 50 MiB by default; override either way |
+| `--memory-mib N` | Decoded waveform page-cache budget, default 256 MiB |
 | `--loadunchecked` | Start with no signals shown (pick them in the `B` tree browser) |
 | `--expanded` | Start with all scope modules expanded |
 | `--demo` | Generate and view a demo trace (written under a per-user temp directory) |
@@ -95,6 +97,63 @@ Flags:
 | `--control` | Expose a token-authenticated control socket so an authorized local agent can drive this live session (see [SKILL.md](SKILL.md)) |
 | `--list-sessions` | Print controllable running viewers as JSON, then exit |
 | `--jobs`, `-j` | Opt-in parallel parse workers for a large (>16 MB) synchronous parse (e.g. `--sync --jobs 8`) |
+
+Parallel workers use `forkserver` where supported and `spawn` elsewhere, so
+they do not inherit the viewer's threads and locks. Library scripts requesting
+parallel parsing must guard their entry point with `if __name__ == '__main__':`.
+The low-level `parse_parallel_file` API accepts an optional `mp_context`;
+`parse_file` falls back to sequential parsing when workers cannot start or fail.
+Worker startup and merging add overhead, so `--jobs` remains opt-in and applies
+to in-memory VCD parsing (`--storage memory --sync --jobs 8`).
+
+### Very large traces
+
+VCD and FST files above 50 MiB automatically use an indexed SQLite trace store.
+Every declared signal remains available. `--signals`, `--loadunchecked`, and
+tree selection remain optional display controls; disk mode does not require a
+signal shortlist. To force disk storage or choose a smaller page cache:
+
+```sh
+alwavelets huge.vcd --storage disk --memory-mib 64
+alwavelets huge.fst --storage disk --loadunchecked
+```
+
+The first open scans the source and writes independently compressed signal
+pages. The viewer opens after metadata parsing and displays available data as
+indexing progresses. Rows and cursor values load on a background worker; panning
+discards obsolete requests. Complete analyses wait until indexing finishes.
+The index includes signal/time lookups and a hierarchy of exact min/max
+summaries, so overview scaling need not decode the whole history. Reopening an
+unchanged source reads metadata immediately and fetches values on demand.
+Changed sources rebuild the index; incomplete/cancelled indexes are never reused.
+
+Pages are evicted from a bounded cache while browsing. The budget covers decoded
+pages, **not total process memory**: Python, declarations, SQLite, builder buffers,
+and active query pages need additional memory. FST also decompresses one signal
+chain plus block time tables/hierarchy; an unusually large individual chain or
+declaration can exceed the budget. There is no new native dependency. Disk mode
+trades a slower first scan and disk space for low memory use and quick subsequent
+opens. `--no-cache` still uses temporary disk storage, removed on close.
+
+Expression searches stream only the referenced signals. `when`/`match` searches
+run in the background in disk mode, with progress and a `cancel` command. Derived
+signal output also uses temporary pages. Clock measurement uses a disk sort for
+its exact median. Explicit materialization such as `signal.changes`, some exports,
+and protocol decoder result lists can still consume memory proportional to the
+requested output; narrow those requests when working with very large traces.
+Live tailing requires `--storage memory`; disk indexes are snapshots.
+
+Library callers can explicitly select storage and should close traces:
+
+```python
+from alwavelets import parse_file
+
+with parse_file("huge.vcd", storage="disk", memory_mib=64) as trace:
+    value = trace.signals[trace.signal_order[0]].value_at(1000)
+```
+
+`VCDFile.parse()` remains the explicit eager reader. The old lazy reader remains
+available through its low-level API and the benchmark's `lazy` mode.
 
 Press `?` inside the viewer for quick help, or `F1` for the full manual.
 For a browsable reference of every key, command, sidecar file and the MCP
@@ -240,6 +299,8 @@ whenever an agent is connected and acting.
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
+| `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
+| `background` | Bounded UI read queue and cancellable analysis jobs |
 | `parallel` | Opt-in multi-process parsing of large VCDs (`--jobs N`) |
 | `expr` | Cross-signal boolean expression search + derived signals (`when`/`derive`) |
 | `gtkw` | GTKWave `.gtkw` save-file import/export (interop) |
@@ -279,6 +340,42 @@ style enforcement.
 
 `pip install .` installs the package and an `alwavelets` console command
 (`pyproject.toml`; no runtime dependencies).
+
+### Performance benchmarks
+
+The stdlib-only harness generates deterministic scalar, bus, real, mixed, and
+sparse VCD workloads. Each sample runs in a fresh interpreter, bypasses the
+parse cache, and verifies rendered views across loading modes. Reports include
+raw samples, medians, input hashes, Python/platform metadata, and Git revision.
+
+```sh
+python3 tools/benchmark.py --size-mib 8 --repeat 5 --output before.json
+python3 tools/benchmark.py --size-mib 8 --repeat 5 --baseline before.json --output after.json
+python3 tools/benchmark.py --scenarios mixed --size-mib 64 --modes full lazy parallel --jobs 4
+python3 tools/benchmark.py --scenarios mixed --size-mib 1024 --modes disk --memory-mib 8 --repeat 1
+python3 tools/benchmark.py --input /path/to/design.vcd --repeat 5
+```
+
+Use `--repo /path/to/checkout` to measure another revision with the same harness.
+Compare matching inputs on the same machine and Python version, with other
+heavy workloads stopped. Timing is informational, not a machine-dependent CI
+pass/fail threshold; ordinary tests check benchmark determinism and reader parity.
+
+- `load(s)` measures a full parse or, in lazy mode, header parsing plus indexing.
+  Disk mode measures building a fresh complete index; this includes neither a
+  persistent-cache hit nor the UI's progressive display before indexing ends.
+- `first(s)` includes loading and rendering the initial 16-signal text view.
+  It is a headless proxy for useful first display, not curses startup latency.
+- `seek(ms)` measures loading/rendering a previously unvisited window at 90%
+  of the trace; `pan(ms)` is the median of three further jumps.
+- `main RSS(MiB)` is the main parsing process's peak resident memory, including
+  imports and rendering. **Parallel workers are excluded**, so it is not total
+  parallel memory usage. It is unavailable on platforms without `resource`.
+
+Generation and imports are outside the timed region. The OS page cache is not
+flushed; "cold" refers to Alwavelets' loaded windows, not cold disk I/O. Use
+`--size-mib` and `--signals` to test larger files and hierarchy widths; synthetic
+results should be supplemented with representative project traces.
 
 ## License
 

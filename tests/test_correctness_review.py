@@ -66,6 +66,41 @@ def test_lazy_initial_values_without_timestamp(trace):
     assert_values_equal(VCDFile.parse(str(trace)), lazy, 0, 1)
 
 
+def test_lazy_index_handles_never_dumped_signals_and_indented_directives(trace):
+    trace.write_text('$var wire 1 ! flag $end\n$var wire 1 ? never $end\n'
+                     '$var wire 8 " data $end\n$enddefinitions $end\n'
+                     '  #0\n  0!\n\tb1 "\n  $comment\n#999\n1?\n$end\n'
+                     '#10\n1!\n#20\n0!\n#30\n')
+    full, lazy = VCDFile.parse(str(trace)), lazy_trace(trace)
+    lazy.ensure_loaded(12, 29)
+    assert_values_equal(full, lazy, 12, 29)
+    assert lazy.max_time == 30
+    assert b'?' not in lazy._first_changes
+
+
+def test_storage_fast_paths_match_shared_decoder(trace):
+    from alwavelets.value_stream import ValueState
+    trace.write_text(HEADER + '#0\nX!\nB1 !\nb "\nr10 #\n'
+                     '  #10\n\t0!\n\tb101 "\nR11 #\n'
+                     '$comment\n#999\n1!\nb11 "\n$end\n'
+                     '#20\n$dumpoff $end\n1!\n#30\n$dumpon $end\nbX !\nBz "\n')
+    full = VCDFile.parse(str(trace))
+    reference, offset = VCDFile.parse_header(str(trace))
+    state = ValueState()
+    with trace.open('rb') as f:
+        f.seek(offset)
+        for line in f:
+            event = state.feed(line)
+            if event is None:
+                continue
+            bid, value = event
+            signals = reference.signals.values() if bid is None else [reference.signals[bid.decode()]]
+            for sig in signals:
+                sig.add_change(state.time, value[-1:].lower() if sig._scalar else value)
+    for sid in reference.signal_order:
+        assert full.signals[sid].changes == reference.signals[sid].changes
+
+
 def test_lazy_analysis_reads_beyond_the_current_view(trace):
     vcd = lazy_trace(trace)
     vcd.ensure_loaded(0, 10)

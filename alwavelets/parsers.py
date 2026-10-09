@@ -12,7 +12,6 @@ import threading
 from collections import OrderedDict
 
 from .core import VCDSignal, AliasSignal, clear_pack_memos, split_reference
-from .core import _S2B
 from .value_stream import ValueState, states_at_offsets
 from .fst import FSTReader  # noqa: F401  (re-exported; the reader lives in fst.py)
 
@@ -125,14 +124,20 @@ def _fst_via_converter(filename, progress_cb=None):
             pass
 
 
-def parse_file(filename, progress_cb=None, use_cache=True, jobs=None):
-    """Universal file parser with a transparent persistent parse cache.
+def parse_file(filename, progress_cb=None, use_cache=True, jobs=None,
+               storage='auto', memory_mib=256):
+    """Universal reader with persistent caching and optional disk storage.
 
-    On a cache hit (source size+mtime unchanged) the fully-parsed VCDFile is
-    deserialized in milliseconds; otherwise the file is parsed normally and the
-    result cached for next time. Caching is keyed on the original path, so
-    reopening even skips FST/legacy conversion. `jobs` controls parallel parsing
-    of large VCDs (None = auto, 1 = sequential)."""
+    Auto storage pages VCD/FST files above 50 MiB to disk, keeping all signal
+    declarations available. memory_mib bounds the decoded-page cache, not total
+    process memory. Close the returned trace (or use a with statement) when done.
+    storage='memory' preserves the eager reader and full parse-cache path.
+    jobs opts into parallel eager VCD parsing (None or 1 = sequential).
+    """
+    from .storage import use_disk_storage, open_trace
+    if use_disk_storage(filename, storage):
+        return open_trace(filename, memory_mib=memory_mib, use_cache=use_cache,
+                          progress_cb=progress_cb)
     if use_cache:
         from . import cache
         cached = cache.load_cache(filename)
@@ -405,8 +410,8 @@ class VCDFile:
         state = ValueState()
         feed = state.feed
         bget = self._value_signals.get
-        scalar_value = _S2B.get
         logic = _BITBYTE
+        active, current_time = True, 0
         size = os.path.getsize(self._filename)
         pos, reported, changes = offset, offset, 0
         with open(self._filename, 'rb', buffering=1 << 20) as f:
@@ -416,31 +421,47 @@ class VCDFile:
                 # Scalar lines cannot alter directive state. Avoid creating
                 # an intermediate event/string on this common storage path.
                 c = raw[0]
-                if c in logic and state.dump and not state.comment:
+                if active and c in logic:
                     sig = bget(raw[1:].strip())
                     if sig is not None:
                         if sig._scalar:
                             sig._values.append(logic[c])
                         else:
                             sig._append_value(chr(logic[c]))
-                        sig._times.append(state.time)
+                        sig._times.append(current_time)
                         changes += 1
-                    event = None
-                else:
-                    event = feed(raw)
-                if event is not None:
-                    bid, value = event
-                    if bid is None:
-                        changes += self._append_event(bid, value, state.time)
+                elif c == 35 and not state.comment:
+                    # Timestamp-heavy sparse traces should not pay payload
+                    # dispatch or recompute unchanged dump/comment state.
+                    feed(raw)
+                    current_time = state.time
+                elif active and c in (98, 66, 114, 82):
+                    # As with scalar lines, payloads cannot affect directive
+                    # state. Split once and store directly; only decode text
+                    # for signals that need it (b-form scalars do not).
+                    parts = raw[1:].split(None, 1)
+                    if len(parts) == 2:
+                        payload, bid = parts[0], parts[1].strip()
+                    elif raw[1:2] in (b' ', b'\t'):
+                        payload, bid = b'', raw[1:].strip()
                     else:
-                        sig = bget(bid)
-                        if sig is not None:
-                            if sig._scalar:
-                                sig._values.append(scalar_value(value if len(value) == 1 else value[-1:], 120))
-                            else:
-                                sig._append_value(value)
-                            sig._times.append(state.time)
-                            changes += 1
+                        continue
+                    sig = bget(bid)
+                    if sig is not None:
+                        if sig._scalar:
+                            sig._values.append(logic.get(payload[-1] if payload else 120, 120))
+                        else:
+                            sig._append_value(payload.decode('ascii', 'ignore'))
+                        sig._times.append(current_time)
+                        changes += 1
+                else:
+                    # Shared decoder owns all timestamp/directive semantics,
+                    # including indented lines and multiline comments.
+                    event = feed(raw)
+                    active = state.dump and not state.comment
+                    current_time = state.time
+                    if event is not None:
+                        changes += self._append_event(*event, current_time)
                 if pos - reported >= 1 << 20:
                     self.max_time = state.max_time
                     reported = pos
@@ -489,34 +510,56 @@ class VCDFile:
         index = [(0, offset)]
         states = {offset: state.snapshot()}
         first = {}
-        masters = {k.encode('ascii') for k, s in self.signals.items() if s.owns_storage}
+        unseen = {k.encode('ascii') for k, s in self.signals.items() if s.owns_storage}
         pos = last_indexed = reported = offset
-        disorder = False
+        feed = state.feed
         try:
             with open(self._filename, 'rb', buffering=1 << 20) as f:
                 f.seek(offset)
                 for raw in f:
-                    before = state.snapshot()
-                    event = state.feed(raw)
-                    if not before[2] and raw.lstrip().startswith(b'#'):
-                        disorder |= state.time < before[0]
-                        if pos - last_indexed >= self._INDEX_STRIDE and state.time > before[0]:
+                    line = raw.lstrip() if raw[0] <= 32 else raw
+                    c = line[:1]
+                    if state.comment:
+                        feed(line)
+                    elif c == b'#':
+                        before = state.snapshot() if pos - last_indexed >= self._INDEX_STRIDE else None
+                        feed(line)
+                        if before is not None and state.time > before[0]:
                             index.append((state.time, pos))
                             states[pos] = before
                             last_indexed = pos
                         self.max_time = state.max_time
-                    if event is not None:
-                        bid, _ = event
-                        if bid is None:
-                            for key in masters:
-                                first.setdefault(key, state.time)
-                        elif bid in masters:
-                            first.setdefault(bid, state.time)
+                    elif c == b'$':
+                        # Value payloads are irrelevant to indexing once a
+                        # signal's first change is known. Still consume every
+                        # directive so comments and dump blackouts carry over.
+                        event = feed(line)
+                        if event is not None:
+                            bid, _ = event
+                            if bid is None:
+                                for key in unseen:
+                                    first[key] = state.time
+                                unseen.clear()
+                    elif unseen and state.dump:
+                        # Undumped declarations may stay unseen forever.
+                        # Extract identifiers without decoding bus/real values.
+                        bid = None
+                        if line and line[0] in _BITBYTE:
+                            bid = line[1:].strip()
+                        elif c in (b'b', b'B', b'r', b'R'):
+                            parts = line[1:].split(None, 1)
+                            if len(parts) == 2:
+                                bid = parts[1].strip()
+                            elif line[1:2] in (b' ', b'\t'):
+                                bid = line[1:].strip()
+                        if bid in unseen:
+                            first[bid] = state.time
+                            unseen.remove(bid)
                     pos += len(raw)
                     if pos - reported >= 1 << 20:
                         reported = pos
                         self._load_progress = min(99, pos * 100 // max(1, size))
-            if disorder:
+            if not state.monotonic:
                 # Bisect indexes require monotonic timestamps. The full
                 # reader can repair malformed out-of-order traces safely.
                 self._read_values(offset)
@@ -536,11 +579,25 @@ class VCDFile:
 
     def require_loaded(self, t_start=0, t_end=None):
         """Ensure an analysis interval is complete, or explain why it is not."""
-        if self.is_loading or not self._extent_known:
-            raise ValueError("Trace is still loading; retry the analysis when loading finishes")
         if self._load_error:
             raise ValueError("Trace loading failed: " + self._load_error)
+        if self.is_loading or not self._extent_known:
+            raise ValueError("Trace is still loading; retry the analysis when loading finishes")
         self.ensure_loaded(t_start, self.max_time if t_end is None else t_end)
+
+    def close(self):
+        """Cancel indexing and release disk pages and temporary storage."""
+        for derived in getattr(self, '_derived_stores', ()):
+            derived.close()
+        store = getattr(self, '_store', None)
+        if store is not None:
+            store.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def ensure_loaded(self, t_start, t_end):
         """Ensure value changes in [t_start, t_end] are loaded into memory.
@@ -762,6 +819,8 @@ class VCDFile:
 
     def start_follow(self):
         """Resume after the bytes actually parsed, carrying directive state."""
+        if getattr(self, '_store', None) is not None:
+            raise ValueError('Follow requires --storage memory; disk indexes are immutable snapshots')
         size = os.path.getsize(self._filename)
         self._tail_offset = getattr(self, '_parsed_offset', size)
         state = getattr(self, '_value_state', None)

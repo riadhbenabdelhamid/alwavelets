@@ -1679,12 +1679,21 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     def format_signal_value(self, sig, sig_id):
         """Format the signal's value at the cursor (numeric for analog signals,
         translated/radix-formatted otherwise)."""
-        # Analog signals: show the numeric value rather than the raw bits/hex.
+        if getattr(self.vcd, '_store', None) is not None:
+            from .background import BackgroundQueries
+            if not hasattr(self, '_queries'):
+                self._queries = BackgroundQueries()
+            cursor = self.cursor_time
+            val = self._queries.request('values', (id(self.vcd), cursor),
+                                        (sig_id, sig.num_changes()), lambda: sig.value_at(cursor), None)
+            if val is None:
+                return '…'
+        else:
+            val = sig.value_at(self.cursor_time)
         if sig_id in self.analog_signals or getattr(sig, 'analog_mode', False):
-            nv = sig.numeric_value_at(self.cursor_time)
+            nv = numeric_value(val, sig.signal_type)
             if nv is not None:
                 return self._fmt_num(nv)
-        val = sig.value_at(self.cursor_time)
         # Check translations first
         translated = self.translations.translate(sig.name, val, sig.size)
         if translated:
@@ -2524,6 +2533,12 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def clear_diff(self):
         """Clear diff comparison."""
+        queries = getattr(self, '_queries', None)
+        if queries is not None:
+            queries.close()
+            del self._queries
+        if self.diff_vcd is not None:
+            self.diff_vcd.close()
         self.diff_vcd = None
         self.diff_ranges = {}
         self.diff_sig_map = {}
@@ -2603,6 +2618,29 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 # viewer mutation stays on this thread; latency is one
                 # halfdelay tick at worst.
                 if self.control is not None and self.control.pump():
+                    self._dirty = True
+
+                queries = getattr(self, '_queries', None)
+                if queries is not None and queries.poll():
+                    self._dirty = True
+                if queries is not None and queries.errors:
+                    self._show_message('Read failed: ' + queries.errors.pop(0))
+                job = getattr(self, '_analysis_job', None)
+                if job is not None and job.progress != getattr(self, '_analysis_progress', None):
+                    self._analysis_progress = job.progress
+                    self._dirty = True
+                if job is not None and job.future.done():
+                    self._analysis_job = None
+                    try:
+                        result = job.future.result()
+                        if job.cancel.is_set():
+                            self._show_message('Analysis cancelled')
+                        else:
+                            job.complete(result)
+                    except Exception as exc:
+                        self._show_message(str(exc))
+                    finally:
+                        job.close()
                     self._dirty = True
 
                 pending_times = getattr(self, '_pending_session_times', None)
@@ -2741,6 +2779,15 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     break
 
         finally:
+            job = getattr(self, '_analysis_job', None)
+            if job is not None:
+                job.close()
+            queries = getattr(self, '_queries', None)
+            if queries is not None:
+                queries.close()
+            if self.diff_vcd is not None:
+                self.diff_vcd.close()
+            self.vcd.close()
             self._cleanup_mouse()
             if self.control is not None:
                 self.control.stop()      # unlink the socket + descriptor

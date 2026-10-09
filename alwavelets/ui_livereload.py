@@ -50,7 +50,11 @@ class LiveReloadMixin:
                                if self.vcd.is_loading else
                                "Follow: not available in lazy (large-file) mode")
             return
-        self.vcd.start_follow()
+        try:
+            self.vcd.start_follow()
+        except ValueError as exc:
+            self._show_message(str(exc))
+            return
         self.follow_on = True
         self._follow_last_poll = 0.0
         self._show_message("Follow: ON (tailing live appends, auto-scroll to now)")
@@ -118,7 +122,13 @@ class LiveReloadMixin:
     def _reload_preserving_view(self):
         """Re-parse the watched file, keeping the current view/cursor state."""
         try:
-            new_vcd = VCDFile.parse(self.live_file)
+            store = getattr(self.vcd, '_store', None)
+            if store is not None:
+                from .storage import open_trace
+                new_vcd = open_trace(self.live_file, memory_mib=store.memory_bytes / (1024 * 1024),
+                                     background=True)
+            else:
+                new_vcd = VCDFile.parse(self.live_file)
         except Exception as e:
             self._show_message(f"Reload failed: {e}")
             return False
@@ -134,6 +144,15 @@ class LiveReloadMixin:
         soff, fidx = self.sig_offset, self.focus_idx
         collapsed = set(self.collapsed_scopes)
 
+        job = getattr(self, '_analysis_job', None)
+        if job is not None:
+            job.close()
+            self._analysis_job = None
+        queries = getattr(self, '_queries', None)
+        if queries is not None:
+            queries.close()
+            del self._queries
+        self.vcd.close()
         self.vcd = new_vcd
         # These signals are new objects with new values. The row cache keys on
         # (kind, sig_id, num_changes) within a window, and we restore the same

@@ -76,6 +76,16 @@ def numeric_value(value, signal_type="wire"):
         return None
 
 
+def time_bisect_left(times, timestamp):
+    lookup = getattr(times, 'bisect', None)
+    return lookup(timestamp) if lookup else bisect.bisect_left(times, timestamp)
+
+
+def time_bisect_right(times, timestamp):
+    lookup = getattr(times, 'bisect', None)
+    return lookup(timestamp, True) if lookup else bisect.bisect_right(times, timestamp)
+
+
 def ensure_trace_loaded(vcd, start=0, end=None):
     """Honor an optional storage-loading hook on a trace-like object.
 
@@ -178,7 +188,7 @@ class VCDSignal:
             self._append_value(value)
         self._times.append(time)
 
-    def _append_value(self, v):
+    def _append_value(self, v, intern=True):
         """Append one non-scalar value: encode into the packed store, or
         intern into the string list. Callers append the timestamp AFTER this
         (the add_change lock-free contract). Parser hot loops call this
@@ -216,7 +226,7 @@ class VCDSignal:
                         memo[v] = b
                     self._values.extend(b)
                     return
-        self._values.append(sys.intern(v) if len(v) < 64 else v)
+        self._values.append(sys.intern(v) if intern and len(v) < 64 else v)
 
     def _encode_values(self, strs):
         """Bulk-encode an iterable of value strings into a packed bytearray,
@@ -295,7 +305,7 @@ class VCDSignal:
         """O(log n) lookup via bisect."""
         if not self._times:
             return 'x'
-        idx = bisect.bisect_right(self._times, time) - 1
+        idx = time_bisect_right(self._times, time) - 1
         if idx < 0:
             return 'x'
         vals = self._values
@@ -309,12 +319,15 @@ class VCDSignal:
         """O(log n) window extraction with one-before for initial value."""
         if not self._times:
             return [], []
-        lo = bisect.bisect_left(self._times, t_start)
+        lo = time_bisect_left(self._times, t_start)
         if lo > 0:
             lo -= 1
-        hi = bisect.bisect_right(self._times, t_end)
+        hi = time_bisect_right(self._times, t_end)
         vals = self._values
-        if self._scalar:
+        if hasattr(vals, 'iter_range'):
+            from .storage import SequenceView
+            vals = SequenceView(vals, range(lo, hi), chr if self._scalar else None)
+        elif self._scalar:
             vals = [_B2S[b] for b in vals[lo:hi]]
         elif type(vals) is bytearray:
             vals = self._decode_slice(vals, lo, hi)
@@ -322,11 +335,17 @@ class VCDSignal:
             vals = vals[lo:hi]
         return self._times[lo:hi], vals
 
+    def iter_changes(self, start=0, end=None):
+        lo = time_bisect_left(self._times, start)
+        hi = len(self._times) if end is None else time_bisect_right(self._times, end)
+        for i in range(lo, hi):
+            yield self._times[i], self.value_str(i)
+
     def next_edge_after(self, time):
         """Find the next transition time after `time`. Returns None if none."""
         if not self._times:
             return None
-        idx = bisect.bisect_right(self._times, time)
+        idx = time_bisect_right(self._times, time)
         if idx < len(self._times):
             return self._times[idx]
         return None
@@ -335,7 +354,7 @@ class VCDSignal:
         """Find the previous transition time before `time`. Returns None if none."""
         if not self._times:
             return None
-        idx = bisect.bisect_left(self._times, time) - 1
+        idx = time_bisect_left(self._times, time) - 1
         if idx >= 0:
             return self._times[idx]
         return None
@@ -344,9 +363,9 @@ class VCDSignal:
         """Find the next time >= start_time where signal equals target. Returns None if not found."""
         if not self._times:
             return None
-        idx = bisect.bisect_left(self._times, start_time)
+        idx = time_bisect_left(self._times, start_time)
         # Check current value at start_time
-        cur_idx = bisect.bisect_right(self._times, start_time) - 1
+        cur_idx = time_bisect_right(self._times, start_time) - 1
         if cur_idx >= 0 and self._match_value(self.value_str(cur_idx), target):
             return start_time
         # Scan forward through changes
@@ -389,11 +408,14 @@ class VCDSignal:
 
         Values follow the declared signal type, matching numeric_value_at."""
         times, values = self.changes_in_window(t_start, t_end)
-        vals = [numeric_value(v, self.signal_type) for v in values]
-        vals = [v for v in vals if v is not None]
-        if not vals:
+        mn = mx = None
+        for raw in values:
+            value = numeric_value(raw, self.signal_type)
+            if value is not None:
+                mn = value if mn is None else min(mn, value)
+                mx = value if mx is None else max(mx, value)
+        if mn is None:
             return (0, 1)
-        mn, mx = min(vals), max(vals)
         if mn == mx:
             return (mn - 1, mx + 1)
         return (mn, mx)
@@ -431,15 +453,15 @@ class VCDSignal:
         """Count number of transitions in window."""
         if not self._times:
             return 0
-        lo = bisect.bisect_left(self._times, t_start)
-        hi = bisect.bisect_right(self._times, t_end)
+        lo = time_bisect_left(self._times, t_start)
+        hi = time_bisect_right(self._times, t_end)
         return max(0, hi - lo)
 
     def find_pattern(self, pattern_val, other_sigs_conditions, start_time=0):
         """Find time where this signal matches pattern_val AND other conditions hold.
         other_sigs_conditions: list of (VCDSignal, target_value) pairs.
         Returns time or None."""
-        for i in range(bisect.bisect_left(self._times, start_time), len(self._times)):
+        for i in range(time_bisect_left(self._times, start_time), len(self._times)):
             t = self._times[i]
             if not self._match_value(self.value_str(i), pattern_val):
                 continue
@@ -528,6 +550,17 @@ class AliasSignal(VCDSignal):
     _stride = property(lambda self: self.master._stride)
     _memo = property(lambda self: self.master._memo)
 
+    def changes_in_window(self, start, end):
+        if hasattr(self.master, 'store'):
+            return self.master.changes_in_window(start, end)
+        return super().changes_in_window(start, end)
+
+    def iter_changes(self, start=0, end=None):
+        return self.master.iter_changes(start, end)
+
+    def numeric_range_in_window(self, start, end):
+        return self.master.numeric_range_in_window(start, end)
+
 
 class Radix(Enum):
     BIN = "bin"
@@ -546,9 +579,13 @@ class TimeScaledSignal(AliasSignal):
     def __init__(self, signal, ratio):
         super().__init__(signal.reference, signal.identifier, signal.size,
                          signal.signal_type, signal.scope, signal, signal.declared_range)
-        self._scaled_times = [t * ratio for t in signal._times]
+        from .storage import SequenceView
+        self._scaled_times = SequenceView(signal._times, transform=lambda t: t * ratio)
 
     _times = property(lambda self: self._scaled_times)
+    changes_in_window = VCDSignal.changes_in_window
+    iter_changes = VCDSignal.iter_changes
+    numeric_range_in_window = VCDSignal.numeric_range_in_window
 
 
 class Marker:
@@ -609,13 +646,16 @@ class VirtualBitSignal:
 
     def changes_in_window(self, t_start, t_end):
         times, values = self.parent.changes_in_window(t_start, t_end)
+        if hasattr(self.parent._times, 'bisect'):
+            from .storage import SequenceView
+            return times, SequenceView(values, transform=self._extract_bit)
         return times, [self._extract_bit(v) for v in values]
 
     def next_edge_after(self, time):
         """Find next transition in extracted bit."""
         if not self.parent._times:
             return None
-        idx = bisect.bisect_right(self.parent._times, time)
+        idx = time_bisect_right(self.parent._times, time)
         cur = self.value_at(time)
         for i in range(idx, len(self.parent._times)):
             nxt = self._extract_bit(self.parent.value_str(i))
@@ -624,10 +664,14 @@ class VirtualBitSignal:
             cur = nxt
         return None
 
+    def iter_changes(self, start=0, end=None):
+        for t, value in self.parent.iter_changes(start, end):
+            yield t, self._extract_bit(value)
+
     def prev_edge_before(self, time):
         if not self.parent._times:
             return None
-        idx = bisect.bisect_left(self.parent._times, time) - 1
+        idx = time_bisect_left(self.parent._times, time) - 1
         if idx < 0:
             return None
         # The bit takes value_str(i) at _times[i], so the edge between change
@@ -665,7 +709,7 @@ class VirtualBitSignal:
         return None, None
 
     def find_value(self, target, start_time=0):
-        for i in range(bisect.bisect_left(self.parent._times, start_time), len(self.parent._times)):
+        for i in range(time_bisect_left(self.parent._times, start_time), len(self.parent._times)):
             if self._extract_bit(self.parent.value_str(i)) == target:
                 return self.parent._times[i]
         return None

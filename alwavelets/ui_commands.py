@@ -50,6 +50,7 @@ class CommandLineMixin:
             'rm': lambda: self.remove_signals(args.split()),
             'when': lambda: self._cmd_find_expr(args),
             'match': lambda: self._cmd_find_expr(args),
+            'cancel': lambda: self._cmd_cancel_analysis(),
             'glitches': lambda: self._cmd_glitches(args),
             'glitch': lambda: self._cmd_glitches(args),
             'derive': lambda: self._cmd_derive(args),
@@ -148,6 +149,7 @@ class CommandLineMixin:
             "group NAME— Collapsible group from the V selection (Tab folds header)",
             "ungroup   — Remove the focused (or named) group",
             "follow    — Live-tail appended changes + auto-scroll (running sim)",
+            "cancel    — Stop a background expression search",
             "loadgtkw F— Apply a GTKWave .gtkw save (signals + radixes)",
             "savegtkw F— Write current view as a GTKWave .gtkw save file",
             "session   — Save session sidecar (auto-restores on reopen);",
@@ -214,6 +216,35 @@ class CommandLineMixin:
             self._show_message("Usage: when <expr>   e.g.  when valid && state==3")
             return
         self._expr_last = args
+        if getattr(self.vcd, '_store', None) is not None:
+            from .background import AnalysisJob
+            old = getattr(self, '_analysis_job', None)
+            if old is not None:
+                self._show_message('Search already running; use cancel before starting another')
+                return
+            vcd, start = self.vcd, self.cursor_time + 1
+            def compute(cancel, progress):
+                t = _expr.find_expression(vcd, args, start, cancel=cancel, progress=progress)
+                wrapped = ''
+                if t is None:
+                    t = _expr.find_expression(vcd, args, 0, min(start - 1, vcd.max_time),
+                                              cancel=cancel, progress=progress)
+                    wrapped = ' (wrapped)'
+                return t, wrapped
+            def complete(result):
+                if self.vcd is not vcd:
+                    return
+                t, wrapped = result
+                if t is None:
+                    self._show_message(f'No match: {args}')
+                    return
+                self.cursor_on = True
+                self.cursor_time = t
+                self._ensure_cursor_visible()
+                self._show_message(f'⌖ {vcd.time_to_str(t)}: {args}{wrapped}')
+            self._analysis_job = AnalysisJob(compute, complete)
+            self._show_message('Searching in background; use cancel to stop')
+            return
         try:
             t = _expr.find_expression(self.vcd, args, self.cursor_time + 1)
             wrapped = ""
@@ -230,6 +261,14 @@ class CommandLineMixin:
         self.cursor_time = t
         self._ensure_cursor_visible()
         self._show_message(f"⌖ {self.vcd.time_to_str(t)}: {args}{wrapped}")
+
+    def _cmd_cancel_analysis(self):
+        job = getattr(self, '_analysis_job', None)
+        if job is None:
+            self._show_message('No analysis running')
+        else:
+            job.cancel.set()
+            self._show_message('Cancelling search…')
 
     def _cmd_glitches(self, args):
         """glitches [max_pulse]: scan displayed signals for x-hazards and

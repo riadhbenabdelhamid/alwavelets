@@ -1,7 +1,8 @@
 """Static analyses over a parsed trace: formal counter-example assertion
 detection and switching-activity (power) estimation."""
-import bisect
+from .core import time_bisect_left, time_bisect_right
 import re
+import itertools
 
 from .core import ensure_trace_loaded, numeric_value
 
@@ -10,8 +11,8 @@ def compare_signal_ranges(a, b, start, end):
     """Mismatch intervals on a shared time axis, restricted to trace coverage."""
     if end <= start:
         return []
-    times = sorted({start, end} | {t for t in a._times if start < t < end}
-                   | {t for t in b._times if start < t < end})
+    from .expr import _candidate_times
+    times = itertools.chain(_candidate_times({'a': a, 'b': b}, start, end), [end])
 
     def value(sig, t):
         raw = sig.value_at(t)
@@ -97,8 +98,8 @@ class FormalAnalyzer:
             if sig.full_name == start_sig.full_name:
                 continue
             times = sig._times
-            lo = bisect.bisect_left(times, t_lo)
-            hi = bisect.bisect_right(times, t_hi)
+            lo = time_bisect_left(times, t_lo)
+            hi = time_bisect_right(times, t_hi)
             n_trans = hi - lo
             last_val = sig.value_str(hi - 1) if n_trans else None
             last_change = times[hi - 1] if n_trans else 0
@@ -218,6 +219,40 @@ def measure_signal(sig, t_start, t_end):
         return out
     times, values = sig.changes_in_window(t_start, t_end)
 
+    if getattr(sig._times, 'iter_range', None) is not None and getattr(sig, '_scalar', False):
+        # Exact median with a disk sort, so clock statistics do not keep a
+        # Python list containing every rising edge in a multi-hour trace.
+        import sqlite3
+        db = sqlite3.connect('')  # private temporary database, deleted on close
+        try:
+            db.execute('PRAGMA cache_size=-2048')
+            db.execute('PRAGMA temp_store=FILE')
+            db.execute('CREATE TABLE periods(delta INTEGER)')
+            cur_t, cur_v, high_time, previous_rise, cycles = t_start, 'x', 0, None, 0
+            for t, value in zip(times, values):
+                if t < t_start:
+                    cur_v = value
+                    continue
+                if cur_v == '1':
+                    high_time += t - cur_t
+                if value == '1' and cur_v != '1':
+                    if previous_rise is not None:
+                        db.execute('INSERT INTO periods VALUES(?)', (t - previous_rise,))
+                        cycles += 1
+                    previous_rise = t
+                cur_t, cur_v = t, value
+            if cur_v == '1':
+                high_time += t_end - cur_t
+            out['duty'] = high_time / span
+            if cycles:
+                period = db.execute('SELECT delta FROM periods ORDER BY delta LIMIT 1 OFFSET ?',
+                                    (cycles // 2,)).fetchone()[0]
+                if period > 0:
+                    out.update(period=period, cycles=cycles)
+            return out
+        finally:
+            db.close()
+
     if getattr(sig, 'size', 1) == 1 and getattr(sig, 'signal_type', 'wire') not in ('real', 'realtime'):
         rises = []
         high_time = 0
@@ -248,8 +283,12 @@ def measure_signal(sig, t_start, t_end):
                 out['period'] = period
                 out['cycles'] = len(rises) - 1
     else:
-        vals = [numeric_value(v, sig.signal_type) for v in values]
-        vals = [v for v in vals if v is not None]
-        if vals:
-            out['min'], out['max'] = min(vals), max(vals)
+        low = high = None
+        for raw in values:
+            value = numeric_value(raw, sig.signal_type)
+            if value is not None:
+                low = value if low is None else min(low, value)
+                high = value if high is None else max(high, value)
+        if low is not None:
+            out['min'], out['max'] = low, high
     return out

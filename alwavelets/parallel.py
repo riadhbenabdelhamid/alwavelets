@@ -6,15 +6,17 @@ independently and returns compact per-signal arrays (array('q').tobytes() +
 packed bytes / a joined blob), which the parent concatenates in chunk order.
 
 This only speeds up the *first* full parse of a large file (the parse cache
-makes re-opens instant regardless). It is gated to fork-capable platforms and
-sizable VCDs, and every entry point falls back to the sequential parser on any
-problem, so correctness never depends on it.
+makes re-opens instant regardless). It is opt-in for sizable VCDs; the public
+file dispatcher falls back to sequential parsing on worker failures.
 
 Workers receive the time, comment and dump state at their byte boundary, so
 splits inside dump blackouts or comments preserve sequential semantics.
+Workers start via forkserver where available, otherwise spawn, so the viewer's
+threads and locks are not inherited. Library callers may supply mp_context.
 """
 import array
 import os
+import sys
 
 from .parsers import VCDFile, _BITBYTE, _compact_times
 from .value_stream import ValueState, states_at_offsets
@@ -84,11 +86,25 @@ def _worker(args):
     return mx, out
 
 
-def _fill_parallel(vcd, filename, offset, jobs):
+def _worker_context():
+    import multiprocessing as mp
+    return mp.get_context('forkserver' if 'forkserver' in mp.get_all_start_methods() else 'spawn')
+
+
+def _main_importable():
+    """Spawn cannot re-open stdin pseudo-files or frozen POSIX entry points."""
+    if os.name == 'posix' and getattr(sys, 'frozen', False):
+        return False
+    main = sys.modules.get('__main__')
+    path = getattr(main, '__file__', None)
+    return bool(getattr(main, '__spec__', None)) or path is None or os.path.isfile(path)
+
+
+def _fill_parallel(vcd, filename, offset, jobs, mp_context=None):
     """Parse the value region with `jobs` workers and fill vcd's signals.
     Returns True on success, False to signal a fallback to sequential parsing."""
     import multiprocessing as mp
-    import sys
+    from concurrent.futures import ProcessPoolExecutor
     size = os.path.getsize(filename)
     n = min(jobs, mp.cpu_count() or jobs) if jobs else min(mp.cpu_count() or 1, 8)
     ranges = _split_points(filename, offset, size, n)
@@ -98,9 +114,11 @@ def _fill_parallel(vcd, filename, offset, jobs):
             for k, s in vcd.signals.items() if s.owns_storage]
     states = states_at_offsets(filename, offset, [a for a, _ in ranges])
     tasks = [(filename, a, b, meta, states[a]) for (a, b) in ranges]
-    ctx = mp.get_context('fork')
-    with ctx.Pool(len(ranges)) as pool:
-        parts = pool.map(_worker, tasks)       # ordered by chunk
+    ctx = mp_context if mp_context is not None else _worker_context()
+    # An executor reports a broken worker instead of repeatedly respawning it
+    # (which could otherwise hang forever on an unimportable entry point).
+    with ProcessPoolExecutor(len(ranges), mp_context=ctx) as pool:
+        parts = list(pool.map(_worker, tasks))  # ordered by chunk
 
     pieces = {}
     mx = 0
@@ -147,13 +165,19 @@ def _fill_parallel(vcd, filename, offset, jobs):
     return True
 
 
-def parse_parallel_file(filename, jobs=None):
+def parse_parallel_file(filename, jobs=None, mp_context=None):
     """Header-parse `filename`, then fill values in parallel. Returns a fully
-    loaded VCDFile, or None to fall back to the sequential parser."""
+    loaded VCDFile, or None when parallel parsing cannot start. Worker failures
+    propagate; parse_file catches them and retries sequentially. Scripts using
+    this API must guard their entry point with ``if __name__ == '__main__'``.
+    An explicit mp_context overrides the safe default without changing the
+    application's global multiprocessing configuration."""
+    if not _main_importable():
+        return None
     vcd, offset = VCDFile.parse_header(filename)
     if not vcd.signal_order:
         return None
-    return vcd if _fill_parallel(vcd, filename, offset, jobs) else None
+    return vcd if _fill_parallel(vcd, filename, offset, jobs, mp_context) else None
 
 
 def viable(filename, jobs=None, min_size=16 * 1024 * 1024):
@@ -164,7 +188,7 @@ def viable(filename, jobs=None, min_size=16 * 1024 * 1024):
     slower with few workers because the parsed data must be merged serially), so
     parallelism is never enabled by default — no regression for the common case.
     """
-    if not jobs or jobs < 2 or not hasattr(os, 'fork'):
+    if not jobs or jobs < 2 or not _main_importable():
         return False
     try:
         if os.path.getsize(filename) < min_size:

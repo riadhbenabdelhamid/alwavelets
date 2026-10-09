@@ -280,7 +280,7 @@ class FSTReader:
 
     # ── top level ────────────────────────────────────────────────────
 
-    def parse(self, progress_cb=None):
+    def parse(self, progress_cb=None, writer_factory=None, metadata_only=False):
         from .parsers import VCDFile, build_scope_tree, _compact_times
         vcd = VCDFile()
         vcd._filename = self.filename
@@ -291,7 +291,7 @@ class FSTReader:
             if not first:
                 return vcd
             if first[0] == self.BL_ZWRAPPER:
-                return self._parse_zwrapped(f, progress_cb)
+                return self._parse_zwrapped(f, progress_cb, writer_factory, metadata_only)
             if first[0] != self.BL_HDR:
                 raise ValueError("Not an FST file (first byte: 0x%02x)" % first[0])
             self._parse_header(f, vcd)
@@ -330,7 +330,12 @@ class FSTReader:
                     self._parse_geom(f, bslen - 8)
                     break
 
-            # Value changes, collected per handle as parallel lists
+            if metadata_only:
+                vcd.scopes = build_scope_tree(vcd)
+                return vcd
+            self._writer = writer_factory(vcd) if writer_factory else None
+
+            # Value changes: stream to a page writer when requested.
             self._times = {}
             self._vals = {}
             vc_blocks = [(p, s) for t, p, s in self._blocks
@@ -343,6 +348,13 @@ class FSTReader:
                 if progress_cb:
                     progress_cb(min(file_size, bpos + bslen), file_size)
 
+            if self._writer is not None and self._frame0:
+                beg0, fvals = self._frame0
+                for h, value in fvals.items():
+                    key = self._handles[h]['hid']
+                    if key not in self._writer.last_time:
+                        self._writer.add(key, beg0, value)
+
             # Blackouts ($dumpoff regions): every signal goes 'x' there, as the
             # VCD parser does for $dumpoff.
             for btype, bpos, bslen in self._blocks:
@@ -350,25 +362,40 @@ class FSTReader:
                     f.seek(bpos + 9)
                     self._apply_blackouts(f.read(bslen - 8))
 
-        self._store(vcd)
-        _compact_times(vcd)
+        if self._writer is not None:
+            beg0, fvals = self._frame0 if self._frame0 else (0, {})
+            for h, value in fvals.items():
+                key = self._handles[h]['hid']
+                if key not in self._writer.last_time:
+                    self._writer.add(key, beg0, value)
+        else:
+            self._store(vcd)
+            _compact_times(vcd)
         vcd.scopes = build_scope_tree(vcd)
         return vcd
 
-    def _parse_zwrapped(self, f, progress_cb):
+    def _parse_zwrapped(self, f, progress_cb, writer_factory=None, metadata_only=False):
         """A '-c' file: gzip of a whole FST after a 17-byte wrapper."""
         import tempfile
-        f.seek(0)
-        raw = f.read()
-        data = zlib.decompress(raw[17:], 15 + 32)
+        f.seek(17)
+        decoder = zlib.decompressobj(15 + 32)
         tmp = tempfile.NamedTemporaryFile(suffix='.fst', delete=False)
         try:
-            tmp.write(data)
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                while chunk:
+                    tmp.write(decoder.decompress(chunk, 1 << 20))
+                    chunk = decoder.unconsumed_tail
+            if not decoder.eof:
+                raise ValueError('Truncated compressed FST wrapper')
             tmp.close()
-            vcd = FSTReader(tmp.name).parse(progress_cb)
+            vcd = FSTReader(tmp.name).parse(progress_cb, writer_factory, metadata_only)
             vcd._filename = self.filename
             return vcd
         finally:
+            tmp.close()
             try:
                 os.unlink(tmp.name)
             except OSError:
@@ -553,8 +580,6 @@ class FSTReader:
         chainbuf = f.read(chain_clen)
         offsets, lengths = self._decode_chain_table(btype, chainbuf, chain_pos - vc_start)
 
-        f.seek(vc_start)
-        vcdata = f.read(chain_pos - vc_start)
 
         # The frame is each signal's value when the block began. For every
         # block but the first that is the last value already stored; for the
@@ -586,7 +611,8 @@ class FSTReader:
             if not off:
                 continue
             ln = lengths[h]
-            chunk = vcdata[off:off + ln] if ln > 0 else b''
+            f.seek(vc_start + off)
+            chunk = f.read(ln) if ln > 0 else b''
             if not chunk:
                 continue
             try:
@@ -660,13 +686,29 @@ class FSTReader:
         return offsets, lengths
 
     def _decode_chain(self, h, mu, times, beg_time):
-        width, is_real = self._width(h)
-        tl = self._times.get(h)
-        if tl is None:
-            tl = self._times[h] = []
-            vl = self._vals[h] = []
+        events = self._chain_events(h, mu, times)
+        writer = getattr(self, '_writer', None)
+        if writer is not None:
+            info = self._handles[h] if h < len(self._handles) else None
+            if info is None:
+                return
+            key = info['hid']
+            for t, value in events:
+                if key not in writer.last_time and self._frame0:
+                    beg0, fvals = self._frame0
+                    if t > beg0 and h in fvals:
+                        writer.add(key, beg0, fvals[h])
+                writer.add(key, t, value)
+            writer.publish()
         else:
-            vl = self._vals[h]
+            tl = self._times.setdefault(h, [])
+            vl = self._vals.setdefault(h, [])
+            for t, value in events:
+                tl.append(t)
+                vl.append(value)
+
+    def _chain_events(self, h, mu, times):
+        width, is_real = self._width(h)
         n = len(mu)
         pos = 0
         tidx = 0
@@ -683,8 +725,7 @@ class FSTReader:
                     val = '1' if (vli >> 1) & 1 else '0'
                 if tidx >= ntimes:
                     break
-                tl.append(times[tidx])              # same-time changes are kept,
-                vl.append(val)                      # as the VCD parser keeps them
+                yield times[tidx], val
             return
         nbytes = (width + 7) >> 3
         fmt = self._real_fmt
@@ -711,8 +752,7 @@ class FSTReader:
                 val = format(int.from_bytes(raw, 'big'), '0%db' % (nbytes * 8))[:width]
             if tidx >= ntimes:
                 break
-            tl.append(times[tidx])
-            vl.append(val)
+            yield times[tidx], val
 
     # ── blackouts ────────────────────────────────────────────────────
 
@@ -729,6 +769,20 @@ class FSTReader:
             t += d
             events.append((t, bool(active)))
         import bisect
+        writer = getattr(self, '_writer', None)
+        if writer is not None:
+            writer.publish(True)
+            for t, active in events:
+                if active:
+                    continue
+                for info in self._handles[1:]:
+                    if info is None:
+                        continue
+                    sig = writer.vcd.signals[info['hid']]
+                    index = sig._times.bisect(t)
+                    if index >= sig.num_changes() or sig._times[index] != t:
+                        writer.add(info['hid'], t, 'x')
+            return
         for t, active in events:
             if active:
                 continue                        # values resume via the chains

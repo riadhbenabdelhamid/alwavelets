@@ -495,23 +495,45 @@ class DrawingMixin:
         if wkey != self._row_cache_window:
             self._row_cache_window = wkey
             self._row_cache.clear()
+            self._row_extras = {}
         key = (kind, sig_id, sig.num_changes(), extra)
         out = self._row_cache.get(key)
         if out is None:
             t0, t1, ww = self.time_start, self.time_end, self.wave_width
-            k = kind[1:] if kind.startswith('d') else kind   # diff-row kinds
-            if k == 'bit':
-                out = draw_single_bit_culled(sig, t0, t1, ww)
-            elif k == 'sub':
-                out = draw_single_bit_subcell(sig, t0, t1, ww)
-            elif k == 'bus':
-                out = draw_bus_culled(sig, t0, t1, ww, extra)
-            elif k == 'analog':
-                out = draw_analog_culled(sig, t0, t1, ww)
-            elif k == 'abraille':                     # hi-res analog (w style)
-                out = draw_analog_braille(sig, t0, t1, ww, extra)
-            else:                                     # 'amulti'
-                out = draw_analog_multi(sig, t0, t1, ww, extra)
+            def compute():
+                k = kind[1:] if kind.startswith('d') else kind   # diff-row kinds
+                if k == 'bit':
+                    return draw_single_bit_culled(sig, t0, t1, ww)
+                elif k == 'sub':
+                    return draw_single_bit_subcell(sig, t0, t1, ww)
+                elif k == 'bus':
+                    return draw_bus_culled(sig, t0, t1, ww, extra)
+                elif k == 'analog':
+                    return draw_analog_culled(sig, t0, t1, ww)
+                elif k == 'abraille':                     # hi-res analog (w style)
+                    return draw_analog_braille(sig, t0, t1, ww, extra)
+                else:                                     # 'amulti'
+                    return draw_analog_multi(sig, t0, t1, ww, extra)
+            if getattr(self.vcd, '_store', None) is not None:
+                from .background import BackgroundQueries
+                if not hasattr(self, '_queries'):
+                    self._queries = BackgroundQueries()
+                k = kind.lstrip('d')
+                blank = ([' '] * ww, [0] * ww)
+                placeholder = (*blank, {}) if k == 'bus' else [blank] * extra if k in ('abraille', 'amulti') else blank
+                def compute_disk():
+                    result = compute()
+                    labels = {col: sig.value_at(int(t0 + col / max(ww, 1) * (t1 - t0)))
+                              for col in result[2]} if k == 'bus' else {}
+                    limits = sig.numeric_range_in_window(t0, t1) if k in ('analog', 'abraille', 'amulti') else None
+                    return result, labels, limits
+                result, labels, limits = self._queries.request(
+                    'rows', (id(self.vcd), wkey), key, compute_disk, (placeholder, {}, None))
+                if len(self._row_extras) > 512:
+                    self._row_extras.clear()
+                self._row_extras[(kind, sig_id)] = labels, limits
+                return result
+            out = compute()
             # Bound it: within one window the live keys are the visible rows,
             # but a background load bumps num_changes on every redraw, so a
             # long load would otherwise accumulate a row per frame per signal.
@@ -709,7 +731,10 @@ class DrawingMixin:
                     max_lbl_len = 4 if self.value_label_size == 1 else 999
                     for bcol, lbl in labels.items():
                         t_at_col = self.col_to_time(bcol)
-                        raw_val = sig.value_at(t_at_col)
+                        if getattr(self.vcd, '_store', None) is not None:
+                            raw_val = self._row_extras.get(('bus', sig_id), ({}, None))[0].get(bcol, 'x')
+                        else:
+                            raw_val = sig.value_at(t_at_col)
                         translated = self.translations.translate(sig.name, raw_val, sig.size)
                         display_lbl = translated if translated else lbl
                         display_lbl = display_lbl[:max_lbl_len]
@@ -861,8 +886,14 @@ class DrawingMixin:
             # ── Analog scale labels (window min/max at the right edge) ──
             # Make the normalised bar plot quantitative: max at the top row,
             # min at the bottom row (single-row signals show 'lo‥hi').
+            limits = None
             if is_analog:
-                vmin, vmax = sig.numeric_range_in_window(self.time_start, self.time_end)
+                if getattr(self.vcd, '_store', None) is not None:
+                    limits = self._row_extras.get((akind if sig_rows > 1 else 'analog', sig_id), ({}, None))[1]
+                else:
+                    limits = sig.numeric_range_in_window(self.time_start, self.time_end)
+            if limits is not None:
+                vmin, vmax = limits
                 attr = curses.color_pair(self.C_VAL) | curses.A_DIM
                 right = self.width - 2          # leave the scrollbar column free
                 left = self.name_width + 1
@@ -1055,6 +1086,11 @@ class DrawingMixin:
         _put(f"Sig {self.sig_offset+1}-{end}/{ts}", curses.color_pair(self.C_HEADER))
 
         # Loading progress
+        job = getattr(self, '_analysis_job', None)
+        if job is not None:
+            _sep()
+            pct = min(100, job.progress[0] * 100 // max(1, job.progress[1])) if job.progress else 0
+            _put(f"Search {pct}% · cancel", curses.color_pair(self.C_PROMPT))
         if self.vcd.is_loading:
             _sep()
             pct = self.vcd.load_progress

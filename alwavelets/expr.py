@@ -16,8 +16,9 @@ eval(), so an expression can never execute arbitrary code.
 Evaluation only happens at times where a referenced signal changes, so a search
 touches O(transitions in window) points, not every tick.
 """
-import bisect
+from .core import time_bisect_right
 import heapq
+import itertools
 import fnmatch
 import operator
 import re
@@ -325,8 +326,8 @@ def _candidate_times(resolved, start, end):
     slices = []
     for s in resolved.values():
         ts = s._times
-        lo = bisect.bisect_right(ts, start)
-        hi = bisect.bisect_right(ts, end)
+        lo = time_bisect_right(ts, start)
+        hi = time_bisect_right(ts, end)
         if hi > lo:
             slices.append(_time_slice(ts, lo, hi))
     prev = start
@@ -337,8 +338,55 @@ def _candidate_times(resolved, start, end):
 
 
 def _time_slice(times, lo, hi):
-    for i in range(lo, hi):
-        yield times[i]
+    if hasattr(times, 'iter_range'):
+        yield from times.iter_range(lo, hi)
+    else:
+        for i in range(lo, hi):
+            yield times[i]
+
+
+class _CurrentValue:
+    def __init__(self, sig, time):
+        self.signal_type = sig.signal_type
+        self.value = sig.value_at(time)
+
+    def value_at(self, time):
+        return self.value
+
+
+def _stream_values(resolved, start, end, cancel=None, progress=None):
+    """Evaluate only referenced signals, keeping one current value per input.
+
+    Same-timestamp updates are applied together, preserving value_at's last
+    delta-cycle semantics. Cancellation is checked even within long runs of
+    repeated timestamps.
+    """
+    if end < start:
+        return
+    def check(t):
+        if cancel is not None and cancel.is_set():
+            raise ExprError('Analysis cancelled')
+        if progress is not None:
+            progress(t, end)
+    check(start)
+    state = {name: _CurrentValue(sig, start) for name, sig in resolved.items()}
+    yield start, state
+    def events(name, sig):
+        for ordinal, (t, value) in enumerate(sig.iter_changes(start, end)):
+            if ordinal % 4096 == 0:
+                check(t)
+            if t > start:
+                yield t, name, ordinal, value
+    merged = heapq.merge(*(events(name, sig) for name, sig in resolved.items()))
+    count = 0
+    for t, group in itertools.groupby(merged, key=lambda event: event[0]):
+        for _, name, _, value in group:
+            state[name].value = value
+            count += 1
+            if count % 4096 == 0:
+                check(t)
+        yield t, state
+    check(end)
 
 
 def _load_interval(vcd, start, end):
@@ -348,33 +396,31 @@ def _load_interval(vcd, start, end):
         raise ExprError(str(exc)) from exc
 
 
-def find_expression(vcd, expr, start_time=0, end_time=None):
+def find_expression(vcd, expr, start_time=0, end_time=None, *, cancel=None, progress=None):
     """Return the first time >= start_time where `expr` holds, or None."""
-    _load_interval(vcd, start_time, end_time)
     ast, resolved = _prepare(vcd, expr)
+    _load_interval(vcd, start_time, end_time)
     if end_time is None:
         end_time = vcd.max_time
     if start_time > end_time:
         return None
-    if not resolved:                           # constant expression
-        return start_time if evaluate(ast, resolved, start_time) else None
-    for t in _candidate_times(resolved, start_time, end_time):
-        if evaluate(ast, resolved, t):
+    for t, state in _stream_values(resolved, start_time, end_time, cancel, progress):
+        if evaluate(ast, state, t):
             return t
     return None
 
 
-def find_all_expression(vcd, expr, start_time=0, end_time=None, limit=1000):
+def find_all_expression(vcd, expr, start_time=0, end_time=None, limit=1000, *, cancel=None, progress=None):
     """Return up to `limit` times where `expr` *becomes* true (rising matches)."""
-    _load_interval(vcd, start_time, end_time)
     ast, resolved = _prepare(vcd, expr)
+    _load_interval(vcd, start_time, end_time)
     if end_time is None:
         end_time = vcd.max_time
     if limit <= 0:
         return []
     hits, prev = [], False
-    for t in _candidate_times(resolved, start_time, end_time):
-        cur = evaluate(ast, resolved, t)
+    for t, state in _stream_values(resolved, start_time, end_time, cancel, progress):
+        cur = evaluate(ast, state, t)
         if cur and not prev:
             hits.append(t)
             if len(hits) >= limit:
@@ -396,27 +442,38 @@ def make_derived_signal(vcd, name, expr_str, size=None, scope="derived"):
     The result is sampled at every time a referenced signal changes; x/z inputs
     propagate to an x result. `size` (bit width) is inferred from the values if
     not given. Returns a VCDSignal not attached to `vcd`."""
-    _load_interval(vcd, 0, None)
     ast, resolved = _prepare(vcd, expr_str)
-    cand = _candidate_times(resolved, 0, vcd.max_time) if resolved else [0]
-    results = []
-    for t in cand:
-        v = _value(ast, resolved, t)
-        if isinstance(v, bool):
-            n = 1 if v else 0
-        else:
-            n = _as_number(v)
-            n = None if n is None else int(n)
-        results.append((t, n))
+    _load_interval(vcd, 0, None)
+    def results():
+        for t, state in _stream_values(resolved, 0, vcd.max_time):
+            value = _value(ast, state, t)
+            number = _as_number(value)
+            yield t, None if number is None else int(number)
     if size is None:
-        mx = max((abs(r) for _, r in results if r is not None), default=0)
-        size = max(1, mx.bit_length()) if mx else 1
+        # Two streaming passes trade some compute for bounded intermediate
+        # memory; no list of every expression sample is retained.
+        mx = max((abs(n) for _, n in results() if n is not None), default=0)
+        size = max(1, mx.bit_length())
     mask = (1 << size) - 1
     sig = VCDSignal(name, "__derived__%s" % name, size, "wire", scope)
+    writer = None
+    if getattr(vcd, '_store', None) is not None:
+        from .storage import create_derived_store
+        sig, writer = create_derived_store(vcd, sig)
     prev = None
-    for t, n in results:
-        val = ("x" * size) if n is None else format(n & mask, "0%db" % size)
-        if val != prev:
-            sig.add_change(t, val)
-            prev = val
+    try:
+        for t, n in results():
+            val = ("x" * size) if n is None else format(n & mask, "0%db" % size)
+            if val != prev:
+                if writer is None:
+                    sig.add_change(t, val)
+                else:
+                    writer.add(sig.identifier, t, val)
+                prev = val
+        if writer is not None:
+            writer.publish(True)
+    except Exception:
+        if writer is not None:
+            writer.store.close()
+        raise
     return sig

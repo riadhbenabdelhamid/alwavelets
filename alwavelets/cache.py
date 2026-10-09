@@ -58,7 +58,7 @@ def save_cache(vcd, source):
         return False
     try:
         st = os.stat(source)
-        if (getattr(vcd, '_lazy_mode', False) or not vcd._extent_known
+        if (getattr(vcd, '_store', None) is not None or getattr(vcd, '_lazy_mode', False) or not vcd._extent_known
                 or getattr(vcd, '_parsed_offset', st.st_size) != st.st_size):
             return False
         body = bytearray()

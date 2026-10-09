@@ -1,9 +1,7 @@
-"""Tests for parallel VCD parsing: parity with the sequential parser, split-point
-alignment, and opt-in gating. Skipped where os.fork is unavailable."""
+"""Parallel VCD parsing: reader parity, safe worker starts and opt-in gating."""
 import os
+import multiprocessing as mp
 import pytest
-
-pytestmark = pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
 
 
 def _make_vcd(tmp_path, n_ts=2000, n_sig=20):
@@ -47,15 +45,65 @@ def _digest(v):
     return "\n".join(out)
 
 
-def test_parallel_matches_sequential(w, tmp_path):
+@pytest.mark.parametrize('method', [m for m in ('spawn', 'forkserver') if m in mp.get_all_start_methods()])
+def test_parallel_matches_sequential(w, tmp_path, method):
     from alwavelets.parsers import VCDFile
     from alwavelets import parallel
     src = _make_vcd(tmp_path)
-    par = parallel.parse_parallel_file(src, jobs=4)
+    par = parallel.parse_parallel_file(src, jobs=4, mp_context=mp.get_context(method))
     assert par is not None                       # splittable into >=2 chunks
     seq = VCDFile.parse(src)
     assert par.max_time == seq.max_time
     assert _digest(par) == _digest(seq)          # byte-for-byte parity
+
+
+def test_default_workers_parse_from_thread_with_directives(w, tmp_path):
+    """A live viewer can own background threads when a parse is requested."""
+    import threading
+    import warnings
+    from concurrent.futures import ThreadPoolExecutor
+    from alwavelets import parallel
+    from test_correctness_review import HEADER, BODY
+    src = tmp_path / 'threaded.vcd'
+    src.write_text(HEADER + BODY)
+    ready = threading.Event()
+    sleeper = threading.Thread(target=ready.wait)
+    sleeper.start()
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', category=DeprecationWarning)
+            with ThreadPoolExecutor(1) as caller:
+                par = caller.submit(parallel.parse_parallel_file, str(src), 4).result(timeout=30)
+        seq = w.VCDFile.parse(str(src))
+        assert par is not None
+        assert _digest(par) == _digest(seq)
+        assert parallel._worker_context().get_start_method() != 'fork'
+    finally:
+        ready.set()
+        sleeper.join()
+
+
+def test_stdin_entry_point_falls_back_without_spawning(w, tmp_path, monkeypatch):
+    import __main__
+    from alwavelets import parallel
+    src = _make_vcd(tmp_path, n_ts=10)
+    monkeypatch.setattr(__main__, '__spec__', None, raising=False)
+    monkeypatch.setattr(__main__, '__file__', '<stdin>', raising=False)
+    assert parallel.parse_parallel_file(src, jobs=2) is None
+    assert not parallel.viable(src, jobs=2, min_size=0)
+
+
+def test_worker_failure_falls_back_to_sequential(w, tmp_path, monkeypatch):
+    from alwavelets import parallel
+    from concurrent.futures.process import BrokenProcessPool
+    src = _make_vcd(tmp_path, n_ts=10)
+    monkeypatch.setattr(parallel, 'viable', lambda *args: True)
+
+    def fail(*args):
+        raise BrokenProcessPool('worker exited unexpectedly')
+
+    monkeypatch.setattr(parallel, 'parse_parallel_file', fail)
+    assert _digest(w.parse_file(src, use_cache=False, jobs=2)) == _digest(w.VCDFile.parse(src))
 
 
 def test_split_points_align_to_timestamps(w, tmp_path):
@@ -85,6 +133,5 @@ def test_viable_is_opt_in(w, tmp_path):
     assert parallel.viable(src, jobs=None) is False       # default off
     assert parallel.viable(src, jobs=1) is False          # 1 = sequential
     assert parallel.viable(src, jobs=8) is False          # below 16MB default floor
-    import multiprocessing as mp
-    if (mp.cpu_count() or 1) > 1:                          # forced on, fork+multicore
+    if (mp.cpu_count() or 1) > 1:                          # forced on, multicore
         assert parallel.viable(src, jobs=8, min_size=0) is True

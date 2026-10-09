@@ -8,6 +8,7 @@ class ValueState:
     Keeping comment and dump state separate from storage lets a worker or a
     live tail resume at a byte boundary without changing the trace semantics.
     """
+    __slots__ = ('time', 'dump', 'comment', 'max_time', 'monotonic')
 
     def __init__(self, time=0, dump=True, comment=False, max_time=0):
         self.time = time

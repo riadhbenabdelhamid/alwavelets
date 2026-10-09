@@ -204,6 +204,10 @@ def main():
     parser.add_argument('--demo', action='store_true', help='Generate and view a demo VCD')
     parser.add_argument('--signals', '-s', help="Signal filter patterns, comma-separated (e.g. 'clk,data*,alu.*')")
     parser.add_argument('--sync', action='store_true', help="Force synchronous parse (disable background loading)")
+    parser.add_argument('--storage', choices=('auto', 'memory', 'disk'), default='auto',
+                        help="Waveform storage (auto uses disk above 50 MiB)")
+    parser.add_argument('--memory-mib', type=int, default=256, metavar='N',
+                        help="Decoded waveform page cache budget in MiB (default: 256)")
     parser.add_argument('--loadunchecked', action='store_true', help="Load with no signals shown (select via B tree browser)")
     parser.add_argument('--expanded', action='store_true', help="Start with all modules expanded (default: collapsed)")
     parser.add_argument('--mcp', action='store_true', help="Run as an MCP server (stdio) instead of the viewer")
@@ -221,6 +225,8 @@ def main():
                         help="Opt-in parallel parse workers for a large (>16MB) synchronous "
                              "VCD parse, e.g. --sync --jobs 8 (omit = sequential)")
     args = parser.parse_args()
+    if args.memory_mib <= 0:
+        parser.error('--memory-mib must be positive')
     if getattr(args, 'no_config', False):
         from . import config as _config
         _config.ENABLED = False
@@ -266,8 +272,14 @@ def main():
 
         # Fast path: a valid persistent cache loads the whole trace instantly.
         t_c = _time.time()
-        vcd = _cache.load_cache(args.file)
-        if vcd is not None:
+        from .storage import use_disk_storage, open_trace
+        disk = use_disk_storage(args.file, args.storage)
+        vcd = None if disk else _cache.load_cache(args.file)
+        if disk:
+            vcd = open_trace(args.file, memory_mib=args.memory_mib,
+                             background=not args.sync, use_cache=not args.no_cache)
+            print(f"  Disk storage: {len(vcd.signal_order)} signals, {args.memory_mib} MiB page cache")
+        elif vcd is not None:
             print(f"  Cache hit: {len(vcd.signal_order)} signals in {(_time.time()-t_c)*1000:.0f}ms")
         # Use background loading for VCD files >5MB (unless --sync)
         elif not args.sync and is_vcd_content and fsize > 5 * 1024 * 1024:
@@ -275,11 +287,8 @@ def main():
             vcd, offset = VCDFile.parse_header(args.file)
             t_hdr = _time.time() - t0
             print(f"  Header: {len(vcd.signal_order)} signals in {t_hdr*1000:.0f}ms")
-            if fsize > 50 * 1024 * 1024:
-                print(f"  Large file: lazy chunk loading (data loaded on demand)")
-            else:
-                print(f"  Background loading: viewer starts immediately")
-            vcd.start_background_load()
+            print(f"  Background loading: viewer starts immediately")
+            vcd.start_background_load(lazy_threshold=float('inf'))
         else:
             # Small file or non-VCD: synchronous parse
             def progress(read, total):
@@ -288,7 +297,7 @@ def main():
                 print(f"\r  [{bar}] {pct}%", end='', flush=True)
             try:
                 vcd = parse_file(args.file, progress_cb=progress if fsize > 1 << 20 else None,
-                                 jobs=args.jobs)
+                                 jobs=args.jobs, storage=args.storage, memory_mib=args.memory_mib)
             except ConverterError as e:
                 print(f"\nError: {e}", file=sys.stderr)
                 sys.exit(1)
@@ -330,9 +339,12 @@ def main():
     # An explicit layout flag (or --no-session) means "open it this way", so
     # don't let a saved session silently overrule it.
     use_session = not (args.no_session or expanded or load_unchecked)
-    curses.wrapper(main_curses, vcd, start_collapsed=not expanded,
-                   load_unchecked=load_unchecked, demo_view=args.demo,
-                   use_session=use_session, control=args.control)
+    try:
+        curses.wrapper(main_curses, vcd, start_collapsed=not expanded,
+                       load_unchecked=load_unchecked, demo_view=args.demo,
+                       use_session=use_session, control=args.control)
+    finally:
+        vcd.close()
 
 
 def _demo_path(name="demo_waveform.vcd"):
