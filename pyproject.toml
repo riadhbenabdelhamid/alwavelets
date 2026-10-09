@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alwavelets"
+version = "0.1.0"
+description = "Terminal VCD/FST waveform viewer: curses TUI, headless snapshots, MCP server"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "AGPL-3.0-or-later"}
+authors = [{name = "Riadh Ben Abdelhamid"}]
+dependencies = []
+classifiers = [
+    "Environment :: Console :: Curses",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[project.scripts]
+alwavelets = "alwavelets.cli:main"
+
+[tool.setuptools]
+packages = ["alwavelets"]

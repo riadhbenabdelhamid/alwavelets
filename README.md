@@ -23,9 +23,13 @@ stdlib, original artwork, no third-party assets.
 ## Features
 
 - **Formats:** VCD (streaming, background, and lazy on-demand loading for large
-  files) and FST (native pure-Python reader, with a `fst2vcd` converter
-  fallback). Values are bit-packed in memory (1-bit signals and all buses up
-  to 64 bits), cutting resident size several-fold on bus-heavy traces.
+  files; aliased identifier codes and `b`-form 1-bit values included) and FST
+  read natively — zlib, LZ4 and FastLZ chains and hierarchies, gzip-wrapped
+  files, aliases, `$dumpoff` blackouts — with pure-Python block decoders, so
+  Verilator, GHDL, Icarus and `vcd2fst` output opens with no extra package
+  (`fst2vcd` is only a fallback for anything the reader rejects). Values are
+  bit-packed in memory (1-bit signals and all buses up to 64 bits), cutting
+  resident size several-fold on bus-heavy traces.
 - **Navigation:** fuzzy signal finder (`/` filters every signal in the file
   live, fzf-style), edge-to-edge jumps, multi-cursor measurement, markers,
   zoom-to-fit / zoom-to-selection, mouse drag-to-zoom, time goto, vim-style
@@ -83,7 +87,7 @@ Flags:
 | `--sync` | Force synchronous parse (disable background loading) |
 | `--loadunchecked` | Start with no signals shown (pick them in the `B` tree browser) |
 | `--expanded` | Start with all scope modules expanded |
-| `--demo` | Generate and view a demo trace |
+| `--demo` | Generate and view a demo trace (written under a per-user temp directory) |
 | `--mcp` | Run as an MCP server (stdio) instead of the viewer |
 | `--no-cache` | Disable the persistent parse cache (force a fresh parse) |
 | `--no-config` | Ignore `~/.config/alwavelets/config.json` |
@@ -214,7 +218,8 @@ whenever an agent is connected and acting.
 | Module | Responsibility |
 | --- | --- |
 | `core` | Data structures (`VCDSignal`, `Radix`, …) and value formatting |
-| `parsers` | VCD/FST parsing, scope tree, `parse_file` dispatcher |
+| `parsers` | VCD parsing (sync / background / lazy / follow), scope tree, `parse_file` dispatcher |
+| `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `parallel` | Opt-in multi-process parsing of large VCDs (`--jobs N`) |
 | `expr` | Cross-signal boolean expression search + derived signals (`when`/`derive`) |
@@ -245,10 +250,16 @@ ruff check .             # bug-finding lint (pyflakes + syntax)
 ```
 
 The suite includes a VCD parser **fuzzer** (random mutations must never crash
-the parser) and a **lazy-chunk parity** check (the on-demand loader must agree
-with a full parse). Both lint and tests run in CI (`.github/workflows/ci.yml`)
-on every push, across Python 3.8–3.13. Ruff is configured in `ruff.toml` for
-bug-finding rules only (`E9` + `F`), not full style enforcement.
+the parser), a **lazy-chunk parity** check (the on-demand loader must agree
+with a full parse), and an **FST parity** check: `tests/fixtures/fst_ref.vcd`
+converted by `vcd2fst` with each compression (`-4`, `-F`, `-Z`, `-c`) must
+decode to exactly what the VCD parser reads. Both lint and tests run in CI
+(`.github/workflows/ci.yml`) on every push, across Python 3.8–3.13. Ruff is
+configured in `ruff.toml` for bug-finding rules only (`E9` + `F`), not full
+style enforcement.
+
+`pip install .` installs the package and an `alwavelets` console command
+(`pyproject.toml`; no runtime dependencies).
 
 ## License
 
