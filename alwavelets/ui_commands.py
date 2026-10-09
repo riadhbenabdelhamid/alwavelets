@@ -438,6 +438,9 @@ class CommandLineMixin:
                 applied += 1
         if order:
             self.display_order = order
+            self._sync_display_set()
+            self._invalidate_scope_cache()
+            self._rebuild_view_rows()
             self._needs_layout = True
         self._show_message(
             f"Loaded {applied}/{len(data['signals'])} signals from {os.path.basename(path)}")

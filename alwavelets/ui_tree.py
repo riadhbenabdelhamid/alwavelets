@@ -151,19 +151,28 @@ class TreePanelMixin:
 
     def _tree_add_scope_signals(self, scope_node):
         """Add all signals in scope (and subscopes) to display."""
-        for sid in scope_node.signal_ids:
-            if sid not in self.display_order:
+        self._sync_display_set()
+        present = self._display_order_set
+        for sid in self._scope_signal_ids(scope_node):
+            if sid not in present:
                 self.display_order.append(sid)
-        for child in scope_node.children.values():
-            self._tree_add_scope_signals(child)
+                present.add(sid)
 
     def _tree_remove_scope_signals(self, scope_node):
         """Remove all signals in scope (and subscopes) from display."""
-        for sid in scope_node.signal_ids:
-            if sid in self.display_order:
-                self.display_order.remove(sid)
+        drop = set(self._scope_signal_ids(scope_node))
+        if drop:
+            self.display_order = [s for s in self.display_order if s not in drop]
+            self._sync_display_set()
+
+    @staticmethod
+    def _scope_signal_ids(scope_node):
+        """Every signal id under a scope node, depth first (one pass, so the
+        add/remove above are O(n) instead of a list scan per signal)."""
+        out = list(scope_node.signal_ids)
         for child in scope_node.children.values():
-            self._tree_remove_scope_signals(child)
+            out.extend(TreePanelMixin._scope_signal_ids(child))
+        return out
 
     def _tree_scope_all_checked(self, scope_node):
         """Check if all signals in scope (and subscopes) are in display. Cached."""

@@ -27,30 +27,6 @@ def _fmt_freq(hz):
     return f"{hz:.4g}Hz"
 
 
-# ══════════════════════════════════════════════════════════════
-#  CURSES VIEWER
-# ══════════════════════════════════════════════════════════════
-
-
-
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCE  (tags, annotations, bookmarks -> alwavelets/persistence.py)
-# ══════════════════════════════════════════════════════════════
-
-from .persistence import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANALYSIS  (FormalAnalyzer, PowerEstimator -> alwavelets/analysis.py)
-# ══════════════════════════════════════════════════════════════
-
-from .analysis import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-
-from .manual import AlwaveletsManual  # noqa: F401  (kept importable here)
-
 
 class DrawingMixin:
     def draw_manual_overlay(self):
@@ -436,7 +412,6 @@ class DrawingMixin:
         """Compute a human-friendly tick interval for the given span."""
         if span <= 0:
             return max(1, span)
-        import math
         raw = span / max(n_ticks, 1)
         if raw < 1:
             return 1

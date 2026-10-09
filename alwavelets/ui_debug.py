@@ -15,30 +15,6 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 
 
-# ══════════════════════════════════════════════════════════════
-#  CURSES VIEWER
-# ══════════════════════════════════════════════════════════════
-
-
-
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCE  (tags, annotations, bookmarks -> alwavelets/persistence.py)
-# ══════════════════════════════════════════════════════════════
-
-from .persistence import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANALYSIS  (FormalAnalyzer, PowerEstimator -> alwavelets/analysis.py)
-# ══════════════════════════════════════════════════════════════
-
-from .analysis import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-
-from .manual import AlwaveletsManual  # noqa: F401  (kept importable here)
-
 
 class DebugActionsMixin:
     def _tag_signal_at_cursor(self):
@@ -404,6 +380,14 @@ class DebugActionsMixin:
 
     # ══ FEATURE 4: BUS DECODE ══
 
+    def _with_clock(self, bus_tags):
+        """Bus decoders sample per clock cycle when the 'clock' role is tagged
+        (otherwise they fall back to change events)."""
+        clk = self.signal_tags.tags.get('clock')
+        if clk:
+            bus_tags = dict(bus_tags, clock=clk)
+        return bus_tags
+
     def decode_axi_transactions(self):
         axi_tags = {k: v for k, v in self.signal_tags.tags.items() if k.startswith('axi.')}
         if not axi_tags:
@@ -412,7 +396,7 @@ class DebugActionsMixin:
         if not axi_tags:
             self._show_message("No AXI tags. Tag axi.aw.valid, axi.aw.addr, ...")
             return
-        decoder = AXIDecoder(self.vcd, axi_tags)
+        decoder = AXIDecoder(self.vcd, self._with_clock(axi_tags))
         txns = decoder.decode_all()
         self.bus_transactions = txns
         if not txns:
@@ -433,7 +417,7 @@ class DebugActionsMixin:
         if not wb_tags:
             self._show_message("No Wishbone tags. Tag wb.cyc, wb.stb, wb.addr, wb.ack")
             return
-        decoder = WishboneDecoder(self.vcd, wb_tags)
+        decoder = WishboneDecoder(self.vcd, self._with_clock(wb_tags))
         txns = decoder.decode_all()
         self.bus_transactions = txns
         if txns:
@@ -450,7 +434,7 @@ class DebugActionsMixin:
         if not ahb_tags:
             self._show_message("No AHB tags. Tag ahb.hready, ahb.htrans, ahb.haddr, ...")
             return
-        decoder = AHBDecoder(self.vcd, ahb_tags)
+        decoder = AHBDecoder(self.vcd, self._with_clock(ahb_tags))
         txns = decoder.decode_all()
         self.bus_transactions = txns
         if txns:

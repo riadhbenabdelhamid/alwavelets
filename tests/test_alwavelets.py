@@ -243,7 +243,7 @@ def test_keymap_wiring(w):
     km = w.Alwavelets._build_keymap(stub)
     # representative keys present and wired to the expected handler
     assert km[ord('q')] is stub._kb_quit
-    assert km[27] is stub._kb_quit
+    assert km[27] is stub._kb_escape      # Esc cancels, never quits
     assert km[curses.KEY_F5] is stub.toggle_live_reload
     assert km[ord('X')] is stub.export_svg
     assert km[ord('/')] is stub.open_finder

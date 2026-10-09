@@ -13,34 +13,23 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 
 
-# ══════════════════════════════════════════════════════════════
-#  CURSES VIEWER
-# ══════════════════════════════════════════════════════════════
-
-
-
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCE  (tags, annotations, bookmarks -> alwavelets/persistence.py)
-# ══════════════════════════════════════════════════════════════
-
-from .persistence import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANALYSIS  (FormalAnalyzer, PowerEstimator -> alwavelets/analysis.py)
-# ══════════════════════════════════════════════════════════════
-
-from .analysis import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-
-from .manual import AlwaveletsManual  # noqa: F401  (kept importable here)
-
 
 class KeymapMixin:
     def _kb_quit(self):
         return 'QUIT'
+
+    def _kb_escape(self):
+        """Esc cancels — a pending g- prefix, visual mode, then the
+        selection. It never quits: terminals deliver a bare Esc for unknown
+        Alt/function-key sequences, and users press it to back out."""
+        if self._pending_g:
+            self._pending_g = False
+            self._show_message("g- cancelled")
+        elif self._visual_mode:
+            self._kb_visual_mode()
+        elif self.selected_signals:
+            self.selected_signals = set()
+            self._show_message("Selection cleared")
 
     def _kb_help(self):
         if self.show_help:
@@ -322,7 +311,7 @@ class KeymapMixin:
         """
         K = curses
         return {
-            ord('q'): self._kb_quit, 27: self._kb_quit,
+            ord('q'): self._kb_quit, 27: self._kb_escape,
             ord('?'): self._kb_help,
             K.KEY_F1: self._kb_show_manual,
             K.KEY_F2: self._kb_toggle_menu_bar,

@@ -34,23 +34,6 @@ from .ui_drawing import DrawingMixin
 
 
 
-# ══════════════════════════════════════════════════════════════
-#  PERSISTENCE  (tags, annotations, bookmarks -> alwavelets/persistence.py)
-# ══════════════════════════════════════════════════════════════
-
-from .persistence import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANALYSIS  (FormalAnalyzer, PowerEstimator -> alwavelets/analysis.py)
-# ══════════════════════════════════════════════════════════════
-
-from .analysis import *  # noqa: F401,F403
-
-
-# ══════════════════════════════════════════════════════════════
-
-from .manual import AlwaveletsManual  # noqa: F401  (kept importable here)
 
 
 # ── true-color theme support ─────────────────────────────────────────
@@ -426,8 +409,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         th = cfg.get('theme')
         if isinstance(th, str) and th.lower() in self.THEMES:
             self.current_theme = th.lower()
-            self.apply_theme()
-            self._init_colors()
+            self.apply_theme()        # after _init_colors(): it must not be re-run
         rx = cfg.get('radix')
         if rx is not None:
             for r in Radix:
@@ -1198,9 +1180,14 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                      'collapsed': g['collapsed'], 'parent': g.get('parent')}
                     for g in gs]
         snap = _copy(self.groups)
+        order = list(self.display_order)     # ;group gathers/adds rows too
 
         def _undo():
             self.groups = _copy(snap)
+            self.display_order = list(order)
+            self._sync_display_set()
+            self._reindex_groups()
+            self._rebuild_view_rows()
         return _undo
 
     def _undo_dict_entry(self, d, sid):
@@ -1484,6 +1471,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     self.groups.append({'name': g.get('name', 'group'), 'members': mem,
                                         'collapsed': bool(g.get('collapsed')),
                                         'parent': g.get('parent')})
+            self._sync_display_set()
+            self._invalidate_scope_cache()
             self._reindex_groups()
             self._rebuild_view_rows()
             radix_val = data.get('radix', 'hex')
@@ -1739,7 +1728,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 # Show signals in this scope
                 for sid in child.signal_ids:
                     sig = self.get_signal(sid)
-                    in_view = sid in self.display_order
+                    in_view = sid in self._display_order_set
                     self._tree_flat.append(('signal', sig, depth + 1, in_view, sid))
                 # Recurse into children
                 self._flatten_node(child, depth + 1)
@@ -2694,6 +2683,12 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     continue
                 self._dirty = True  # any real key/mouse event triggers a redraw
 
+                # ── Resize applies whatever overlay is open; otherwise the
+                #    layout stays stale until a second resize ──
+                if key == curses.KEY_RESIZE:
+                    self._needs_layout = True
+                    continue
+
                 # ── Manual takes full control of keys (F1/?? opens it) ──
                 if self.show_manual:
                     if not self.manual_handle_key(key):
@@ -2735,26 +2730,27 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     if self.panel_handle_tree_key(key):
                         continue
 
-                # ── VIM 'g' prefix (gg = first in module, gt = goto time) ──
-                if key == ord('g'):
-                    if self._pending_g:
+                # ── VIM 'g' prefix (gg = first in module, gt = goto time).
+                #    The second key is consumed here: it must not also run
+                #    its own binding (gt used to toggle values, then goto).
+                if self._pending_g:
+                    self._pending_g = False
+                    if key == ord('g'):
                         self._vim_goto_first_in_module()
-                        self._pending_g = False
+                    elif key == ord('t'):
+                        self.goto_time()
                     else:
-                        self._pending_g = True
-                        self._show_message("g-")
+                        self._show_message("g- cancelled")
+                    continue
+                if key == ord('g'):
+                    self._pending_g = True
+                    self._show_message("g-")
                     continue
 
                 # ── Table-driven dispatch (see _build_keymap) ──
                 handler = self.keymap.get(key)
                 if handler is not None and handler() == 'QUIT':
                     break
-
-                # ── 'g' prefix fallback: gt = goto time ──
-                if self._pending_g and key != ord('g'):
-                    if key == ord('t'):
-                        self.goto_time()  # gt = goto time
-                    self._pending_g = False
 
         finally:
             self._cleanup_mouse()

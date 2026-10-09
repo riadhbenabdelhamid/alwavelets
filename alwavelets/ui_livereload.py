@@ -42,6 +42,14 @@ class LiveReloadMixin:
         if not path or not os.path.isfile(path) or not self._is_vcd_file(path):
             self._show_message("Follow: no VCD file on disk to follow")
             return
+        if self.vcd.is_loading or getattr(self.vcd, '_lazy_mode', False):
+            # tail() appends to the same arrays the background parser is
+            # filling (or lazy mode merges into); two writers would break
+            # the sorted-times contract every reader relies on.
+            self._show_message("Follow: wait for the background load to finish"
+                               if self.vcd.is_loading else
+                               "Follow: not available in lazy (large-file) mode")
+            return
         self.vcd.start_follow()
         self.follow_on = True
         self._follow_last_poll = 0.0
