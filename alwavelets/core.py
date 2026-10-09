@@ -72,6 +72,8 @@ class VCDSignal:
                  'signal_type', 'scope', '_times', '_values', '_scalar',
                  '_packed', '_stride', '_memo',
                  'analog_mode', 'is_dumped', '_parent_sig', '_bit_idx')
+    # False on AliasSignal: storage loops (sort/compact/dumpoff) skip aliases.
+    owns_storage = True
 
     def __init__(self, name, identifier, size=1, signal_type="wire", scope=""):
         self.name = name
@@ -460,6 +462,40 @@ class VCDSignal:
         return bit_sig
 
 
+class AliasSignal(VCDSignal):
+    """A second name for another signal's storage.
+
+    VCD reuses one identifier code for a net that is visible from several
+    scopes, and FST marks such variables as aliases of an earlier handle. The
+    alias owns no storage: every read goes to the master, so de-packing,
+    re-sorting and timestamp compaction happen once, on the master, and the
+    two can never drift apart. Appends are keyed by identifier and only ever
+    reach the master; storage-mutating loops skip aliases via owns_storage.
+    """
+    __slots__ = ('master',)
+    owns_storage = False
+
+    def __init__(self, name, identifier, size, signal_type, scope, master):
+        self.master = master
+        self.name = name
+        self.full_name = f"{scope}.{name}" if scope else name
+        self.identifier = identifier
+        self.size = size
+        self.signal_type = signal_type
+        self.scope = scope
+        self.analog_mode = (signal_type == "real")
+        self.is_dumped = True
+        self._parent_sig = None
+        self._bit_idx = None
+
+    _times = property(lambda self: self.master._times)
+    _values = property(lambda self: self.master._values)
+    _scalar = property(lambda self: self.master._scalar)
+    _packed = property(lambda self: self.master._packed)
+    _stride = property(lambda self: self.master._stride)
+    _memo = property(lambda self: self.master._memo)
+
+
 class Radix(Enum):
     BIN = "bin"
     HEX = "hex"
@@ -685,6 +721,16 @@ def ieee754_decode(bits_int, fmt):
     return (fval, sign, exp_raw, exp_real, man_raw, None)
 
 
+def format_real(val):
+    """Format a real-valued ('r' line) string compactly: six significant
+    digits, scientific notation when needed. Never truncates the text, which
+    used to turn '1.2345e-05' into '1.2345e-'."""
+    try:
+        return f"{float(val):.6g}"
+    except (ValueError, OverflowError):
+        return val
+
+
 def format_float_value(val, fmt, size=1):
     """Format a binary value string as IEEE 754 float."""
     if any(c in val for c in 'xXzZ'):
@@ -692,10 +738,7 @@ def format_float_value(val, fmt, size=1):
     try:
         bits = int(val, 2)
     except ValueError:
-        try:
-            return str(float(val))[:10]
-        except ValueError:
-            return val
+        return format_real(val)
 
     fval, sign, exp_raw, exp_real, man_raw, special = ieee754_decode(bits, fmt)
 
@@ -723,10 +766,7 @@ def format_float_decomposed(val, fmt, size=1):
     try:
         bits = int(val, 2)
     except ValueError:
-        try:
-            return str(float(val))[:10]
-        except ValueError:
-            return val
+        return format_real(val)
 
     total, exp_bits, man_bits, bias = IEEE754_FORMATS[fmt]
     fval, sign, exp_raw, exp_real, man_raw, special = ieee754_decode(bits, fmt)
@@ -828,16 +868,17 @@ def format_value(val, radix, size=1):
     try:
         int_val = int(val, 2)
     except ValueError:
-        try:
-            return str(float(val))[:8]
-        except ValueError:
-            return val
+        return format_real(val)
     if radix == Radix.BIN:
         return val
     elif radix == Radix.HEX:
         return f"{int_val:0{(size+3)//4}X}"
     elif radix == Radix.DEC:
-        if len(val) > 0 and val[0] == '1' and size > 1:
+        # Two's complement: the sign bit is bit size-1 of the value, which is
+        # only the string's first character when the string is full width.
+        # String-stored values (wide or de-packed buses) can be shorter —
+        # VCD zero-extends them — so '1' in an 8-bit bus is +1, not -255.
+        if size > 1 and len(val) >= size and val[-size] == '1':
             int_val -= (1 << size)
         return str(int_val)
     elif radix == Radix.UNSIGNED:

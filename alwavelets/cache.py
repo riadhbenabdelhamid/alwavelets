@@ -15,11 +15,11 @@ import struct
 import sys
 import zlib
 
-from .core import VCDSignal
+from .core import VCDSignal, AliasSignal
 from .parsers import VCDFile, build_scope_tree
 
 _MAGIC = b'WLT1'
-_VERSION = 4      # v4: per-signal storage-kind byte (0=strings 1=scalar 2=packed bus)
+_VERSION = 5      # v5: kind 3 = alias of an earlier signal (no storage of its own)
 _BO = 0 if sys.byteorder == 'little' else 1
 
 # Module-level switch so `--no-cache` can disable load + save in one place.
@@ -69,15 +69,22 @@ def save_cache(vcd, source):
         for sid in vcd.signal_order:
             _wstr(body, sid)
         body += struct.pack('<I', len(vcd.signals))
+        master_keys = {}
         for key, sig in vcd.signals.items():
             _wstr(body, key)
             _wstr(body, sig.name)
             _wstr(body, sig.identifier)
             _wstr(body, sig.signal_type)
             _wstr(body, sig.scope)
-            n = len(sig._times)
             # Storage kind: 1 = scalar bytearray, 2 = packed bus bytearray,
-            # 0 = string list (reals, very wide, or de-packed signals).
+            # 0 = string list (reals, very wide, or de-packed signals),
+            # 3 = alias (names the master's key; masters precede aliases).
+            if not sig.owns_storage:
+                body += struct.pack('<IBIc', sig.size, 3, 0, b'q')
+                _wstr(body, master_keys[id(sig.master)])
+                continue
+            master_keys[id(sig)] = key
+            n = len(sig._times)
             if sig._scalar:
                 kind = 1
             elif type(sig._values) is bytearray:
@@ -157,6 +164,11 @@ def load_cache(source):
             scope, pos = _rstr(mv, pos)
             size, kind, n, tc = struct.unpack_from('<IBIc', mv, pos)
             pos += struct.calcsize('<IBIc')
+            if kind == 3:                        # alias of an earlier signal
+                mkey, pos = _rstr(mv, pos)
+                vcd.signals[key] = AliasSignal(name, ident, size, stype, scope,
+                                               vcd.signals[mkey])
+                continue
             sig = VCDSignal(name, ident, size, stype, scope)
             t = array.array(tc.decode('ascii'))
             t.frombytes(mv[pos:pos + n * t.itemsize]); pos += n * t.itemsize

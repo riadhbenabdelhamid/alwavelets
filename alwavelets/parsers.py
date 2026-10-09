@@ -3,6 +3,7 @@ lazy), the native pure-Python FST reader, the scope tree, and the
 parse_file dispatcher. Depends on the stdlib and core.VCDSignal.
 """
 import array
+import bisect
 import os
 import re
 import shutil
@@ -13,12 +14,34 @@ import threading
 import zlib
 from collections import OrderedDict
 
-from .core import VCDSignal, clear_pack_memos
+from .core import VCDSignal, AliasSignal, clear_pack_memos
 
 # First byte of a scalar value-change line -> normalised value byte for the
 # packed bytearray store ('X'->'x', 'Z'->'z'). Lets the hot parse loop append a
 # byte directly (no chr().lower()/intern per change). See VCDSignal._scalar.
 _BITBYTE = {48: 48, 49: 49, 120: 120, 88: 120, 122: 122, 90: 122}
+
+
+class ConverterError(RuntimeError):
+    """An external format converter (fst2vcd, lxt2vcd, …) is missing or
+    failed. Raised instead of exiting so library users (the MCP server, a
+    REPL) get an exception; the CLI turns it into an error message."""
+
+
+def _declare_var(vcd, parts, scope):
+    """Register one `$var` line. A repeated identifier code is an alias (one
+    net seen from several scopes — Icarus does this), so it becomes an
+    AliasSignal sharing the first declaration's storage instead of being
+    silently dropped. Alias keys contain a space, which an id never does."""
+    sig_id, size, stype, name = parts[3], _safe_int(parts[2]), parts[1], parts[4]
+    master = vcd.signals.get(sig_id)
+    if master is None:
+        vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope)
+        vcd.signal_order.append(sig_id)
+    elif master.full_name != (f"{scope}.{name}" if scope else name):
+        key = f"{sig_id} #{len(vcd.signal_order)}"
+        vcd.signals[key] = AliasSignal(name, sig_id, size, stype, scope, master)
+        vcd.signal_order.append(key)
 
 
 def _safe_int(s, default=1):
@@ -46,6 +69,8 @@ def _compact_times(vcd):
     if not _I32_OK or vcd.max_time > _I32_MAX:
         return
     for sig in vcd.signals.values():
+        if not sig.owns_storage:
+            continue
         t = sig._times
         if t.typecode != 'i' and len(t):
             sig._times = array.array('i', t)
@@ -673,14 +698,16 @@ class FSTReader:
         return False
 
 
+
+
 def _fst_via_converter(filename, progress_cb=None):
     """Convert FST to VCD using fst2vcd, then parse the VCD."""
     converter = shutil.which('fst2vcd')
     if not converter:
-        print("Error: 'fst2vcd' not found. Install GTKWave tools for FST support.", file=sys.stderr)
-        print("  Ubuntu/Debian: sudo apt install gtkwave", file=sys.stderr)
-        print("  Or convert to VCD first: fst2vcd input.fst > output.vcd", file=sys.stderr)
-        sys.exit(1)
+        raise ConverterError(
+            "'fst2vcd' not found. Install GTKWave tools for FST support "
+            "(Ubuntu/Debian: sudo apt install gtkwave), or convert first: "
+            "fst2vcd input.fst > output.vcd")
 
     import tempfile
     _fd, vcd_file = tempfile.mkstemp(suffix='.vcd', prefix='alwavelets_fst_')
@@ -693,14 +720,12 @@ def _fst_via_converter(filename, progress_cb=None):
         )
         if result.returncode != 0:
             err_msg = result.stderr.decode('utf-8', errors='replace').strip()
-            print(f"Error: fst2vcd failed: {err_msg}", file=sys.stderr)
-            sys.exit(1)
+            raise ConverterError(f"fst2vcd failed: {err_msg}")
 
         # fst2vcd writes VCD to stdout
         vcd_data = result.stdout
         if not vcd_data or len(vcd_data) < 10:
-            print(f"Error: fst2vcd produced empty output", file=sys.stderr)
-            sys.exit(1)
+            raise ConverterError("fst2vcd produced empty output")
 
         with open(vcd_file, 'wb') as f:
             f.write(vcd_data)
@@ -708,17 +733,18 @@ def _fst_via_converter(filename, progress_cb=None):
         print(f"  [Converted: {len(vcd_data)/1024:.0f} KB VCD, parsing...]")
         vcd = VCDFile.parse(vcd_file, progress_cb)
         vcd._filename = filename  # Keep original FST filename for sidecar files
-        try:
-            os.unlink(vcd_file)
-        except Exception:
-            pass
         return vcd
     except subprocess.TimeoutExpired:
-        print("Error: fst2vcd timed out (>5 min)", file=sys.stderr)
-        sys.exit(1)
+        raise ConverterError("fst2vcd timed out (>5 min)")
+    except ConverterError:
+        raise
     except Exception as e:
-        print(f"Error converting FST: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ConverterError(f"converting FST: {e}")
+    finally:
+        try:
+            os.unlink(vcd_file)
+        except OSError:
+            pass
 
 
 def parse_file(filename, progress_cb=None, use_cache=True, jobs=None):
@@ -773,13 +799,11 @@ def _parse_file_uncached(filename, progress_cb=None, jobs=None):
 
     # ── Native FST (verified by magic bytes) ──
     if FSTReader.is_fst(filename):
-        print(f"  [FST native reader]")
         try:
-            reader = FSTReader(filename)
-            vcd = reader.parse(progress_cb)
+            vcd = FSTReader(filename).parse(progress_cb)
             if vcd and vcd.signal_order:
                 return vcd
-            print(f"  [Native FST: 0 signals, trying fst2vcd converter...]")
+            print("  [Native FST: 0 signals, trying fst2vcd converter...]")
         except Exception as e:
             print(f"  [Native FST failed: {e}, trying fst2vcd converter...]")
 
@@ -798,8 +822,7 @@ def _parse_file_uncached(filename, progress_cb=None, jobs=None):
 
     converter_path = shutil.which(converter)
     if not converter_path:
-        print(f"Error: '{converter}' not found. Install fst2vcd for {ext} support.", file=sys.stderr)
-        sys.exit(1)
+        raise ConverterError(f"'{converter}' not found (needed for {ext} files)")
 
     import tempfile
     _fd, vcd_file = tempfile.mkstemp(suffix='.vcd', prefix='vcd_viewer_')
@@ -808,16 +831,19 @@ def _parse_file_uncached(filename, progress_cb=None, jobs=None):
     try:
         result = subprocess.run([converter_path, filename], capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
-            print(f"Error: {converter} failed: {result.stderr}", file=sys.stderr)
-            sys.exit(1)
+            raise ConverterError(f"{converter} failed: {result.stderr.strip()}")
         with open(vcd_file, 'w') as f:
             f.write(result.stdout)
-        vcd = VCDFile.parse(vcd_file, progress_cb)
-        os.unlink(vcd_file)
-        return vcd
+        return VCDFile.parse(vcd_file, progress_cb)
+    except ConverterError:
+        raise
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        raise ConverterError(f"{converter}: {e}")
+    finally:
+        try:
+            os.unlink(vcd_file)
+        except OSError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -958,11 +984,7 @@ class VCDFile:
                 elif line.startswith('$var'):
                     parts = line.split()
                     if len(parts) >= 5:
-                        sig_id = parts[3]
-                        if sig_id not in vcd.signals:
-                            sig = VCDSignal(parts[4], sig_id, _safe_int(parts[2]), parts[1], current_scope)
-                            vcd.signals[sig_id] = sig
-                            vcd.signal_order.append(sig_id)
+                        _declare_var(vcd, parts, current_scope)
                 elif line.startswith('$enddefinitions'):
                     break
                 elif line.startswith('$date'):
@@ -994,7 +1016,6 @@ class VCDFile:
             bget = {k.encode('ascii'): v for k, v in signals.items()}.get
             bitbyte = _BITBYTE
             current_time = 0
-            in_dumpvars = False
             dump_active = True
             bytes_read = offset
             changes = 0
@@ -1038,9 +1059,14 @@ class VCDFile:
                             sp = raw_line.find(32, 1)
                             if sp > 0:
                                 sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None and not sig._scalar:  # vector -> packed/list store
-                                    v = raw_line[1:sp].decode('ascii', 'ignore')
-                                    sig._append_value(v)   # values before times (contract)
+                                if sig is not None:
+                                    if sig._scalar:
+                                        # 'b1 !' for a 1-bit var (GHDL, xsim,
+                                        # cocotb write one-element vectors so)
+                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
+                                    else:                  # vector -> packed/list store
+                                        v = raw_line[1:sp].decode('ascii', 'ignore')
+                                        sig._append_value(v)   # values before times (contract)
                                     sig._times.append(current_time)
                                     changes += 1
                         continue
@@ -1061,13 +1087,12 @@ class VCDFile:
                     # ── directives ($dumpvars/off/on, $comment, $end) ──
                     if c0 == 36:  # b'$'
                         line = raw_line.decode('ascii', errors='ignore').strip()
-                        if line.startswith('$dumpvars'):
-                            in_dumpvars = True
-                        elif line.startswith('$dumpoff'):
+                        if line.startswith('$dumpoff'):
                             dump_active = False
                             for sig in signals.values():
-                                sig.add_change(current_time, 'x')  # type-aware append
-                                changes += 1
+                                if sig.owns_storage:
+                                    sig.add_change(current_time, 'x')  # type-aware append
+                                    changes += 1
                         elif line.startswith('$dumpon'):
                             dump_active = True
                         elif line.startswith('$comment'):
@@ -1076,8 +1101,6 @@ class VCDFile:
                                     bytes_read += len(cont)
                                     if b'$end' in cont:
                                         break
-                        elif line == '$end':
-                            in_dumpvars = False
                         continue
 
             self._time_index = time_index
@@ -1087,6 +1110,8 @@ class VCDFile:
             # the first 100 entries — and rebind _values before _times to keep
             # the lock-free-read contract (see VCDSignal.add_change).
             for sig in signals.values():
+                if not sig.owns_storage:
+                    continue
                 t = sig._times
                 if len(t) < 2:
                     continue
@@ -1116,10 +1141,19 @@ class VCDFile:
 
     # ══ Phase 2b: Lazy time index build (for huge files) ══
 
+    # One index entry at most every this many bytes: a chunk request then
+    # over-reads by at most this much on each side, while the index stays
+    # tens of thousands of entries for a multi-GB trace instead of one tuple
+    # per '#' line (which was ~100 bytes of Python objects per timestamp).
+    _INDEX_STRIDE = 64 * 1024
+
     def _build_time_index(self, offset):
         """Fast scan: read only timestamps to build time->offset index."""
         file_size = os.path.getsize(self._filename)
         time_index = []
+        stride = self._INDEX_STRIDE
+        last_indexed = -stride
+        n_lines = 0
         try:
             with open(self._filename, 'rb', buffering=1 << 20) as f:
                 f.seek(offset)
@@ -1128,15 +1162,19 @@ class VCDFile:
                     if raw_line[0:1] == b'#':
                         try:
                             t = int(raw_line[1:])
-                            time_index.append((t, pos))
                             if t > self.max_time:
                                 self.max_time = t
+                            if pos - last_indexed >= stride:
+                                time_index.append((t, pos))
+                                last_indexed = pos
                         except ValueError:
                             pass
+                        n_lines += 1
+                        if n_lines % 10000 == 0 and file_size > 0:
+                            self._load_progress = min(99, pos * 100 // file_size)
                     pos += len(raw_line)
-                    if len(time_index) % 10000 == 0 and file_size > 0:
-                        self._load_progress = min(99, pos * 100 // file_size)
             self._time_index = time_index
+            self._ti_times = [t for t, _ in time_index]
             self._lazy_mode = True
             self._loaded_ranges = []
             self._load_progress = 100
@@ -1168,18 +1206,19 @@ class VCDFile:
         self._mark_loaded(t_start, t_end)
 
     def _chunk_offsets(self, t_start, t_end):
-        """Map a time window to a [start, end) byte range using the time index."""
+        """Map a time window to a [start, end) byte range using the time
+        index: from the entry before the first timestamp >= t_start to the
+        entry after the last timestamp <= t_end (O(log n), two bisects)."""
         idx = self._time_index
-        start_off = self._values_offset
-        end_off = os.path.getsize(self._filename)
-        for i in range(len(idx)):
-            if idx[i][0] >= t_start:
-                start_off = idx[max(0, i - 1)][1]
-                break
-        for i in range(len(idx) - 1, -1, -1):
-            if idx[i][0] <= t_end:
-                end_off = idx[min(len(idx) - 1, i + 1)][1] if i + 1 < len(idx) else end_off
-                break
+        if not idx:
+            return self._values_offset, os.path.getsize(self._filename)
+        tt = getattr(self, '_ti_times', None)
+        if tt is None or len(tt) != len(idx):
+            tt = self._ti_times = [t for t, _ in idx]
+        i = bisect.bisect_left(tt, t_start)
+        start_off = idx[max(0, i - 1)][1]
+        j = bisect.bisect_right(tt, t_end)
+        end_off = idx[j][1] if j < len(idx) else os.path.getsize(self._filename)
         return start_off, end_off
 
     def _uncovered_ranges(self, t_start, t_end):
@@ -1298,6 +1337,7 @@ class VCDFile:
         # Bytes-keyed membership + result so the hot loop avoids decoding the id
         # of every change; the keys are decoded once at return (per signal).
         valid = {k.encode('ascii') for k in signals}
+        scalar_ids = {k.encode('ascii') for k, s in signals.items() if s._scalar}
         bitbyte = _BITBYTE
         _intern = sys.intern
         result = {}
@@ -1341,7 +1381,10 @@ class VCDFile:
                                 tv = result[bid] = ([], [])
                             if not tv[0] or tv[0][-1] != current_time:
                                 tv[0].append(current_time)
-                                tv[1].append(_intern(raw_line[1:sp].decode('ascii', 'ignore')))
+                                if scalar_ids is not None and bid in scalar_ids:
+                                    tv[1].append(bitbyte.get(raw_line[sp - 1], 120))
+                                else:
+                                    tv[1].append(_intern(raw_line[1:sp].decode('ascii', 'ignore')))
                 elif c0 == 114 or c0 == 82:
                     sp = raw_line.find(32, 1)
                     if sp > 0:
@@ -1381,6 +1424,28 @@ class VCDFile:
         self._tail_time = self.max_time
         self._tail_dump = True
         self._tail_bget = {k.encode('ascii'): v for k, v in self.signals.items()}.get
+        # _compact_times may have narrowed timestamps to 32 bits; a live sim
+        # can run past that, so tail() widens them back the moment it has to.
+        self._tail_narrow = any(s.owns_storage and s._times.typecode == 'i'
+                                for s in self.signals.values())
+
+    def _widen_times(self):
+        """Undo _compact_times: 32-bit timestamp arrays back to 64-bit."""
+        for sig in self.signals.values():
+            if sig.owns_storage and sig._times.typecode == 'i':
+                sig._times = array.array('q', sig._times)   # atomic rebind
+        self._tail_narrow = False
+
+    def _resync_storage(self):
+        """After an interrupted append (value in, timestamp not), trim any
+        value store that ran ahead of its timestamps so readers stay aligned."""
+        for sig in self.signals.values():
+            if not sig.owns_storage:
+                continue
+            n, vals = len(sig._times), sig._values
+            want = n * sig._stride if (sig._packed and type(vals) is bytearray) else n
+            if len(vals) > want:
+                del vals[want:]
 
     def tail(self):
         """Parse value changes appended since the last tail()/start_follow().
@@ -1407,6 +1472,7 @@ class VCDFile:
         bget = self._tail_bget
         bitbyte = _BITBYTE
         ct, dump, mx, changes = self._tail_time, self._tail_dump, self.max_time, 0
+        narrow = getattr(self, '_tail_narrow', False)
         try:
             for raw_line in data[:consumed].split(b'\n'):
                 if not raw_line:
@@ -1423,6 +1489,9 @@ class VCDFile:
                         ct = int(raw_line[1:])
                         if ct > mx:
                             mx = ct
+                            if narrow and ct > _I32_MAX:
+                                self._widen_times()
+                                narrow = False
                     except ValueError:
                         pass
                     continue
@@ -1431,10 +1500,15 @@ class VCDFile:
                         sp = raw_line.find(32, 1)
                         if sp > 0:
                             sig = bget(raw_line[sp + 1:].rstrip())
-                            if sig is not None and not sig._scalar:
-                                v = raw_line[1:sp].decode('ascii', 'ignore')
-                                sig._append_value(v)   # values before times
-                                sig._times.append(ct); changes += 1
+                            if sig is not None:
+                                if sig._scalar:
+                                    if c0 == 98 or c0 == 66:   # 'b1 !' on a 1-bit var
+                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
+                                        sig._times.append(ct); changes += 1
+                                else:
+                                    v = raw_line[1:sp].decode('ascii', 'ignore')
+                                    sig._append_value(v)   # values before times
+                                    sig._times.append(ct); changes += 1
                     continue
                 if c0 == 36:
                     line = raw_line.decode('ascii', 'ignore').strip()
@@ -1443,7 +1517,7 @@ class VCDFile:
                     elif line.startswith('$dumpon'):
                         dump = True
         except Exception:
-            pass                           # malformed tail: keep what we appended
+            self._resync_storage()         # malformed tail: keep what aligned
         self._tail_offset += consumed
         self._tail_time, self._tail_dump, self.max_time = ct, dump, mx
         return changes
@@ -1461,7 +1535,6 @@ class VCDFile:
         current_scope = ""
         current_time = 0
         in_header = True
-        in_dumpvars = False
         dump_active = True
         bytes_read = 0
         last_progress = 0
@@ -1510,9 +1583,12 @@ class VCDFile:
                             sp = raw_line.find(32, 1)  # space
                             if sp > 0:
                                 sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None and not sig._scalar:  # vector -> packed/list store
-                                    v = raw_line[1:sp].decode('ascii', 'ignore')
-                                    sig._append_value(v)   # values before times
+                                if sig is not None:
+                                    if sig._scalar:        # 'b1 !' for a 1-bit var
+                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
+                                    else:                  # vector -> packed/list store
+                                        v = raw_line[1:sp].decode('ascii', 'ignore')
+                                        sig._append_value(v)   # values before times
                                     sig._times.append(current_time)
                         continue
 
@@ -1530,12 +1606,11 @@ class VCDFile:
 
                     if c0 == 36:  # b'$'
                         line = raw_line.decode('ascii', errors='ignore').strip()
-                        if line.startswith('$dumpvars'):
-                            in_dumpvars = True
-                        elif line.startswith('$dumpoff'):
+                        if line.startswith('$dumpoff'):
                             dump_active = False
                             for sig in signals.values():
-                                sig.add_change(current_time, 'x')  # type-aware append
+                                if sig.owns_storage:
+                                    sig.add_change(current_time, 'x')  # type-aware append
                         elif line.startswith('$dumpon'):
                             dump_active = True
                         elif line.startswith('$comment'):
@@ -1544,8 +1619,6 @@ class VCDFile:
                                     bytes_read += len(cont)
                                     if b'$end' in cont:
                                         break
-                        elif line == '$end':
-                            in_dumpvars = False
                         continue
 
                     continue
@@ -1589,14 +1662,7 @@ class VCDFile:
                 elif line.startswith('$var'):
                     parts = line.split()
                     if len(parts) >= 5:
-                        sig_id = parts[3]
-                        if sig_id not in signals:
-                            sig = VCDSignal(
-                                parts[4], sig_id, _safe_int(parts[2]),
-                                parts[1], current_scope
-                            )
-                            signals[sig_id] = sig
-                            vcd.signal_order.append(sig_id)
+                        _declare_var(vcd, parts, current_scope)
                 elif line.startswith('$enddefinitions'):
                     in_header = False
                     # Build the bytes-keyed id->signal map for the value hot loop.
@@ -1611,7 +1677,7 @@ class VCDFile:
 
         # ── Post-parse: robustness checks ──
         for sig in vcd.signals.values():
-            if len(sig._times) >= 2:
+            if sig.owns_storage and len(sig._times) >= 2:
                 is_sorted = True
                 for i in range(1, min(len(sig._times), 100)):
                     if sig._times[i] < sig._times[i-1]:

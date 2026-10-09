@@ -238,7 +238,7 @@ def main():
         return
 
     if args.demo:
-        demo_file = '/tmp/demo_waveform.vcd'
+        demo_file = _demo_path()
         print(f"Generating demo VCD: {demo_file}")
         generate_demo_vcd(demo_file)
         vcd = VCDFile.parse(demo_file)
@@ -286,8 +286,12 @@ def main():
                 pct = read * 100 // total
                 bar = '█' * (pct // 2) + '░' * (50 - pct // 2)
                 print(f"\r  [{bar}] {pct}%", end='', flush=True)
-            vcd = parse_file(args.file, progress_cb=progress if fsize > 1 << 20 else None,
-                             jobs=args.jobs)
+            try:
+                vcd = parse_file(args.file, progress_cb=progress if fsize > 1 << 20 else None,
+                                 jobs=args.jobs)
+            except ConverterError as e:
+                print(f"\nError: {e}", file=sys.stderr)
+                sys.exit(1)
             if fsize > 1 << 20:
                 print()
     else:
@@ -331,6 +335,19 @@ def main():
                    use_session=use_session, control=args.control)
 
 
+def _demo_path(name="demo_waveform.vcd"):
+    """A per-user, 0700 directory under the temp dir for generated demo
+    traces (and their sidecars) — never a fixed world-writable /tmp name."""
+    import tempfile
+    try:
+        tag = str(os.getuid())
+    except AttributeError:                       # no getuid on Windows
+        tag = os.environ.get('USERNAME', 'user')
+    d = os.path.join(tempfile.gettempdir(), f"alwavelets-{tag}")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return os.path.join(d, name)
+
+
 def demo(signals=None, start="0ns", end="300ns", width=88, path=None):
     """Print a demo waveform — the fastest way to show what this does.
 
@@ -346,10 +363,9 @@ def demo(signals=None, start="0ns", end="300ns", width=88, path=None):
         >>> vcd = alwavelets.demo()
         >>> alwavelets.measure(vcd, ["top.clk"])
     """
-    import tempfile
     from .snapshot import render_text
     if path is None:
-        path = os.path.join(tempfile.gettempdir(), "alwavelets_demo.vcd")
+        path = _demo_path("alwavelets_demo.vcd")
     if not os.path.isfile(path):
         generate_demo_vcd(path)
     vcd = parse_file(path)

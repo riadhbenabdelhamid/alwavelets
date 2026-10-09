@@ -91,12 +91,18 @@ def _worker(args):
                     sp = raw.find(32, 1)
                     if sp > 0:
                         bid = raw[sp + 1:].rstrip()
-                        if meta.get(bid) is False:   # bus/real signal
+                        scalar = meta.get(bid)
+                        if scalar is False:            # bus/real signal
                             tv = rget(bid)
                             if tv is None:
                                 tv = result[bid] = ([], [])
                             v = raw[1:sp].decode('ascii', 'ignore')
                             tv[0].append(ct); tv[1].append(intern(v) if len(v) < 64 else v)
+                        elif scalar and (c0 == 98 or c0 == 66):   # 'b1 !' on a 1-bit var
+                            tv = rget(bid)
+                            if tv is None:
+                                tv = result[bid] = ([], [])
+                            tv[0].append(ct); tv[1].append(bitbyte.get(raw[sp - 1], 120))
                 continue
             if c0 == 36:                       # '$'
                 line = raw.decode('ascii', 'ignore')
@@ -126,7 +132,7 @@ def _fill_parallel(vcd, filename, offset, jobs):
     if len(ranges) < 2:
         return False
     meta = [(k.encode('ascii'), (s.size == 1 and s.signal_type != 'real'))
-            for k, s in vcd.signals.items()]
+            for k, s in vcd.signals.items() if s.owns_storage]
     tasks = [(filename, a, b, meta) for (a, b) in ranges]
     ctx = mp.get_context('fork')
     with ctx.Pool(len(ranges)) as pool:
