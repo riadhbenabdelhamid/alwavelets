@@ -1928,13 +1928,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         cs_sig = self._find_signal_by_name(cs_name) if cs_name else None
 
         decoder = SPIDecoder(clk_sig, mosi_sig, cs_sig=cs_sig)
-        frames = decoder.decode(self.time_start, self.time_end)
-        # Store as overlay on MOSI signal
-        for sid, sig in self.vcd.signals.items():
-            if sig is mosi_sig:
-                self.decode_overlays[sid] = frames
-                break
-        self._show_message(f"SPI: decoded {len(frames)} frames")
+        self._decode_protocol(decoder, mosi_sig, 'SPI')
 
     def setup_i2c_decode(self):
         """Interactive I2C decode setup."""
@@ -1950,12 +1944,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self._show_message("Signal not found")
             return
         decoder = I2CDecoder(sda_sig, scl_sig)
-        frames = decoder.decode(self.time_start, self.time_end)
-        for sid, sig in self.vcd.signals.items():
-            if sig is sda_sig:
-                self.decode_overlays[sid] = frames
-                break
-        self._show_message(f"I2C: decoded {len(frames)} frames")
+        self._decode_protocol(decoder, sda_sig, 'I2C')
 
     def setup_uart_decode(self):
         """Interactive UART decode setup."""
@@ -1975,12 +1964,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self._show_message("Invalid baud period")
             return
         decoder = UARTDecoder(tx_sig, baud)
-        frames = decoder.decode(self.time_start, self.time_end)
-        for sid, sig in self.vcd.signals.items():
-            if sig is tx_sig:
-                self.decode_overlays[sid] = frames
-                break
-        self._show_message(f"UART: decoded {len(frames)} frames")
+        self._decode_protocol(decoder, tx_sig, 'UART')
 
     def do_protocol_decode_menu(self):
         """Protocol decode sub-menu."""
@@ -1995,7 +1979,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         elif c == 'u':
             self.setup_uart_decode()
         elif c == 'c':
-            self.decode_overlays.clear()
+            self._clear_decode_results()
             self._show_message("Decode overlays cleared")
 
     def _find_signal_by_name(self, name):
@@ -2085,6 +2069,23 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         frames = self.decode_overlays[sig_id]
         span = self.time_end - self.time_start
         if span <= 0:
+            return
+        from .results import PagedResults
+        if isinstance(frames, PagedResults):
+            from .background import BackgroundQueries
+            if not hasattr(self, '_queries'):
+                self._queries = BackgroundQueries()
+            start, end, width = self.time_start, self.time_end, self.wave_width
+            runs = self._queries.request('decodes', (id(self.vcd), start, end, width),
+                                         (sig_id, frames),
+                                         lambda cancel: frames.overlay(start, end, width, cancel=cancel),
+                                         [], cancellable=True)
+            for col, text in runs:
+                try:
+                    self.stdscr.addstr(row, self.name_width + 1 + col, text,
+                                      curses.color_pair(self.C_BUSLBL) | curses.A_BOLD)
+                except curses.error:
+                    pass
             return
         for frame in frames:
             if frame.t_end < self.time_start or frame.t_start > self.time_end:
@@ -2636,6 +2637,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                             self._show_message('Analysis cancelled')
                         else:
                             job.complete(result)
+                            job.result_claimed = True
                     except Exception as exc:
                         self._show_message(str(exc))
                     finally:

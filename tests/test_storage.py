@@ -238,3 +238,28 @@ def test_disk_png_preserves_external_rendering_fixes(tmp_path):
     eager = VCDFile.parse(path)
     with open_trace(path, use_cache=False) as disk:
         assert render_waveform_png(disk, ['top.a'], width=80) == render_waveform_png(eager, ['top.a'], width=80)
+
+
+@pytest.mark.parametrize('disordered', [False, True])
+def test_summary_groups_spill_without_losing_extrema(tmp_path, monkeypatch, disordered):
+    from alwavelets import storage
+    original = storage.PageWriter.__init__
+    def small_groups(writer, *args):
+        original(writer, *args)
+        writer.summary_group_limit = 2
+    monkeypatch.setattr(storage.PageWriter, '__init__', small_groups)
+    monkeypatch.setattr(storage, 'PAGE_EVENTS', 2)
+    declarations = ''.join('$var wire 16 %s s%d $end\n' % (key, i) for i, key in enumerate('!"#$'))
+    ticks = list(range(100))
+    if disordered:
+        ticks.reverse()
+    body = ''.join('#%d\n%s' % (t, ''.join('b%s %s\n' % (format(t + i, '016b'), key)
+                                           for i, key in enumerate('!"#$'))) for t in ticks)
+    path = trace(tmp_path, body, declarations)
+    eager = VCDFile.parse(path)
+    with open_trace(path, use_cache=False) as disk:
+        assert disk._store.db.execute('SELECT MAX(level) FROM summaries').fetchone()[0] >= 1
+        for key, expected in eager.signals.items():
+            assert disk.signals[key].changes == expected.changes
+            for start, end in [(0, 99), (5, 77), (3, 3)]:
+                assert disk.signals[key].numeric_range_in_window(start, end) == expected.numeric_range_in_window(start, end)

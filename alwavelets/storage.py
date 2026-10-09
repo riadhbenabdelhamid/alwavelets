@@ -7,7 +7,7 @@ pages; sequence views preserve the existing read-only signal API.
 import array
 import bisect
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import heapq
 import json
 import math
@@ -44,6 +44,7 @@ def _decode_number(value):
 
 class SequenceView(Sequence):
     """Slices stay views, including for legacy consumers of _times/_values."""
+    __slots__ = ('source', 'indices', 'transform')
     def __init__(self, source, indices=None, transform=None):
         self.source = source
         self.indices = range(len(source)) if indices is None else indices
@@ -70,6 +71,7 @@ class SequenceView(Sequence):
 
 
 class PageSequence(Sequence):
+    __slots__ = ('signal', 'values')
     typecode = 'q'
 
     def __init__(self, signal, values=False):
@@ -118,10 +120,19 @@ class StoredSignal(VCDSignal):
             setattr(self, name, getattr(metadata, name))
         self._packed, self._stride, self._memo = False, 0, None
         self.key, self.store = key, store
-        self._time_view, self._value_view = PageSequence(self), PageSequence(self, True)
+        self._time_view = self._value_view = None
 
-    _times = property(lambda self: self._time_view)
-    _values = property(lambda self: self._value_view)
+    @property
+    def _times(self):
+        if self._time_view is None:
+            self._time_view = PageSequence(self)
+        return self._time_view
+
+    @property
+    def _values(self):
+        if self._value_view is None:
+            self._value_view = PageSequence(self, True)
+        return self._value_view
 
     def num_changes(self):
         return self.store.counts.get(self.key, 0)
@@ -178,9 +189,28 @@ def _definition(sig):
             sig.scope, sig.declared_range]
 
 
-def _signal(definition):
+def _signal(definition, *, metadata_only=False):
     name, identifier, size, kind, scope, bounds = definition
-    return VCDSignal(name, identifier, size, kind, scope, tuple(bounds) if bounds is not None else None)
+    return VCDSignal(name, identifier, size, kind, scope, tuple(bounds) if bounds is not None else None,
+                     metadata_only=metadata_only)
+
+
+class SignalDefinitions(Mapping):
+    """Reuse declarations on signal objects instead of retaining a second copy."""
+    def __init__(self, signals):
+        self.signals = signals
+
+    def __getitem__(self, key):
+        signal = self.signals[key]
+        if not signal.owns_storage:
+            raise KeyError(key)
+        return _definition(signal)
+
+    def __iter__(self):
+        return (key for key, signal in self.signals.items() if signal.owns_storage)
+
+    def __len__(self):
+        return sum(signal.owns_storage for signal in self.signals.values())
 
 
 class TraceStore:
@@ -320,7 +350,8 @@ class PageWriter:
     def __init__(self, store, vcd):
         self.store, self.vcd = store, vcd
         self.builders = OrderedDict()
-        self.summary_groups = {}
+        self.summary_groups = OrderedDict()
+        self.summary_group_limit = 4096
         self.sizes, self.totals, self.last_time = {}, {}, {}
         self.buffer_bytes = 0
         self.buffer_limit = min(32 * 1024 * 1024, max(PAGE_BYTES, store.memory_bytes // 4))
@@ -344,15 +375,18 @@ class PageWriter:
             CREATE INDEX page_lookup ON pages(sid,lo);
             CREATE INDEX page_time ON pages(sid,t0,t1);
             CREATE INDEX page_end ON pages(sid,t1,lo);
+            CREATE TEMP TABLE pending_summaries(sid TEXT,level INTEGER,data TEXT,
+                                                PRIMARY KEY(sid,level));
         ''')
-        master_keys = {id(sig): sid for sid, sig in vcd.signals.items() if sig.owns_storage}
-        old = list(vcd.signals.items())
-        for sid, sig in old:
+        if not isinstance(vcd.signals, dict) or isinstance(vcd.signals, OrderedDict):
+            vcd.signals = dict(vcd.signals)
+        store.definitions = SignalDefinitions(vcd.signals)
+        for sid in vcd.signal_order:
+            sig = vcd.signals[sid]
             definition = _definition(sig)
-            master = sid if sig.owns_storage else master_keys[id(sig.master)]
+            master = sid if sig.owns_storage else sig.master.identifier
             db.execute('INSERT INTO signals VALUES(?,?,?,0)', (sid, json.dumps(definition), master))
             if sig.owns_storage:
-                store.definitions[sid] = definition
                 store.counts[sid] = 0
                 vcd.signals[sid] = StoredSignal(sig, sid, store)
             else:
@@ -361,20 +395,21 @@ class PageWriter:
         db.commit()
         vcd._store = store
         vcd._lazy_mode = False
-        vcd.scopes = build_scope_tree(vcd)
+        if vcd.scopes is None:
+            vcd.scopes = build_scope_tree(vcd)
 
     def add(self, key, timestamp, value):
         if self.store.cancel.is_set():
             raise Cancelled('Indexing cancelled')
-        definition = self.store.definitions.get(key)
-        if definition is None:
+        metadata = self.vcd.signals.get(key)
+        if metadata is None or not metadata.owns_storage:
             return
         if timestamp < self.last_time.get(key, timestamp):
             self.disordered = True
         self.last_time[key] = timestamp
         sig = self.builders.get(key)
         if sig is None:
-            sig = self.builders[key] = _signal(definition)
+            sig = self.builders[key] = _signal(_definition(metadata))
             sig._memo = None
             self.sizes[key] = 256
             self.buffer_bytes += 256
@@ -421,8 +456,16 @@ class PageWriter:
         group_key = key, level
         group = self.summary_groups.get(group_key)
         if group is None:
-            group = [lo, 0, None, None, 0]
+            row = self.store.db.execute('SELECT data FROM pending_summaries WHERE sid=? AND level=?',
+                                        group_key).fetchone()
+            if row is not None:
+                group = json.loads(row[0])
+                group[2], group[3] = _decode_number(group[2]), _decode_number(group[3])
+                self.store.db.execute('DELETE FROM pending_summaries WHERE sid=? AND level=?', group_key)
+            else:
+                group = [lo, 0, None, None, 0]
             self.summary_groups[group_key] = group
+        self.summary_groups.move_to_end(group_key)
         group[1] += n
         if minimum is not None:
             group[2] = minimum if group[2] is None else min(group[2], minimum)
@@ -431,6 +474,11 @@ class PageWriter:
         if group[4] == 16:
             del self.summary_groups[group_key]
             self.add_summary(key, group[0], group[1], level + 1, group[2], group[3])
+        while len(self.summary_groups) > self.summary_group_limit:
+            (sid, level), group = self.summary_groups.popitem(last=False)
+            data = [group[0], group[1], _encode_number(group[2]), _encode_number(group[3]), group[4]]
+            self.store.db.execute('INSERT OR REPLACE INTO pending_summaries VALUES(?,?,?)',
+                                  (sid, level, json.dumps(data)))
 
     def publish(self, force=False):
         if not force and time.monotonic() - self.last_publish < 0.25:
@@ -463,6 +511,7 @@ class PageWriter:
         db.execute('DELETE FROM pages')
         db.execute('DELETE FROM summaries')
         self.summary_groups.clear()
+        db.execute('DELETE FROM pending_summaries')
         self.store.pages.clear()
         self.store.cache_bytes = 0
         self.totals.clear()
@@ -490,6 +539,7 @@ class PageWriter:
                 'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
                 'min_time': self.vcd.min_time}
         with self.store.lock:
+            self.store.db.execute('DROP TABLE pending_summaries')
             self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
             self.store.db.commit()
         self.vcd._extent_known = True
@@ -523,14 +573,20 @@ def _restore(store, source):
     if meta['version'] != VERSION or meta['signature'] != _signature(source) or not meta['complete']:
         return None
     vcd = VCDFile()
+    vcd.signals = {}
+    store.definitions = SignalDefinitions(vcd.signals)
     vcd._filename = source
     for field in ('timescale', 'timescale_number', 'timescale_unit', 'date', 'max_time', 'min_time'):
         setattr(vcd, field, meta[field])
     vcd.version = meta['simulator_version']
+    scopes, kinds = {}, {}
     for key, definition, master, count in store.db.execute('SELECT sid,definition,master,n FROM signals ORDER BY rowid'):
-        sig = _signal(json.loads(definition))
+        definition = json.loads(definition)
+        definition[3] = kinds.setdefault(definition[3], definition[3])
+        definition[4] = scopes.setdefault(definition[4], definition[4])
+        definition[1] = key if master == key else vcd.signals[master].identifier
+        sig = _signal(definition, metadata_only=True)
         if master == key:
-            store.definitions[key] = json.loads(definition)
             store.counts[key] = count
             sig = StoredSignal(sig, key, store)
         else:
@@ -571,7 +627,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         vcd = FSTReader(source).parse(metadata_only=True)
         offset = 0
     else:
-        vcd, offset = VCDFile.parse_header(source)
+        vcd, offset = VCDFile.parse_header(source, metadata_only=True)
     if not vcd.signal_order:
         raise ValueError('Trace has no signal declarations')
     if use_cache:

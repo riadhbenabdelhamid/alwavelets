@@ -319,7 +319,10 @@ class FSTReader:
                 raise ValueError("FST file has no hierarchy block")
             btype, bpos, bslen = hier[-1]
             f.seek(bpos + 9)
-            self._parse_hierarchy(self._read_hier_block(f, btype, bslen - 8), vcd)
+            compact = metadata_only or writer_factory is not None
+            if compact:
+                vcd.signals = {}
+            self._parse_hierarchy(self._read_hier_block(f, btype, bslen - 8), vcd, compact)
             if progress_cb:
                 progress_cb(f.tell(), file_size)
 
@@ -445,7 +448,7 @@ class FSTReader:
         mid = lz4_block_decompress(f.read(data_len - 16), mid_len)
         return lz4_block_decompress(mid, uncomp_len)
 
-    def _parse_hierarchy(self, data, vcd):
+    def _parse_hierarchy(self, data, vcd, metadata_only=False):
         pos, n = 0, len(data)
         scope_stack = []
         next_handle = 0
@@ -487,7 +490,8 @@ class FSTReader:
                 size = 64 if is_real else length         # reals: 64, as fst2vcd declares them
                 hid = str(handle)
                 if hid not in vcd.signals:
-                    vcd.signals[hid] = VCDSignal(disp, hid, size, type_name, scope, declared_range)
+                    vcd.signals[hid] = VCDSignal(disp, hid, size, type_name, scope, declared_range,
+                                                metadata_only=metadata_only)
                     vcd.signal_order.append(hid)
                 else:
                     key = "%s #%d" % (hid, len(vcd.signal_order))

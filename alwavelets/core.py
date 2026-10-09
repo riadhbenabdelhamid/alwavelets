@@ -119,7 +119,7 @@ class VCDSignal:
     owns_storage = True
 
     def __init__(self, name, identifier, size=1, signal_type="wire", scope="",
-                 declared_range=None):
+                 declared_range=None, *, metadata_only=False):
         self.reference = name
         self.declared_range = declared_range
         # Keep familiar names for conventional buses; disambiguate slices
@@ -133,7 +133,7 @@ class VCDSignal:
         self.size = size
         self.signal_type = signal_type
         self.scope = scope
-        self._times = array.array('q')   # signed 64-bit ints — 8 bytes each
+        self._times = () if metadata_only else array.array('q')
         # Single-bit signals pack values into a bytearray (1 byte/change);
         # 2..64-bit buses pack into a flat bytearray at _stride bytes/change
         # (see "packed bus value storage" above); reals and very wide buses
@@ -153,6 +153,8 @@ class VCDSignal:
         self.is_dumped = True             # tracks $dumpoff/$dumpon state
         self._parent_sig = None           # set for expanded bus bits
         self._bit_idx = None              # bit index for expanded bus bits
+        if metadata_only:
+            self._values = ()
 
     def bit_label(self, offset):
         if self.declared_range is None:

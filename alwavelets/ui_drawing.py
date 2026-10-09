@@ -1090,7 +1090,8 @@ class DrawingMixin:
         if job is not None:
             _sep()
             pct = min(100, job.progress[0] * 100 // max(1, job.progress[1])) if job.progress else 0
-            _put(f"Search {pct}% · cancel", curses.color_pair(self.C_PROMPT))
+            label = getattr(job, 'label', 'Search')
+            _put(f"{label} {pct}% · cancel", curses.color_pair(self.C_PROMPT))
         if self.vcd.is_loading:
             _sep()
             pct = self.vcd.load_progress

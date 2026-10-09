@@ -28,7 +28,7 @@ class ConverterError(RuntimeError):
     REPL) get an exception; the CLI turns it into an error message."""
 
 
-def _declare_var(vcd, parts, scope):
+def _declare_var(vcd, parts, scope, metadata_only=False):
     """Register one `$var` line. A repeated identifier code is an alias (one
     net seen from several scopes — Icarus does this), so it becomes an
     AliasSignal sharing the first declaration's storage instead of being
@@ -38,7 +38,8 @@ def _declare_var(vcd, parts, scope):
     name, declared_range = split_reference(reference)
     master = vcd.signals.get(sig_id)
     if master is None:
-        vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope, declared_range)
+        vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope, declared_range,
+                                      metadata_only=metadata_only)
         vcd.signal_order.append(sig_id)
     elif (master.reference, master.scope, master.declared_range) != (name, scope, declared_range):
         key = f"{sig_id} #{len(vcd.signal_order)}"
@@ -321,9 +322,11 @@ class VCDFile:
     # ══ Phase 1: Header-only parse (synchronous, <100ms) ══
 
     @staticmethod
-    def parse_header(filename):
+    def parse_header(filename, *, metadata_only=False):
         """Parse VCD header only. Returns (vcd, values_offset)."""
         vcd = VCDFile()
+        if metadata_only:
+            vcd.signals = {}  # insertion order without linked-list overhead
         vcd._filename = filename
         vcd._extent_known = False
         scope_stack = []
@@ -358,7 +361,7 @@ class VCDFile:
                 elif line.startswith('$var'):
                     parts = line.split()
                     if len(parts) >= 5:
-                        _declare_var(vcd, parts, current_scope)
+                        _declare_var(vcd, parts, current_scope, metadata_only)
                 elif line.startswith('$enddefinitions'):
                     break
                 elif line.startswith('$comment'):
@@ -570,6 +573,8 @@ class VCDFile:
 
     def close(self):
         """Cancel indexing and release disk pages and temporary storage."""
+        for results in tuple(getattr(self, '_result_stores', ())):
+            results.close()
         for derived in getattr(self, '_derived_stores', ()):
             derived.close()
         store = getattr(self, '_store', None)

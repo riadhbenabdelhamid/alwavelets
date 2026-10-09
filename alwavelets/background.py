@@ -10,26 +10,38 @@ class BackgroundQueries:
         self.limit = limit
         self.pending, self.ready, self.windows = {}, OrderedDict(), {}
         self.placeholders = {}
+        self.cancellations = {}
         self.errors = []
 
-    def request(self, group, window, key, compute, placeholder):
+    def request(self, group, window, key, compute, placeholder, *, cancellable=False):
         if self.windows.get(group) != window:
+            self.invalidate(group)
             self.windows[group] = window
-            for token in list(self.pending):
-                if token[0] == group:
-                    self.pending.pop(token).cancel()
-                    self.placeholders.pop(token, None)
-            for token in list(self.ready):
-                if token[0] == group:
-                    del self.ready[token]
         token = (group, window, key)
         if token in self.ready:
             self.ready.move_to_end(token)
             return self.ready[token]
         if token not in self.pending and len(self.pending) < self.limit:
-            self.pending[token] = self.pool.submit(compute)
+            if cancellable:
+                cancel = self.cancellations[token] = threading.Event()
+                self.pending[token] = self.pool.submit(compute, cancel)
+            else:
+                self.pending[token] = self.pool.submit(compute)
             self.placeholders[token] = placeholder
         return placeholder
+
+    def invalidate(self, group):
+        self.windows.pop(group, None)
+        for token in list(self.pending):
+            if token[0] == group:
+                cancel = self.cancellations.pop(token, None)
+                if cancel is not None:
+                    cancel.set()
+                self.pending.pop(token).cancel()
+                self.placeholders.pop(token, None)
+        for token in list(self.ready):
+            if token[0] == group:
+                del self.ready[token]
 
     def poll(self):
         changed = False
@@ -37,6 +49,7 @@ class BackgroundQueries:
             if not future.done():
                 continue
             del self.pending[token]
+            self.cancellations.pop(token, None)
             placeholder = self.placeholders.pop(token, None)
             if self.windows.get(token[0]) != token[1]:
                 continue
@@ -51,19 +64,24 @@ class BackgroundQueries:
         return changed
 
     def close(self):
+        for cancel in self.cancellations.values():
+            cancel.set()
         for future in self.pending.values():
             future.cancel()
         self.pool.shutdown(wait=True)
         self.pending.clear()
         self.ready.clear()
         self.placeholders.clear()
+        self.cancellations.clear()
 
 
 class AnalysisJob:
-    def __init__(self, compute, complete):
+    def __init__(self, compute, complete, discard=None):
         self.cancel = threading.Event()
         self.progress = None
         self.complete = complete
+        self.discard = discard
+        self.result_claimed = False
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='wavelet-analysis')
         self.future = self.pool.submit(compute, self.cancel, self.update_progress)
 
@@ -74,3 +92,7 @@ class AnalysisJob:
         self.cancel.set()
         self.future.cancel()
         self.pool.shutdown(wait=True)
+        if self.discard is not None and not self.result_claimed and not self.future.cancelled():
+            self.result_claimed = True
+            if self.future.exception() is None:
+                self.discard(self.future.result())

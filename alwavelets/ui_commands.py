@@ -268,7 +268,7 @@ class CommandLineMixin:
             self._show_message('No analysis running')
         else:
             job.cancel.set()
-            self._show_message('Cancelling search…')
+            self._show_message('Cancelling analysis…')
 
     def _cmd_glitches(self, args):
         """glitches [max_pulse]: scan displayed signals for x-hazards and

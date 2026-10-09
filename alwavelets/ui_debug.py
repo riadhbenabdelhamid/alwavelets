@@ -26,6 +26,76 @@ def load_analysis_data(viewer, start=0, end=None):
 
 
 class DebugActionsMixin:
+    def _start_decode_results(self, factory, item_type, complete, title, end=None, kind='decode'):
+        from .background import AnalysisJob
+        from .results import PagedResults, close_results
+        if getattr(self, '_analysis_job', None) is not None:
+            self._show_message('Analysis already running; use cancel before starting another')
+            return
+        vcd = self.vcd
+        end = vcd.max_time if end is None else end
+        def compute(cancel, progress):
+            progress(0, end)
+            return PagedResults.collect(factory(cancel), item_type, owner=vcd,
+                                        cancel=cancel, progress=progress, end=end)
+        def apply(results):
+            if self.vcd is not vcd:
+                results.close()
+                return
+            complete(results)
+        self._analysis_job = AnalysisJob(compute, apply, discard=close_results)
+        self._analysis_job.kind = kind
+        self._analysis_job.label = 'Decode'
+        self._show_message(f'Decoding {title} in background; use cancel to stop')
+
+    def _decode_protocol(self, decoder, signal, title):
+        from .results import close_results
+        sid = next(key for key, sig in self.vcd.signals.items() if sig is signal)
+        start, end = self.time_start, self.time_end
+        def complete(frames):
+            close_results(self.decode_overlays.get(sid))
+            self.decode_overlays[sid] = frames
+            self._show_message(f'{title}: decoded {len(frames)} frames')
+        self._start_decode_results(lambda cancel: decoder.iter_decode(start, end, cancel=cancel),
+                                    DecodedFrame, complete, title, end, kind='protocol')
+
+    def _decode_bus(self, decoder, title):
+        from .results import close_results
+        def complete(txns):
+            close_results(self.bus_transactions)
+            self.bus_transactions = txns
+            if txns:
+                self.markers.clear()
+                for txn in txns[:50]:
+                    label = f'{txn.type[0].upper()} @0x{txn.addr:x}' if txn.addr is not None else txn.type
+                    if txn.resp:
+                        label += f' [{txn.resp}]'
+                    self.markers.append(Marker(txn.t_start, label))
+            self._show_message(f'{len(txns)} {title} transactions ({min(len(txns), 50)} markers)')
+        self._start_decode_results(lambda cancel: decoder.iter_decode(cancel=cancel),
+                                    BusTransaction, complete, title)
+
+    def _clear_decode_results(self, all_results=False):
+        from .results import close_results
+        job = getattr(self, '_analysis_job', None)
+        if job is not None and (all_results or getattr(job, 'kind', None) == 'protocol'):
+            job.close()
+            self._analysis_job = None
+        queries = getattr(self, '_queries', None)
+        if queries is not None:
+            queries.invalidate('decodes')
+        for frames in getattr(self, 'decode_overlays', {}).values():
+            close_results(frames)
+        self.decode_overlays = {}
+        if all_results:
+            close_results(getattr(self, 'bus_transactions', None))
+            self.bus_transactions = []
+            trace = getattr(self, 'instr_trace', None)
+            if trace is not None:
+                close_results(trace.entries)
+                trace.entries = []
+                trace.built = False
+
     def _tag_signal_at_cursor(self):
         """Tag the signal at tree cursor with an ISA role."""
         n = len(self._tree_flat)
@@ -111,8 +181,18 @@ class DebugActionsMixin:
                 self._show_message("No tagged signals. Use B→t to tag, or T to load tags.")
                 return
             self._show_message(f"Auto-detected {n} signal roles")
-        n = self.instr_trace.build(self.vcd, self.signal_tags, self.isa_decoder)
-        self._show_message(f"Trace built: {n} instructions")
+        from .results import close_results
+        vcd, trace, decoder = self.vcd, self.instr_trace, self.isa_decoder
+        # Tags can be edited while the worker runs; take a stable snapshot.
+        import copy
+        tags = copy.deepcopy(self.signal_tags)
+        def complete(entries):
+            close_results(trace.entries)
+            trace.entries = entries
+            trace.tags, trace.decoder, trace.built = tags, decoder, True
+            self._show_message(f'Trace built: {len(entries)} instructions')
+        self._start_decode_results(lambda cancel: trace.iter_entries(vcd, tags, decoder, cancel=cancel),
+                                    dict, complete, 'instructions')
 
     def _trace_query_prompt(self):
         """Interactive trace query."""
@@ -414,17 +494,7 @@ class DebugActionsMixin:
             self._show_message("No AXI tags. Tag axi.aw.valid, axi.aw.addr, ...")
             return
         decoder = AXIDecoder(self.vcd, self._with_clock(axi_tags))
-        txns = decoder.decode_all()
-        self.bus_transactions = txns
-        if not txns:
-            self._show_message("No AXI transactions decoded")
-        else:
-            self.markers.clear()
-            for txn in txns[:50]:
-                label = f"{txn.type[0].upper()} @0x{txn.addr:x}" if txn.addr is not None else txn.type
-                if txn.resp: label += f" [{txn.resp}]"
-                self.markers.append(Marker(txn.t_start, label))
-            self._show_message(f"{len(txns)} AXI txns ({min(len(txns),50)} markers)")
+        self._decode_bus(decoder, 'AXI')
 
     def decode_wishbone(self):
         if not load_analysis_data(self):
@@ -437,16 +507,7 @@ class DebugActionsMixin:
             self._show_message("No Wishbone tags. Tag wb.cyc, wb.stb, wb.addr, wb.ack")
             return
         decoder = WishboneDecoder(self.vcd, self._with_clock(wb_tags))
-        txns = decoder.decode_all()
-        self.bus_transactions = txns
-        if txns:
-            self.markers.clear()
-            for txn in txns[:50]:
-                label = f"{txn.type[0].upper()} @0x{txn.addr:x}" if txn.addr is not None else txn.type
-                self.markers.append(Marker(txn.t_start, label))
-            self._show_message(f"{len(txns)} Wishbone txns")
-        else:
-            self._show_message("No Wishbone transactions")
+        self._decode_bus(decoder, 'Wishbone')
 
     def decode_ahb(self):
         if not load_analysis_data(self):
@@ -456,16 +517,7 @@ class DebugActionsMixin:
             self._show_message("No AHB tags. Tag ahb.hready, ahb.htrans, ahb.haddr, ...")
             return
         decoder = AHBDecoder(self.vcd, self._with_clock(ahb_tags))
-        txns = decoder.decode_all()
-        self.bus_transactions = txns
-        if txns:
-            self.markers.clear()
-            for txn in txns[:50]:
-                label = f"{txn.type[0].upper()} @0x{txn.addr:x}" if txn.addr is not None else txn.type
-                self.markers.append(Marker(txn.t_start, label))
-            self._show_message(f"{len(txns)} AHB txns")
-        else:
-            self._show_message("No AHB transactions")
+        self._decode_bus(decoder, 'AHB')
 
     def _auto_tag_axi(self):
         patterns = {

@@ -134,6 +134,10 @@ chain plus block time tables/hierarchy; an unusually large individual chain or
 declaration can exceed the budget. There is no new native dependency. Disk mode
 trades a slower first scan and disk space for low memory use and quick subsequent
 opens. `--no-cache` still uses temporary disk storage, removed on close.
+Declarations share metadata with the page store, and sequence wrappers are
+created only when a signal is accessed. Pending index-summary groups spill to
+disk when their bounded builder cache fills. Metadata still grows with the
+number of declared signals; all signals remain available.
 
 Expression searches stream only the referenced signals. `when`/`match` searches
 run in the background in disk mode, with progress and a `cancel` command. Derived
@@ -143,12 +147,21 @@ output. PNG rasterization retains pixels rather than a complete event list,
 including when narrow pulses share a pixel. Protocol decoders expose iterators;
 AXI spills unmatched responses to a temporary disk queue.
 
+Viewer protocol decoding, bus decoding, and instruction-trace building run in
+the background with progress and `cancel`. Their complete results are indexed
+in temporary SQLite files, including when the source uses in-memory storage.
+Overlays read the visible time range on a worker and cache only the painted
+terminal cells. Changing the viewport cancels obsolete overlay reads. Successful
+decodes replace prior results; cancellation or failure leaves prior results
+available. Replacing/clearing results, reloading, or closing the trace releases
+their temporary storage. No frame-count limit is imposed.
+
 Explicit materialization such as `signal.changes`, `render_svg()`, and decoder
 `decode()`/`decode_all()` result lists still uses memory proportional to the
-requested output. Instruction trace `build()` also retains its index. Prefer the
+requested output. Library `InstructionTrace.build()` retains its index, and
+instruction-trace queries can still materialize matching entries. Prefer the
 streaming APIs for large captures; individual transactions still retain their
-payloads. The viewer's decode overlays and bus results retain their decoded
-frames, and file exports from the viewer remain synchronous.
+payloads. File exports from the viewer remain synchronous.
 Live tailing requires `--storage memory`; disk indexes are snapshots.
 
 Library callers can explicitly select storage and should close traces:
@@ -413,10 +426,13 @@ python3 tools/stress_workflows.py --size-gib 10 --signals 100000 --memory-mib 8 
 ```
 
 This generates a 4096-bit bus with a clock, verifies indexed values, streams
-PNG/CSV exports and SPI decoding, and checks reopening without loading pages.
-A separate workload checks 100,000 signal declarations. Reports include total
-process peak RSS, page-cache usage, index size, and timings. The generated traces
-and indexes require temporary disk space and are removed after the run.
+PNG/CSV exports and paged SPI decoding, and checks reopening without loading
+pages. Separate workloads check 100,000 signal declarations and one million
+records each for frames, transactions, and instructions (`--result-frames N`).
+Reports include process peak RSS before and after reopening, page-cache usage,
+index size, and timings. The reopening measurement retains the first closed
+trace object, so its metadata is still resident. The generated traces and
+indexes require temporary disk space and are removed after the run.
 
 ## License
 

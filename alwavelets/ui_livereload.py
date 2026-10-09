@@ -152,6 +152,8 @@ class LiveReloadMixin:
         if queries is not None:
             queries.close()
             del self._queries
+        if hasattr(self, '_clear_decode_results'):
+            self._clear_decode_results(all_results=True)
         self.vcd.close()
         self.vcd = new_vcd
         # These signals are new objects with new values. The row cache keys on
