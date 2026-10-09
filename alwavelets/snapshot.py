@@ -8,14 +8,16 @@ import fnmatch
 import json
 import re
 
-from .core import Radix, format_value, xml_escape
-from .rendering import draw_single_bit_culled, draw_bus_culled
+from .core import Radix, ensure_trace_loaded, format_typed_value, xml_escape
+from .rendering import (draw_single_bit_culled, draw_single_bit_subcell,
+                        draw_bus_culled, draw_analog_culled)
+from .analysis import measure_signal
 
 _RADIX = {
     "bin": Radix.BIN, "binary": Radix.BIN,
     "hex": Radix.HEX, "hexadecimal": Radix.HEX,
     "dec": Radix.DEC, "decimal": Radix.DEC, "signed": Radix.DEC,
-    "unsigned": Radix.UNSIGNED, "uint": Radix.UNSIGNED,
+    "unsigned": Radix.UNSIGNED, "uint": Radix.UNSIGNED, "uns": Radix.UNSIGNED,
 }
 
 _UNIT_SECONDS = {"fs": 1e-15, "ps": 1e-12, "ns": 1e-9, "us": 1e-6,
@@ -114,10 +116,12 @@ def _resolve_palette(theme):
 def load_arrangement(vcd, path):
     """Read a saved arrangement file and return (signal_full_names, radix_name).
 
-    Arrangements store display order as VCD signal identifiers; we map them back
-    to full names (skipping any no longer present) and read the global radix."""
+    Version 2 resolves declaration identities before mapping display order to
+    full names; legacy files use raw identifiers. Missing signals are skipped."""
     with open(path) as f:
         data = json.load(f)
+    from .persistence import remap_view_state
+    data, _ = remap_view_state(vcd, data)
     names = []
     for sid in data.get("display_order", []):
         sig = vcd.signals.get(sid)
@@ -221,8 +225,19 @@ def render_text(vcd, signals=None, t_start=None, t_end=None, width=100,
     if not sigs:
         return "(no signals matched: %s)" % ", ".join(signals or ["(none given)"])
 
+    return render_signal_rows(vcd, [(s, rx, s.analog_mode) for s in sigs],
+                              t_start, t_end, width, name_width, header)
+
+
+def render_signal_rows(vcd, rows, t_start, t_end, width=100, name_width=None,
+                       header=True, wave_style=1):
+    """Render resolved (signal, radix, analog) rows, including virtual signals."""
+    ensure_trace_loaded(vcd, t_start, t_end)
+    if not rows:
+        return "(no signals displayed)"
+
     if name_width is None:
-        name_width = min(32, max(len(s.full_name) for s in sigs) + 1)
+        name_width = min(32, max(len(s.full_name) for s, _, _ in rows) + 1)
     wave_w = max(8, int(width) - name_width - 1)
 
     lines = []
@@ -230,10 +245,14 @@ def render_text(vcd, signals=None, t_start=None, t_end=None, width=100,
         lines.append("%s  [%s .. %s]" % (
             "waveform", vcd.time_to_str(t_start), vcd.time_to_str(t_end)))
     lines.append(_ruler(vcd, t_start, t_end, name_width, wave_w))
-    for sig in sigs:
+    for sig, rx, analog in rows:
         label = sig.full_name[-name_width:].ljust(name_width)
-        if sig.size == 1 and sig.signal_type != "real":
-            chars, _attrs = draw_single_bit_culled(sig, t_start, t_end, wave_w)
+        if analog:
+            chars, _attrs = draw_analog_culled(sig, t_start, t_end, wave_w)
+            wave = "".join(chars)
+        elif sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
+            draw = draw_single_bit_subcell if wave_style == 2 else draw_single_bit_culled
+            chars, _attrs = draw(sig, t_start, t_end, wave_w)
             wave = "".join(chars)
         else:
             chars, _attrs, labels = draw_bus_culled(sig, t_start, t_end, wave_w, rx)
@@ -252,6 +271,7 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
     t_end = vcd.max_time if t_end is None else parse_time(vcd, t_end)
     if t_end <= t_start:
         t_end = t_start + 1
+    ensure_trace_loaded(vcd, t_start, t_end)
     sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
     pal = _resolve_palette(theme)
 
@@ -283,7 +303,7 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
         x0 = margin + name_w
         out.append('<text x="%d" y="%d" class="nm">%s</text>'
                    % (margin, ymid + 4, xml_escape(sig.full_name[-22:])))
-        if sig.size == 1 and sig.signal_type != "real":
+        if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
             pts, cls = [], "hi"
             for c in range(wave_w):
                 t = t_start + c * span / wave_w
@@ -307,7 +327,7 @@ def render_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
                 out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" class="%s"/>'
                            % (xa, ybot, xb, ybot, cls))
                 if xb - xa > 22:
-                    lbl = format_value(vw[j], rx, sig.size)
+                    lbl = format_typed_value(sig, vw[j], rx)
                     out.append('<text x="%d" y="%d" font-size="10">%s</text>'
                                % (xa + 3, ymid + 3, xml_escape(lbl)))
     out.append("</svg>")
@@ -338,6 +358,7 @@ def measure(vcd, signals, t_start=None, t_end=None):
     t_end = vcd.max_time if t_end is None else parse_time(vcd, t_end)
     if t_end <= t_start:
         t_end = t_start + 1
+    ensure_trace_loaded(vcd, t_start, t_end)
     sigs = resolve_signals(vcd, signals)
     if not sigs:
         return "(no signals matched: %s)" % ", ".join(signals or ["(none given)"])
@@ -345,7 +366,7 @@ def measure(vcd, signals, t_start=None, t_end=None):
     lines = ["measurements  [%s .. %s]" % (vcd.time_to_str(t_start), vcd.time_to_str(t_end))]
     for sig in sigs:
         trans = sig.transition_count_in_window(t_start, t_end)
-        period, _ = sig.detect_frequency()
+        period = measure_signal(sig, t_start, t_end).get('period')
         if period:
             info = "period=%s freq=%s" % (vcd.time_to_str(period), _fmt_hz(_freq_hz(vcd, period)))
         else:

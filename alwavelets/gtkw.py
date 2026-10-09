@@ -101,7 +101,7 @@ def save_gtkw(path, dumpfile, signals, time_start=None, time_end=None):
         if flag != last_flag:
             lines.append("@%x" % flag)
             last_flag = flag
-        if size and size > 1:
+        if size and size > 1 and not name.endswith(']'):
             lines.append("%s[%d:0]" % (name, size - 1))
         else:
             lines.append(name)

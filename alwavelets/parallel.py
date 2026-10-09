@@ -10,15 +10,14 @@ makes re-opens instant regardless). It is gated to fork-capable platforms and
 sizable VCDs, and every entry point falls back to the sequential parser on any
 problem, so correctness never depends on it.
 
-Caveats (documented, rare): a chunk assumes dumping is active at its start, so a
-$dumpoff/$dumpon region spanning a split is not modelled (such regions normally
-carry no value changes); $comment blocks spanning a split are likewise not
-special-cased.
+Workers receive the time, comment and dump state at their byte boundary, so
+splits inside dump blackouts or comments preserve sequential semantics.
 """
 import array
 import os
 
 from .parsers import VCDFile, _BITBYTE, _compact_times
+from .value_stream import ValueState, states_at_offsets
 
 
 def _split_points(filename, offset, size, n):
@@ -51,16 +50,10 @@ def _split_points(filename, offset, size, n):
 
 def _worker(args):
     """Parse [start, end) of `filename`; return (max_time, {id: (tbytes, vblob, scalar)})."""
-    import sys as _sys
-    filename, start, end, meta_items = args
-    meta = dict(meta_items)                     # id_bytes -> scalar(bool)
-    bitbyte = _BITBYTE
-    intern = _sys.intern
+    filename, start, end, meta_items = args[:4]
+    state = ValueState(*args[4]) if len(args) > 4 else ValueState()
+    meta = dict(meta_items)
     result = {}
-    rget = result.get
-    ct = 0
-    dump = True
-    mx = 0
     with open(filename, 'rb') as f:
         f.seek(start)
         pos = start
@@ -68,49 +61,19 @@ def _worker(args):
             if pos >= end:
                 break
             pos += len(raw)
-            c0 = raw[0]
-            if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
-                if dump:
-                    bid = raw[1:].rstrip()
-                    if meta.get(bid):          # scalar signal
-                        tv = rget(bid)
-                        if tv is None:
-                            tv = result[bid] = ([], [])
-                        tv[0].append(ct); tv[1].append(bitbyte[c0])
+            event = state.feed(raw)
+            if event is None:
                 continue
-            if c0 == 35:                       # '#'
-                try:
-                    ct = int(raw[1:])
-                    if ct > mx:
-                        mx = ct
-                except ValueError:
-                    pass
-                continue
-            if c0 == 98 or c0 == 66 or c0 == 114 or c0 == 82:   # b/B/r/R
-                if dump:
-                    sp = raw.find(32, 1)
-                    if sp > 0:
-                        bid = raw[sp + 1:].rstrip()
-                        scalar = meta.get(bid)
-                        if scalar is False:            # bus/real signal
-                            tv = rget(bid)
-                            if tv is None:
-                                tv = result[bid] = ([], [])
-                            v = raw[1:sp].decode('ascii', 'ignore')
-                            tv[0].append(ct); tv[1].append(intern(v) if len(v) < 64 else v)
-                        elif scalar and (c0 == 98 or c0 == 66):   # 'b1 !' on a 1-bit var
-                            tv = rget(bid)
-                            if tv is None:
-                                tv = result[bid] = ([], [])
-                            tv[0].append(ct); tv[1].append(bitbyte.get(raw[sp - 1], 120))
-                continue
-            if c0 == 36:                       # '$'
-                line = raw.decode('ascii', 'ignore')
-                if line.startswith('$dumpoff'):
-                    dump = False
-                elif line.startswith('$dumpon'):
-                    dump = True
-                continue
+            bid, value = event
+            keys = meta if bid is None else (bid,)
+            for key in keys:
+                if key not in meta:
+                    continue
+                ts, vs = result.setdefault(key, ([], []))
+                ts.append(state.time)
+                vs.append(_BITBYTE.get(ord(value[-1:]) if value else 120, 120)
+                          if meta[key] else value)
+    mx = state.max_time
     out = {}
     for bid, (ts, vs) in result.items():
         tb = array.array('q', ts).tobytes()
@@ -131,9 +94,10 @@ def _fill_parallel(vcd, filename, offset, jobs):
     ranges = _split_points(filename, offset, size, n)
     if len(ranges) < 2:
         return False
-    meta = [(k.encode('ascii'), (s.size == 1 and s.signal_type != 'real'))
+    meta = [(k.encode('ascii'), s._scalar)
             for k, s in vcd.signals.items() if s.owns_storage]
-    tasks = [(filename, a, b, meta) for (a, b) in ranges]
+    states = states_at_offsets(filename, offset, [a for a, _ in ranges])
+    tasks = [(filename, a, b, meta, states[a]) for (a, b) in ranges]
     ctx = mp.get_context('fork')
     with ctx.Pool(len(ranges)) as pool:
         parts = pool.map(_worker, tasks)       # ordered by chunk
@@ -173,6 +137,12 @@ def _fill_parallel(vcd, filename, offset, jobs):
         sig._times = times
         sig._values = vals
     vcd.max_time = mx
+    vcd._extent_known = True
+    vcd._parsed_offset = size
+    for sig in vcd.signals.values():
+        if sig.owns_storage and any(sig._times[i] < sig._times[i - 1]
+                                   for i in range(1, len(sig._times))):
+            sig._sort_by_time()
     _compact_times(vcd)
     return True
 

@@ -10,12 +10,12 @@ def _mcp(w):
     return mcp_server
 
 
-def test_initialize_echoes_version(w):
+def test_initialize_negotiates_supported_version(w):
     m = _mcp(w)
     r = m.handle_message({"jsonrpc": "2.0", "id": 0, "method": "initialize",
                           "params": {"protocolVersion": "2025-06-18"}})
     assert r["id"] == 0
-    assert r["result"]["protocolVersion"] == "2025-06-18"   # echo client's version
+    assert r["result"]["protocolVersion"] == m.PROTOCOL_VERSION
     assert r["result"]["serverInfo"]["name"] == "alwavelets"
     assert "tools" in r["result"]["capabilities"]
 

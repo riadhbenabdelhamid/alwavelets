@@ -33,11 +33,10 @@ Layout notes (from fstapi.c, the reference implementation):
   Time deltas accumulate per chain into the block's time table.
 """
 import os
-import re
 import struct
 import zlib
 
-from .core import VCDSignal, AliasSignal
+from .core import VCDSignal, AliasSignal, split_reference
 
 # ── small decompressors ─────────────────────────────────────────────
 
@@ -156,7 +155,6 @@ def fastlz_decompress(src, dst_size):
 # ── the reader ───────────────────────────────────────────────────────
 
 _RCV = "xzhuwl-?"          # 4-state value index -> VCD char (fstapi FST_RCV_STR)
-_RANGE_SUFFIX = re.compile(r' \[[^\]]*\]$')
 _VAR_TYPE_NAMES = {
     0: 'event', 1: 'integer', 2: 'parameter', 3: 'real', 4: 'real',
     5: 'reg', 6: 'supply0', 7: 'supply1', 8: 'time', 9: 'tri',
@@ -456,18 +454,18 @@ class FSTReader:
                 scope = ".".join(scope_stack)
                 type_name = _VAR_TYPE_NAMES.get(var_type, 'wire')
                 is_real = var_type in _REAL_TYPES
-                # vcd2fst keeps "name [7:0]"; the VCD parser reads only the
-                # name, so match it for sidecar/arrangement compatibility.
-                disp = _RANGE_SUFFIX.sub('', name)
+                # Preserve the declaration range with the same identity and
+                # display conventions as the VCD parser.
+                disp, declared_range = split_reference(name)
                 size = 64 if is_real else length         # reals: 64, as fst2vcd declares them
                 hid = str(handle)
                 if hid not in vcd.signals:
-                    vcd.signals[hid] = VCDSignal(disp, hid, size, type_name, scope)
+                    vcd.signals[hid] = VCDSignal(disp, hid, size, type_name, scope, declared_range)
                     vcd.signal_order.append(hid)
                 else:
                     key = "%s #%d" % (hid, len(vcd.signal_order))
                     vcd.signals[key] = AliasSignal(disp, hid, size, type_name,
-                                                   scope, vcd.signals[hid])
+                                                   scope, vcd.signals[hid], declared_range)
                     vcd.signal_order.append(key)
                 while len(self._handles) <= handle:
                     self._handles.append(None)

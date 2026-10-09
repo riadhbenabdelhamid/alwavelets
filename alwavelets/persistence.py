@@ -23,6 +23,83 @@ def _write_json_atomic(path, data):
         raise
 
 
+def signal_identities(vcd, ids=None):
+    ids = vcd.signals if ids is None else ids
+    return {sid: vcd.signals[sid].identity() for sid in ids if sid in vcd.signals}
+
+
+def view_reference_ids(viewer):
+    ids = set(viewer.display_order)
+    for field in ('analog_signals', 'selected_signals', 'sig_radix', 'sig_color', 'sig_height'):
+        ids.update(getattr(viewer, field, ()))
+    for group in viewer.groups:
+        ids.update(group['members'])
+    return ids
+
+
+def remap_view_state(vcd, data):
+    """Resolve v2 view references by declaration, retaining v1 compatibility.
+
+    An ambiguous or missing declaration is omitted, never rebound to whatever
+    happens to have its old VCD identifier. Returns (state, missing count).
+    """
+    if not isinstance(data, dict):
+        raise ValueError('view state must be an object')
+    if data.get('version', 1) == 1:
+        return data, 0
+    if data.get('version') != 2 or not isinstance(data.get('signal_identities'), dict):
+        raise ValueError('unsupported view state version')
+    by_identity = {}
+    for sid, identity in signal_identities(vcd).items():
+        key = json.dumps(identity, sort_keys=True)
+        by_identity.setdefault(key, []).append(sid)
+    mapping = {}
+    for old, identity in data['signal_identities'].items():
+        matches = by_identity.get(json.dumps(identity, sort_keys=True), [])
+        if len(matches) == 1:
+            mapping[old] = matches[0]
+    out = dict(data)
+    referenced = set()
+
+    def remap(items):
+        referenced.update(items)
+        return [mapping[sid] for sid in items if sid in mapping]
+
+    for field in ('display_order', 'analog_signals', 'selected_signals'):
+        if field in data:
+            out[field] = remap(data[field])
+    for field in ('sig_radix', 'sig_color', 'sig_height'):
+        if field in data:
+            referenced.update(data[field])
+            out[field] = {mapping[sid]: value for sid, value in data[field].items() if sid in mapping}
+    out['groups'] = [dict(g, members=remap(g.get('members', []))) for g in data.get('groups', [])]
+    return out, len(referenced - mapping.keys())
+
+
+def apply_session_times(viewer, data):
+    """Apply time state only once the trace's final extent is available."""
+    if getattr(viewer.vcd, 'is_loading', False) or not getattr(viewer.vcd, '_extent_known', True):
+        viewer._pending_session_times = {k: data[k] for k in ('view', 'cursors', 'markers') if k in data}
+        return False
+    from .core import Marker
+    mx = max(0, viewer.vcd.max_time)
+
+    def clamp(t):
+        return max(0, min(int(t), mx))
+
+    viewer.markers = [Marker(clamp(m['time']), m.get('label', '')) for m in data.get('markers', [])]
+    view = data.get('view')
+    if isinstance(view, list) and len(view) == 2 and view[1] > view[0]:
+        ts, te = map(clamp, view)
+        viewer.time_start, viewer.time_end = (ts, te) if te > ts else (0, max(1, mx))
+    cur = data.get('cursors')
+    if isinstance(cur, list) and len(cur) == 3:
+        viewer.cursor_a, viewer.cursor_b = clamp(cur[0]), clamp(cur[1])
+        viewer.cursor_b_on = bool(cur[2])
+    viewer._pending_session_times = None
+    return True
+
+
 # ══════════════════════════════════════════════════════════════
 #  STAGE 1: SIGNAL TAG SYSTEM
 # ══════════════════════════════════════════════════════════════

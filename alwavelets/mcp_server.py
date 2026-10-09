@@ -33,6 +33,7 @@ from .expr import find_all_expression, ExprError, resolve_signal
 from .analysis import find_anomalies
 
 PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 __version__ = "0.1.0"
 
 # ── parsed-trace cache (most-recent file only, keyed by path+mtime) ──
@@ -145,10 +146,18 @@ def _pick_session(session=None):
             "cannot be driven).")
     if session:
         key = str(session)
-        for s in live:
-            if key in (str(s.get("pid")), s.get("trace", "")) or \
-                    key in os.path.basename(s.get("trace", "")):
-                return s
+        matches = [s for s in live if key == str(s.get('pid'))]
+        if not matches:
+            matches = [s for s in live if key == s.get('trace')]
+        if not matches:
+            matches = [s for s in live if key == os.path.basename(s.get('trace', ''))]
+        if not matches:
+            matches = [s for s in live if key in os.path.basename(s.get('trace', ''))]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError("ambiguous session %r; choose a pid: %s" % (
+                session, ', '.join('%s (%s)' % (s.get('pid'), s.get('trace')) for s in matches)))
         raise RuntimeError("no live viewer matches %r; open ones: %s" % (
             session, ", ".join(os.path.basename(s.get("trace") or "?")
                                for s in live)))
@@ -523,11 +532,24 @@ def _error(mid, code, message):
 def handle_message(msg):
     """Handle one JSON-RPC message; return a response dict, or None for
     notifications (and unknown notifications)."""
+    if not isinstance(msg, dict):
+        return _error(None, -32600, "request must be a JSON object")
     method = msg.get("method")
     mid = msg.get("id")
+    if (msg.get('jsonrpc') != '2.0' or not isinstance(method, str)
+            or isinstance(mid, bool) or not isinstance(mid, (str, int, type(None)))):
+        return _error(None, -32600, "invalid JSON-RPC request")
+    if 'id' not in msg:
+        return None
+    params = msg.get('params', {})
+    if not isinstance(params, dict):
+        return _error(mid, -32602, "params must be a JSON object")
 
     if method == "initialize":
-        ver = (msg.get("params") or {}).get("protocolVersion") or PROTOCOL_VERSION
+        requested = params.get('protocolVersion', PROTOCOL_VERSION)
+        if not isinstance(requested, str):
+            return _error(mid, -32602, "protocolVersion must be a string")
+        ver = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
         return _result(mid, {
             "protocolVersion": ver,
             "capabilities": {"tools": {"listChanged": False}},
@@ -541,8 +563,9 @@ def handle_message(msg):
         return _result(mid, {"tools": [
             {k: t[k] for k in ("name", "description", "inputSchema")} for t in TOOLS]})
     if method == "tools/call":
-        params = msg.get("params") or {}
-        name, args = params.get("name"), (params.get("arguments") or {})
+        name, args = params.get("name"), params.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(args, dict):
+            return _error(mid, -32602, "tools/call requires a name and object arguments")
         tool = next((t for t in TOOLS if t["name"] == name), None)
         if tool is None:
             return _error(mid, -32602, "unknown tool: %s" % name)
@@ -569,9 +592,10 @@ def serve(stdin=None, stdout=None):
             continue
         try:
             msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        resp = handle_message(msg)
+        except (json.JSONDecodeError, RecursionError):
+            resp = _error(None, -32700, "invalid JSON")
+        else:
+            resp = handle_message(msg)
         if resp is not None:
             stdout.write(json.dumps(resp) + "\n")
             stdout.flush()

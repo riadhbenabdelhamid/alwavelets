@@ -340,14 +340,21 @@ def _op_key(v, req):
 
 def _op_render(v, req):
     """Text render of what the viewer is showing right now."""
-    from .snapshot import render_text
+    from .snapshot import render_signal_rows
     width = int(req.get("width", 100) or 100)
     width = max(20, min(400, width))
-    sigs = [s for s in v.display_order if v.get_signal(s)]
-    names = [v.get_signal(s).full_name for s in sigs]
-    if not names:
-        return {"ok": True, "text": "(no signals displayed)"}
-    text = render_text(v.vcd, names, v.time_start, v.time_end, width=width)
+    v._rebuild_view_rows()
+    visible = v.view_rows[v.sig_offset:v.sig_offset + v.visible_signals]
+    rows = []
+    for sid in visible:
+        if not isinstance(sid, str):
+            continue
+        sig = v.get_signal(sid)
+        if sig is not None:
+            rows.append((sig, v.get_signal_radix(sid),
+                         sid in v.analog_signals or sig.analog_mode))
+    text = render_signal_rows(v.vcd, rows, v.time_start, v.time_end, width=width,
+                              wave_style=getattr(v, 'line_thickness', 1))
     return {"ok": True, "text": text,
             "window": [v.time_start, v.time_end]}
 

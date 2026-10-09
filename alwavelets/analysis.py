@@ -3,6 +3,34 @@ detection and switching-activity (power) estimation."""
 import bisect
 import re
 
+from .core import ensure_trace_loaded, numeric_value
+
+
+def compare_signal_ranges(a, b, start, end):
+    """Mismatch intervals on a shared time axis, restricted to trace coverage."""
+    if end <= start:
+        return []
+    times = sorted({start, end} | {t for t in a._times if start < t < end}
+                   | {t for t in b._times if start < t < end})
+
+    def value(sig, t):
+        raw = sig.value_at(t)
+        number = numeric_value(raw, sig.signal_type)
+        if number is not None:
+            return number
+        raw = raw.lower()
+        return raw.rjust(sig.size, raw[0] if raw[:1] in ('x', 'z') else '0')
+
+    ranges, begin = [], None
+    for t in times:
+        differs = t < end and value(a, t) != value(b, t)
+        if differs and begin is None:
+            begin = t
+        elif not differs and begin is not None:
+            ranges.append((begin, t))
+            begin = None
+    return ranges
+
 
 # ══════════════════════════════════════════════════════════════
 #  FEATURE 2: FORMAL VERIFICATION COUNTEREXAMPLE
@@ -33,6 +61,7 @@ class FormalAnalyzer:
         return found
 
     def find_failure_time(self):
+        ensure_trace_loaded(self.vcd)
         if not self.assertion_signals:
             self.detect_assertion_signals()
         earliest = None
@@ -94,6 +123,7 @@ class PowerEstimator:
         self.signal_activity = {}
 
     def compute(self, t_start, t_end):
+        ensure_trace_loaded(self.vcd, t_start, t_end)
         self.scope_activity = {}
         self.signal_activity = {}
         span = max(1, t_end - t_start)
@@ -139,7 +169,7 @@ def find_anomalies(signals, t_start, t_end, max_pulse=None, limit=10000):
     for sig in signals:
         if sig is None:
             continue
-        scalar = (sig.size == 1 and sig.signal_type != "real")
+        scalar = (sig.size == 1 and sig.signal_type not in ('real', 'realtime'))
         thr = max_pulse
         if thr is None:
             period = sig.detect_frequency()[0] if scalar else None
@@ -188,7 +218,7 @@ def measure_signal(sig, t_start, t_end):
         return out
     times, values = sig.changes_in_window(t_start, t_end)
 
-    if getattr(sig, 'size', 1) == 1 and getattr(sig, 'signal_type', 'wire') != 'real':
+    if getattr(sig, 'size', 1) == 1 and getattr(sig, 'signal_type', 'wire') not in ('real', 'realtime'):
         rises = []
         high_time = 0
         # Baseline = the value just BEFORE the window (the one-before entry
@@ -218,12 +248,8 @@ def measure_signal(sig, t_start, t_end):
                 out['period'] = period
                 out['cycles'] = len(rises) - 1
     else:
-        vals = []
-        for v in values:
-            try:
-                vals.append(int(v, 2) if set(v) <= {'0', '1'} else float(v))
-            except (ValueError, TypeError):
-                pass
+        vals = [numeric_value(v, sig.signal_type) for v in values]
+        vals = [v for v in vals if v is not None]
         if vals:
             out['min'], out['max'] = min(vals), max(vals)
     return out

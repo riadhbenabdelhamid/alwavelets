@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from fractions import Fraction
 
 from .core import *  # noqa: F401,F403
 from .rendering import *  # noqa: F401,F403
@@ -16,6 +17,7 @@ from .decoders import *  # noqa: F401,F403
 from .parsers import *  # noqa: F401,F403
 from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
+from .persistence import _write_json_atomic
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .finder import FinderMixin
@@ -24,7 +26,7 @@ from .ui_tree import TreePanelMixin
 from .ui_export import ExportMixin
 from .ui_commands import CommandLineMixin
 from .ui_keymap import KeymapMixin
-from .ui_debug import DebugActionsMixin
+from .ui_debug import DebugActionsMixin, load_analysis_data
 from .ui_drawing import DrawingMixin
 
 
@@ -1339,6 +1341,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def do_pattern_search(self):
         """Interactive pattern/trigger search: find when conditions meet."""
+        if not load_analysis_data(self):
+            return
         # Prompt for conditions: "signal=value [AND signal=value]"
         inp = self.prompt_input("Trigger (sig=val [AND sig=val]): ")
         if not inp:
@@ -1410,9 +1414,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 for sig_id in visible:
                     sig = self.get_signal(sig_id)
                     name = sig.full_name[:20].ljust(20)
-                    val = format_value(sig.value_at(self.cursor_time), self.radix, sig.size)
+                    val = format_typed_value(sig, sig.value_at(self.cursor_time), self.radix)
 
-                    if sig.size == 1 and sig.signal_type != "real":
+                    if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
                         chars, _ = draw_single_bit_culled(sig, self.time_start, self.time_end, 60)
                     elif sig_id in self.analog_signals or sig.analog_mode:
                         chars, _ = draw_analog_culled(sig, self.time_start, self.time_end, 60)
@@ -1436,6 +1440,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         if not fname.endswith('.json'):
             fname += '.json'
         data = {
+            'version': 2,
+            'signal_identities': signal_identities(self.vcd, view_reference_ids(self)),
             'display_order': self.display_order,
             'analog_signals': list(self.analog_signals),
             'collapsed_scopes': list(self.collapsed_scopes),
@@ -1447,8 +1453,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             'markers': [{'time': m.time, 'label': m.label} for m in self.markers],
         }
         try:
-            with open(fname, 'w') as f:
-                json.dump(data, f, indent=2)
+            _write_json_atomic(fname, data)
             self._show_message(f"Arrangement saved → {fname}")
         except Exception as e:
             self._show_message(f"Save error: {e}")
@@ -1459,6 +1464,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         try:
             with open(fname) as f:
                 data = json.load(f)
+            data, missing = remap_view_state(self.vcd, data)
             # Validate signal IDs exist
             valid_ids = set(self.vcd.signal_order)
             self.display_order = [s for s in data.get('display_order', []) if s in valid_ids]
@@ -1479,7 +1485,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self.radix = next((r for r in Radix if r.value == radix_val), Radix.HEX)
             self.selected_signals = set(s for s in data.get('selected_signals', []) if s in valid_ids)
             self.markers = [Marker(m['time'], m.get('label', '')) for m in data.get('markers', [])]
-            self._show_message(f"Arrangement loaded ← {fname}")
+            self._show_message(f"Arrangement loaded ← {fname}" +
+                               (f" ({missing} unresolved signal(s))" if missing else ""))
         except FileNotFoundError:
             self._show_message(f"File not found: {fname}")
         except Exception as e:
@@ -1505,7 +1512,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         layout (order/groups/analog/heights/colors), radixes, markers, and
         the view (zoom window, cursors, display knobs)."""
         return {
-            'version': 1,
+            'version': 2,
+            'signal_identities': signal_identities(self.vcd, view_reference_ids(self)),
             'display_order': self.display_order,
             'groups': [{'name': g['name'], 'members': sorted(g['members']),
                         'collapsed': g['collapsed'], 'parent': g.get('parent')}
@@ -1536,8 +1544,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             return
         path = self.session_path(src)
         try:
-            with open(path, 'w') as f:
-                json.dump(self._session_state(), f, indent=2)
+            _write_json_atomic(path, self._session_state())
             self._show_message(f"Session saved → {os.path.basename(path)} (auto-restores)")
         except Exception as e:
             self._show_message(f"Session save error: {e}")
@@ -1569,9 +1576,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         except (OSError, ValueError):
             return False
         try:
+            data, missing = remap_view_state(self.vcd, data)
             valid = set(self.vcd.signal_order)
             order = [s for s in data.get('display_order', []) if s in valid]
-            if order:
+            if order or data.get('version') == 2:
                 self.display_order = order
             self.analog_signals = {s for s in data.get('analog_signals', []) if s in valid}
             self.collapsed_scopes = set(data.get('collapsed_scopes', []))
@@ -1592,25 +1600,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                               if k in valid}
             self.sig_height = {k: int(v) for k, v in data.get('sig_height', {}).items()
                                if k in valid}
-            # Clamp everything time-valued to this trace's extent: the file
-            # may have been regenerated shorter since the session was saved,
-            # and an out-of-range window opens on a blank screen with no clue
-            # why. (_reload_preserving_view clamps the same way.)
-            mx = self.vcd.max_time if self.vcd.max_time > 0 else 0
-            self.markers = [Marker(min(int(m['time']), mx), m.get('label', ''))
-                            for m in data.get('markers', [])]
-            view = data.get('view')
-            if isinstance(view, list) and len(view) == 2 and view[1] > view[0]:
-                ts, te = max(0, min(int(view[0]), mx)), min(int(view[1]), mx)
-                if te > ts:
-                    self.time_start, self.time_end = ts, te
-                else:                       # window is entirely past the end
-                    self.time_start, self.time_end = 0, mx
-            cur = data.get('cursors')
-            if isinstance(cur, list) and len(cur) == 3:
-                self.cursor_a = min(int(cur[0]), mx)
-                self.cursor_b = min(int(cur[1]), mx)
-                self.cursor_b_on = bool(cur[2])
+            apply_session_times(self, data)
             if 'name_width' in data:
                 self.name_width = max(8, int(data['name_width']))
                 self._name_width_manual = True
@@ -1632,7 +1622,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self._sync_display_set()
             self._rebuild_view_rows()
             self.update_layout()
-            self._show_message("Session restored  (;session clear to forget it)")
+            self._show_message("Session restored  (;session clear to forget it)" +
+                               (f" — {missing} unresolved signal(s)" if missing else ""))
             return True
         except Exception:
             return False    # stale/corrupt sidecar: open normally
@@ -1700,7 +1691,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             return translated
         # Per-signal radix
         radix = self.get_signal_radix(sig_id)
-        return format_value(val, radix, sig.size)
+        return format_typed_value(sig, val, radix)
 
     # ── Tree Browser ──
 
@@ -1914,6 +1905,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def setup_spi_decode(self):
         """Interactive SPI decode setup."""
+        if not load_analysis_data(self, self.time_start, self.time_end):
+            return
         clk_name = self.prompt_input("SPI CLK signal name: ")
         mosi_name = self.prompt_input("SPI MOSI signal name: ")
         if not clk_name or not mosi_name:
@@ -1937,6 +1930,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def setup_i2c_decode(self):
         """Interactive I2C decode setup."""
+        if not load_analysis_data(self, self.time_start, self.time_end):
+            return
         sda_name = self.prompt_input("I2C SDA signal name: ")
         scl_name = self.prompt_input("I2C SCL signal name: ")
         if not sda_name or not scl_name:
@@ -1956,6 +1951,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def setup_uart_decode(self):
         """Interactive UART decode setup."""
+        if not load_analysis_data(self, self.time_start, self.time_end):
+            return
         tx_name = self.prompt_input("UART TX/RX signal name: ")
         baud_str = self.prompt_input("Baud period (ticks, e.g. 104 for 9600@1MHz): ")
         if not tx_name or not baud_str:
@@ -2408,6 +2405,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             pass
 
     def do_find_value(self):
+        if not load_analysis_data(self):
+            return
         sid = self.focused_signal_id()
         if not sid:
             return
@@ -2476,31 +2475,40 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         if not fname:
             return
         try:
-            diff_vcd = VCDFile.parse(fname)
+            self.vcd.require_loaded()
+            diff_vcd = parse_file(fname)
         except Exception as e:
             self._show_message(f"Diff load error: {e}")
             return
 
         self.diff_vcd = diff_vcd
         self.diff_ranges = {}
+        ratio = Fraction(diff_vcd.tick_fs, self.vcd.tick_fs)
+        self._diff_start = max(self.vcd.min_time, diff_vcd.min_time * ratio)
+        self._diff_end = min(self.vcd.max_time, diff_vcd.max_time * ratio)
 
         # Build signal name → diff signal mapping
         self.diff_sig_map = {}  # sid_in_A -> VCDSignal_in_B
 
         matched = 0
         differing = 0
+        by_full, by_name = {}, {}
+        for dsig in diff_vcd.signals.values():
+            by_full.setdefault(dsig.full_name, []).append(dsig)
+            by_name.setdefault(dsig.name, []).append(dsig)
         for sid in self.vcd.signal_order:
             sig_a = self.vcd.signals.get(sid)
             if not sig_a:
                 continue
 
-            sig_b = None
-            for dsid, dsig in diff_vcd.signals.items():
-                if dsig.full_name == sig_a.full_name or dsig.name == sig_a.name:
-                    sig_b = dsig
-                    break
-            if not sig_b:
+            candidates = by_full.get(sig_a.full_name) or by_name.get(sig_a.name, [])
+            if len(candidates) != 1:
                 continue
+            sig_b = candidates[0]
+            if (sig_b.size, sig_b.signal_type) != (sig_a.size, sig_a.signal_type):
+                continue
+            if ratio != 1:
+                sig_b = TimeScaledSignal(sig_b, ratio)
             matched += 1
             self.diff_sig_map[sid] = sig_b
 
@@ -2512,33 +2520,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self._show_message(f"Split diff: {matched} matched, {differing} differ")
 
     def _compute_diff_ranges(self, sig_a, sig_b):
-        """Compare two signals and return list of (t_start, t_end) where they differ."""
-        # Merge all timestamps from both signals
-        all_times = sorted(set(sig_a._times) | set(sig_b._times))
-        if not all_times:
-            return []
-
-        ranges = []
-        diff_start = None
-
-        for t in all_times:
-            va = sig_a.value_at(t)
-            vb = sig_b.value_at(t)
-            values_differ = (va != vb)
-
-            if values_differ and diff_start is None:
-                diff_start = t
-            elif not values_differ and diff_start is not None:
-                ranges.append((diff_start, t))
-                diff_start = None
-
-        # Close open range at end
-        if diff_start is not None:
-            end_t = max(sig_a._times[-1] if sig_a._times else 0,
-                       sig_b._times[-1] if sig_b._times else 0)
-            ranges.append((diff_start, end_t))
-
-        return ranges
+        return compare_signal_ranges(sig_a, sig_b, self._diff_start, self._diff_end)
 
     def clear_diff(self):
         """Clear diff comparison."""
@@ -2621,6 +2603,12 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 # viewer mutation stays on this thread; latency is one
                 # halfdelay tick at worst.
                 if self.control is not None and self.control.pump():
+                    self._dirty = True
+
+                pending_times = getattr(self, '_pending_session_times', None)
+                if pending_times is not None and self.vcd._extent_known and not self.vcd.is_loading:
+                    apply_session_times(self, pending_times)
+                    self._needs_layout = True
                     self._dirty = True
 
                 if self._needs_layout:

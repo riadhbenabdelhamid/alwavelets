@@ -6,6 +6,7 @@ AHB). Everything operates on duck-typed signal objects; only the standard
 library is used beyond intra-module references.
 """
 import re
+from .core import ensure_trace_loaded
 
 
 # ══════════════════════════════════════════════════════════════
@@ -230,7 +231,7 @@ class UARTDecoder:
         half = baud // 2
         n_par = 1 if self.parity else 0
         frame_len = (1 + self.data_bits + n_par + self.stop_bits) * baud
-        t = t_start
+        t = t_start - 1
         while t < t_end:
             nxt = self.data.next_edge_after(t)
             if nxt is None or nxt >= t_end:
@@ -264,7 +265,8 @@ class UARTDecoder:
                 label = f"0x{val:02X}"
             frame_end = nxt + frame_len
             frames.append(DecodedFrame(nxt, min(frame_end, t_end), label, ' '.join(errs), 6))
-            t = frame_end
+            # The next start bit may coincide with the end of this stop bit.
+            t = frame_end - 1
         return frames
 
 
@@ -525,6 +527,7 @@ class InstructionTrace:
 
     def build(self, vcd, tags, decoder=None):
         """Build trace from VCD + tag store. Returns number of entries."""
+        ensure_trace_loaded(vcd)
         self.tags = tags
         self.decoder = decoder or RV32Decoder()
         self.entries = []
@@ -988,6 +991,7 @@ class _BusDecoder:
         return None
 
     def _sample_points(self, sigs, clock=None):
+        ensure_trace_loaded(self.vcd)
         clock = clock or self._clock()
         if clock is not None:
             edges = rising_edges(clock, 0, self.vcd.max_time)
@@ -1021,6 +1025,7 @@ class AXIDecoder(_BusDecoder):
     RESP_NAMES = {0: 'OKAY', 1: 'EXOKAY', 2: 'SLVERR', 3: 'DECERR'}
 
     def _hs(self, v, r, clk):
+        ensure_trace_loaded(self.vcd)
         return self._handshake_times(v, r, clk, self.vcd.max_time) if v and r else []
 
     def decode_writes(self):

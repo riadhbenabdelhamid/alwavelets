@@ -237,6 +237,11 @@ class CommandLineMixin:
         after the cursor (wrapping). Optional max_pulse overrides the per-signal
         auto threshold (~1/3 of the detected clock period)."""
         from .analysis import find_anomalies
+        try:
+            self.vcd.require_loaded()
+        except ValueError as exc:
+            self._show_message(str(exc))
+            return
         sigs = [s for s in (self.get_signal(i) for i in self.display_order) if s]
         if not sigs:
             self._show_message("No signals displayed to scan")
@@ -430,7 +435,7 @@ class CommandLineMixin:
         order, applied = [], 0
         for name, radix in data['signals']:
             base = _g.base_name(name)
-            sid = byfull.get(base) or byname.get(base) or byfull.get(name) or byname.get(name)
+            sid = byfull.get(name) or byname.get(name) or byfull.get(base) or byname.get(base)
             if sid:
                 order.append(sid)
                 if radix is not None:

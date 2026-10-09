@@ -121,6 +121,8 @@ def render_waveform_png(vcd, signals=None, t_start=None, t_end=None,
     t_end = vcd.max_time if t_end is None else parse_time(vcd, t_end)
     if t_end <= t_start:
         t_end = t_start + 1
+    from .core import ensure_trace_loaded
+    ensure_trace_loaded(vcd, t_start, t_end)
     sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
     indices, w, h = _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx)
     return png_encode(w, h, indices)
@@ -135,7 +137,7 @@ def _rasterise(vcd, sigs, t_start, t_end, width, row_h, rx):
         y0 = i * row_h
         yhi, ylo = y0 + 3, y0 + row_h - 4
         ymid = (yhi + ylo) // 2
-        if sig.size == 1 and getattr(sig, "signal_type", "wire") != "real":
+        if sig.size == 1 and getattr(sig, "signal_type", "wire") not in ('real', 'realtime'):
             prev_y = None
             for x in range(width):
                 v = sig.value_at(int(t_start + x * span / width))

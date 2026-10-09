@@ -102,6 +102,24 @@ integration, read the **[complete field guide](https://riadhbenabdelhamid.github
 — also in the repo at [`docs/index.html`](docs/index.html), self-contained and
 usable offline.
 
+Lazy views preserve the value entering a window and all changes at the same
+timestamp. Analysis commands load their requested interval before returning
+results; a whole-trace search can therefore load substantially more data than
+the visible window. Commands report when the initial background load is still
+in progress instead of searching incomplete data.
+
+New session and arrangement files identify signals by hierarchical reference,
+declared range, width, and type, so layouts survive regenerated VCD identifier
+codes. Missing or ambiguous references are reported. Older version-1 files
+remain readable using their original identifiers; save them again against the
+original trace to upgrade their references. Saved time positions are restored
+after background loading establishes the trace extent.
+
+Diff comparison normalizes both traces to the same time units and compares
+their overlapping time extent, including values held through the end of that
+interval. Separately declared bits and non-zero-based or ascending bus ranges
+retain their indices in signal names and expanded bit labels.
+
 ## Configuration
 
 An optional `~/.config/alwavelets/config.json` (or `$XDG_CONFIG_HOME`) sets
@@ -219,6 +237,7 @@ whenever an agent is connected and acting.
 | --- | --- |
 | `core` | Data structures (`VCDSignal`, `Radix`, …) and value formatting |
 | `parsers` | VCD parsing (sync / background / lazy / follow), scope tree, `parse_file` dispatcher |
+| `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `parallel` | Opt-in multi-process parsing of large VCDs (`--jobs N`) |

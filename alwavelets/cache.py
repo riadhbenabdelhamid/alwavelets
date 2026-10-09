@@ -19,7 +19,7 @@ from .core import VCDSignal, AliasSignal
 from .parsers import VCDFile, build_scope_tree
 
 _MAGIC = b'WLT1'
-_VERSION = 5      # v5: kind 3 = alias of an earlier signal (no storage of its own)
+_VERSION = 6      # declared signal ranges; invalidate old parser semantics
 _BO = 0 if sys.byteorder == 'little' else 1
 
 # Module-level switch so `--no-cache` can disable load + save in one place.
@@ -58,6 +58,9 @@ def save_cache(vcd, source):
         return False
     try:
         st = os.stat(source)
+        if (getattr(vcd, '_lazy_mode', False) or not vcd._extent_known
+                or getattr(vcd, '_parsed_offset', st.st_size) != st.st_size):
+            return False
         body = bytearray()
         _wstr(body, vcd.timescale)
         body += struct.pack('<i', vcd.timescale_number)
@@ -72,7 +75,8 @@ def save_cache(vcd, source):
         master_keys = {}
         for key, sig in vcd.signals.items():
             _wstr(body, key)
-            _wstr(body, sig.name)
+            _wstr(body, sig.reference)
+            _wstr(body, ','.join(map(str, sig.declared_range)) if sig.declared_range else '')
             _wstr(body, sig.identifier)
             _wstr(body, sig.signal_type)
             _wstr(body, sig.scope)
@@ -142,6 +146,7 @@ def load_cache(source):
         pos = 0
         vcd = VCDFile()
         vcd._filename = source
+        vcd._parsed_offset = st.st_size
         vcd.timescale, pos = _rstr(mv, pos)
         (vcd.timescale_number,) = struct.unpack_from('<i', mv, pos); pos += 4
         vcd.timescale_unit, pos = _rstr(mv, pos)
@@ -159,6 +164,8 @@ def load_cache(source):
         for _ in range(n_sig):
             key, pos = _rstr(mv, pos)
             name, pos = _rstr(mv, pos)
+            range_text, pos = _rstr(mv, pos)
+            declared_range = tuple(map(int, range_text.split(','))) if range_text else None
             ident, pos = _rstr(mv, pos)
             stype, pos = _rstr(mv, pos)
             scope, pos = _rstr(mv, pos)
@@ -167,9 +174,9 @@ def load_cache(source):
             if kind == 3:                        # alias of an earlier signal
                 mkey, pos = _rstr(mv, pos)
                 vcd.signals[key] = AliasSignal(name, ident, size, stype, scope,
-                                               vcd.signals[mkey])
+                                               vcd.signals[mkey], declared_range)
                 continue
-            sig = VCDSignal(name, ident, size, stype, scope)
+            sig = VCDSignal(name, ident, size, stype, scope, declared_range)
             t = array.array(tc.decode('ascii'))
             t.frombytes(mv[pos:pos + n * t.itemsize]); pos += n * t.itemsize
             sig._times = t

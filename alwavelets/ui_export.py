@@ -133,12 +133,12 @@ class ExportMixin:
             y_bot = y_base + row_h - 4
 
             # Name
-            val = format_value(sig.value_at(self.cursor_time), self.get_radix(sig_id), sig.size)
+            val = format_typed_value(sig, sig.value_at(self.cursor_time), self.get_radix(sig_id))
             lines.append(f'<text x="{margin}" y="{y_mid + 4}" class="sig-name">{xml_escape(sig.name)}</text>')
             lines.append(f'<text x="{margin + name_w - 40}" y="{y_mid + 4}" class="sig-val">{xml_escape(val)}</text>')
 
             # Waveform
-            if sig.size == 1 and sig.signal_type != "real":
+            if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
                 # Draw single bit as path
                 path_parts = []
                 for c in range(wave_w):
@@ -180,7 +180,7 @@ class ExportMixin:
                         if ti > 0:
                             lines.append(f'<line x1="{x1}" y1="{y_top}" x2="{x1}" y2="{y_bot}" class="edge"/>')
                         # Label
-                        lbl = format_value(v, self.get_radix(sig_id), sig.size)
+                        lbl = format_typed_value(sig, v, self.get_radix(sig_id))
                         if x2 - x1 > 20:
                             lines.append(f'<text x="{x1 + 3}" y="{y_mid + 4}" class="sig-val" font-size="9">{xml_escape(lbl)}</text>')
 

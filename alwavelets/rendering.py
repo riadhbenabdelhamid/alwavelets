@@ -3,7 +3,7 @@ character/attribute arrays (single-bit, bus, analog). No curses.
 """
 import bisect
 
-from .core import _B2S, format_value
+from .core import _B2S, format_typed_value
 
 
 # ══════════════════════════════════════════════════════════════
@@ -300,7 +300,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
         at = sig._times
         vstr = sig.value_str            # decodes packed bus storage
         prev = sig.value_at(t_start)
-        labels[0] = format_value(prev, radix, size)
+        labels[0] = format_typed_value(sig, prev, radix)
         inv_w = span / width
         for col in range(width):
             # Half-open [start, end) float boundaries — see draw_single_bit_culled.
@@ -312,7 +312,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
                 if hi - lo > 1 or last != prev:
                     chars[col], attrs[col] = CH_BUS_T, 1
                     if col + 1 < width:
-                        labels[col + 1] = format_value(last, radix, size)
+                        labels[col + 1] = format_typed_value(sig, last, radix)
                 else:
                     v = str(last)
                     if 'x' in v or 'X' in v: chars[col], attrs[col] = CH_X, 2
@@ -332,7 +332,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
     # Round half-up for consistent column spacing (see draw_single_bit_culled).
     trans = [(min(width - 1, int((t - t_start) * scale + 0.5)), v) for t, v in zip(times, values)]
     start_val = sig.value_at(t_start)
-    labels[0] = format_value(start_val, radix, size)
+    labels[0] = format_typed_value(sig, start_val, radix)
     cur = start_val
     ti = 0; nt = len(trans)
 
@@ -345,7 +345,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
         if edge:
             chars[col], attrs[col] = CH_BUS_T, 1
             if col + 1 < width:
-                labels[col + 1] = format_value(nxt, radix, size)
+                labels[col + 1] = format_typed_value(sig, nxt, radix)
         else:
             v = str(nxt)
             if any(c in v for c in 'xX'): chars[col], attrs[col] = CH_X, 2

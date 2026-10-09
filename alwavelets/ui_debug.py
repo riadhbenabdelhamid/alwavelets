@@ -16,6 +16,15 @@ from .manual import AlwaveletsManual  # noqa: F401
 
 
 
+def load_analysis_data(viewer, start=0, end=None):
+    try:
+        viewer.vcd.require_loaded(start, end)
+    except ValueError as exc:
+        viewer._show_message(str(exc))
+        return False
+    return True
+
+
 class DebugActionsMixin:
     def _tag_signal_at_cursor(self):
         """Tag the signal at tree cursor with an ISA role."""
@@ -93,6 +102,8 @@ class DebugActionsMixin:
 
     def _build_trace(self):
         """Build instruction trace from current tags."""
+        if not load_analysis_data(self):
+            return
         if not self.signal_tags.tags:
             # Try auto-detect
             n = self.signal_tags.auto_detect_roles(self.vcd)
@@ -335,6 +346,8 @@ class DebugActionsMixin:
     # ══ FEATURE 2: FORMAL CEX ══
 
     def analyze_formal_cex(self):
+        if not load_analysis_data(self):
+            return
         if not self.formal_analyzer:
             self.formal_analyzer = FormalAnalyzer(self.vcd)
         asserts = self.formal_analyzer.detect_assertion_signals()
@@ -368,6 +381,8 @@ class DebugActionsMixin:
     # ══ FEATURE 3: POWER ══
 
     def run_power_analysis(self):
+        if not load_analysis_data(self, self.time_start, self.time_end):
+            return
         if not self.power_est:
             self.power_est = PowerEstimator(self.vcd)
         self.power_est.compute(self.time_start, self.time_end)
@@ -389,6 +404,8 @@ class DebugActionsMixin:
         return bus_tags
 
     def decode_axi_transactions(self):
+        if not load_analysis_data(self):
+            return
         axi_tags = {k: v for k, v in self.signal_tags.tags.items() if k.startswith('axi.')}
         if not axi_tags:
             self._auto_tag_axi()
@@ -410,6 +427,8 @@ class DebugActionsMixin:
             self._show_message(f"{len(txns)} AXI txns ({min(len(txns),50)} markers)")
 
     def decode_wishbone(self):
+        if not load_analysis_data(self):
+            return
         wb_tags = {k: v for k, v in self.signal_tags.tags.items() if k.startswith('wb.')}
         if not wb_tags:
             self._auto_tag_wishbone()
@@ -430,6 +449,8 @@ class DebugActionsMixin:
             self._show_message("No Wishbone transactions")
 
     def decode_ahb(self):
+        if not load_analysis_data(self):
+            return
         ahb_tags = {k: v for k, v in self.signal_tags.tags.items() if k.startswith('ahb.')}
         if not ahb_tags:
             self._show_message("No AHB tags. Tag ahb.hready, ahb.htrans, ahb.haddr, ...")

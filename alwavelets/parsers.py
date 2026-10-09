@@ -8,11 +8,12 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 from collections import OrderedDict
 
-from .core import VCDSignal, AliasSignal, clear_pack_memos
+from .core import VCDSignal, AliasSignal, clear_pack_memos, split_reference
+from .core import _S2B
+from .value_stream import ValueState, states_at_offsets
 from .fst import FSTReader  # noqa: F401  (re-exported; the reader lives in fst.py)
 
 # First byte of a scalar value-change line -> normalised value byte for the
@@ -33,13 +34,15 @@ def _declare_var(vcd, parts, scope):
     AliasSignal sharing the first declaration's storage instead of being
     silently dropped. Alias keys contain a space, which an id never does."""
     sig_id, size, stype, name = parts[3], _safe_int(parts[2]), parts[1], parts[4]
+    reference = ' '.join(parts[4:]).split('$end', 1)[0].strip()
+    name, declared_range = split_reference(reference)
     master = vcd.signals.get(sig_id)
     if master is None:
-        vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope)
+        vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope, declared_range)
         vcd.signal_order.append(sig_id)
-    elif master.full_name != (f"{scope}.{name}" if scope else name):
+    elif (master.reference, master.scope, master.declared_range) != (name, scope, declared_range):
         key = f"{sig_id} #{len(vcd.signal_order)}"
-        vcd.signals[key] = AliasSignal(name, sig_id, size, stype, scope, master)
+        vcd.signals[key] = AliasSignal(name, sig_id, size, stype, scope, master, declared_range)
         vcd.signal_order.append(key)
 
 
@@ -275,6 +278,7 @@ class VCDFile:
         self.max_time = 0
         self.min_time = 0
         self._filename = ""
+        self._extent_known = True
         self.scopes = None  # ScopeNode tree, built after parse
 
         # ── Background loading state ──
@@ -295,6 +299,12 @@ class VCDFile:
     @property
     def is_loading(self):
         return self._loading
+
+    @property
+    def tick_fs(self):
+        return self.timescale_number * {'fs': 1, 'ps': 1000, 'ns': 1000000,
+                                       'us': 1000000000, 'ms': 1000000000000,
+                                       's': 1000000000000000}[self.timescale_unit]
 
     @property
     def load_progress(self):
@@ -327,6 +337,7 @@ class VCDFile:
         """Parse VCD header only. Returns (vcd, values_offset)."""
         vcd = VCDFile()
         vcd._filename = filename
+        vcd._extent_known = False
         scope_stack = []
         current_scope = ""
 
@@ -362,6 +373,8 @@ class VCDFile:
                         _declare_var(vcd, parts, current_scope)
                 elif line.startswith('$enddefinitions'):
                     break
+                elif line.startswith('$comment'):
+                    _extract_block(line, '$comment', _TextWrapper(f))
                 elif line.startswith('$date'):
                     vcd.date = _extract_block(line, '$date', _TextWrapper(f))
                 elif line.startswith('$version'):
@@ -374,141 +387,86 @@ class VCDFile:
 
     # ══ Phase 2a: Background full value parse ══
 
+    def _append_event(self, bid, value, time):
+        if bid is None:
+            for sig in self.signals.values():
+                if sig.owns_storage:
+                    sig.add_change(time, 'x')
+            return sum(s.owns_storage for s in self.signals.values())
+        sig = self._value_signals.get(bid)
+        if sig is None:
+            return 0
+        sig.add_change(time, value[-1:].lower() if sig._scalar else value)
+        return 1
+
+    def _read_values(self, offset, progress_cb=None):
+        self._value_signals = {k.encode('ascii'): s for k, s in self.signals.items()
+                               if s.owns_storage}
+        state = ValueState()
+        feed = state.feed
+        bget = self._value_signals.get
+        scalar_value = _S2B.get
+        logic = _BITBYTE
+        size = os.path.getsize(self._filename)
+        pos, reported, changes = offset, offset, 0
+        with open(self._filename, 'rb', buffering=1 << 20) as f:
+            f.seek(offset)
+            for raw in f:
+                pos += len(raw)
+                # Scalar lines cannot alter directive state. Avoid creating
+                # an intermediate event/string on this common storage path.
+                c = raw[0]
+                if c in logic and state.dump and not state.comment:
+                    sig = bget(raw[1:].strip())
+                    if sig is not None:
+                        if sig._scalar:
+                            sig._values.append(logic[c])
+                        else:
+                            sig._append_value(chr(logic[c]))
+                        sig._times.append(state.time)
+                        changes += 1
+                    event = None
+                else:
+                    event = feed(raw)
+                if event is not None:
+                    bid, value = event
+                    if bid is None:
+                        changes += self._append_event(bid, value, state.time)
+                    else:
+                        sig = bget(bid)
+                        if sig is not None:
+                            if sig._scalar:
+                                sig._values.append(scalar_value(value if len(value) == 1 else value[-1:], 120))
+                            else:
+                                sig._append_value(value)
+                            sig._times.append(state.time)
+                            changes += 1
+                if pos - reported >= 1 << 20:
+                    self.max_time = state.max_time
+                    reported = pos
+                    self._load_progress = min(99, pos * 100 // max(1, size))
+                    self._load_changes = changes
+                    if progress_cb:
+                        progress_cb(pos, size)
+        if not state.monotonic:
+            for sig in self.signals.values():
+                if sig.owns_storage:
+                    sig._sort_by_time()
+        self._parsed_offset = pos
+        self.max_time = state.max_time
+        self._value_state = state
+        self._extent_known = True
+        self._load_changes = changes
+        self._load_progress = 100
+        _compact_times(self)
+        if progress_cb:
+            progress_cb(pos, size)
+
     def _parse_values_background(self, offset):
-        """Parse all value changes from offset. Runs in background thread.
-
-        Hot path is lock-free: the reader never takes _load_lock, and VCDSignal
-        appends values before times, so a concurrent bisect reader always sees a
-        consistent prefix (see VCDSignal.add_change). It also keys signals by
-        bytes (no per-change decode) and inlines the appends — together this is
-        several times faster than the locked/decoded per-change path it replaces.
-        """
         try:
-            file_size = os.path.getsize(self._filename)
-            signals = self.signals
-            # Bytes-keyed view of the id->signal map so the hot loop never has to
-            # decode the signal id of every value change.
-            bget = {k.encode('ascii'): v for k, v in signals.items()}.get
-            bitbyte = _BITBYTE
-            current_time = 0
-            dump_active = True
-            bytes_read = offset
-            changes = 0
-            time_index = []
-            ti_append = time_index.append
-
-            with open(self._filename, 'rb', buffering=1 << 20) as f:
-                f.seek(offset)
-                for raw_line in f:
-                    bytes_read += len(raw_line)
-                    c0 = raw_line[0]
-
-                    # ── scalar value change (overwhelmingly the common case) ──
-                    if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
-                        if dump_active:
-                            sig = bget(raw_line[1:].rstrip())
-                            if sig is not None:
-                                sig._values.append(bitbyte[c0])  # bytearray; values before times
-                                sig._times.append(current_time)
-                                changes += 1
-                        continue
-
-                    # ── timestamp ──
-                    if c0 == 35:  # b'#'
-                        try:
-                            current_time = int(raw_line[1:])
-                            if current_time > self.max_time:
-                                self.max_time = current_time
-                            if not time_index or bytes_read - time_index[-1][1] > 100000:
-                                ti_append((current_time, f.tell() - len(raw_line)))
-                                if file_size > 0:
-                                    self._load_progress = min(99, bytes_read * 100 // file_size)
-                                    self._load_changes = changes
-                        except ValueError:
-                            pass
-                        continue
-
-                    # ── vector (bus) value change ──
-                    if c0 == 98 or c0 == 66:  # b'b' / b'B'
-                        if dump_active:
-                            sp = raw_line.find(32, 1)
-                            if sp > 0:
-                                sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None:
-                                    if sig._scalar:
-                                        # 'b1 !' for a 1-bit var (GHDL, xsim,
-                                        # cocotb write one-element vectors so)
-                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
-                                    else:                  # vector -> packed/list store
-                                        v = raw_line[1:sp].decode('ascii', 'ignore')
-                                        sig._append_value(v)   # values before times (contract)
-                                    sig._times.append(current_time)
-                                    changes += 1
-                        continue
-
-                    # ── real value change ──
-                    if c0 == 114 or c0 == 82:  # b'r' / b'R'
-                        if dump_active:
-                            sp = raw_line.find(32, 1)
-                            if sp > 0:
-                                sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None and not sig._scalar:
-                                    v = raw_line[1:sp].decode('ascii', 'ignore')
-                                    sig._append_value(v)   # reals stay strings
-                                    sig._times.append(current_time)
-                                    changes += 1
-                        continue
-
-                    # ── directives ($dumpvars/off/on, $comment, $end) ──
-                    if c0 == 36:  # b'$'
-                        line = raw_line.decode('ascii', errors='ignore').strip()
-                        if line.startswith('$dumpoff'):
-                            dump_active = False
-                            for sig in signals.values():
-                                if sig.owns_storage:
-                                    sig.add_change(current_time, 'x')  # type-aware append
-                                    changes += 1
-                        elif line.startswith('$dumpon'):
-                            dump_active = True
-                        elif line.startswith('$comment'):
-                            if '$end' not in line:
-                                for cont in f:
-                                    bytes_read += len(cont)
-                                    if b'$end' in cont:
-                                        break
-                        continue
-
-            self._time_index = time_index
-
-            # Repair out-of-order timestamps (e.g. $dumpoff/$dumpon regions).
-            # Scan the WHOLE array — disorder can appear anywhere, not just in
-            # the first 100 entries — and rebind _values before _times to keep
-            # the lock-free-read contract (see VCDSignal.add_change).
-            for sig in signals.values():
-                if not sig.owns_storage:
-                    continue
-                t = sig._times
-                if len(t) < 2:
-                    continue
-                prev = t[0]
-                out_of_order = False
-                for cur in t:
-                    if cur < prev:
-                        out_of_order = True
-                        break
-                    prev = cur
-                if out_of_order:
-                    sig._sort_by_time()   # storage-aware (scalar/packed/list)
-
-            self._load_changes = changes
-            self._load_progress = 100
-            _compact_times(self)     # 64-bit -> 32-bit timestamps when they fit
-            # Persist a parse cache so the next open of this file is instant.
-            try:
-                from . import cache
-                cache.save_cache(self, self._filename)
-            except Exception:
-                pass
+            self._read_values(offset)
+            from . import cache
+            cache.save_cache(self, self._filename)
         except Exception as e:
             self._load_error = str(e)
         finally:
@@ -516,47 +474,73 @@ class VCDFile:
 
     # ══ Phase 2b: Lazy time index build (for huge files) ══
 
-    # One index entry at most every this many bytes: a chunk request then
-    # over-reads by at most this much on each side, while the index stays
-    # tens of thousands of entries for a multi-GB trace instead of one tuple
-    # per '#' line (which was ~100 bytes of Python objects per timestamp).
+    # Sparse timestamp boundaries keep the index small on multi-GB traces.
+    # Cold windows may scan earlier blocks to recover held signal values.
     _INDEX_STRIDE = 64 * 1024
 
     def _build_time_index(self, offset):
-        """Fast scan: read only timestamps to build time->offset index."""
-        file_size = os.path.getsize(self._filename)
-        time_index = []
-        stride = self._INDEX_STRIDE
-        last_indexed = -stride
-        n_lines = 0
+        """Index timestamp boundaries and the directive state at each one.
+
+        First-change times let a cold window find predecessor values without
+        searching for signals that have never changed. No values are retained.
+        """
+        size = os.path.getsize(self._filename)
+        state = ValueState()
+        index = [(0, offset)]
+        states = {offset: state.snapshot()}
+        first = {}
+        masters = {k.encode('ascii') for k, s in self.signals.items() if s.owns_storage}
+        pos = last_indexed = reported = offset
+        disorder = False
         try:
             with open(self._filename, 'rb', buffering=1 << 20) as f:
                 f.seek(offset)
-                pos = offset
-                for raw_line in f:
-                    if raw_line[0:1] == b'#':
-                        try:
-                            t = int(raw_line[1:])
-                            if t > self.max_time:
-                                self.max_time = t
-                            if pos - last_indexed >= stride:
-                                time_index.append((t, pos))
-                                last_indexed = pos
-                        except ValueError:
-                            pass
-                        n_lines += 1
-                        if n_lines % 10000 == 0 and file_size > 0:
-                            self._load_progress = min(99, pos * 100 // file_size)
-                    pos += len(raw_line)
-            self._time_index = time_index
-            self._ti_times = [t for t, _ in time_index]
+                for raw in f:
+                    before = state.snapshot()
+                    event = state.feed(raw)
+                    if not before[2] and raw.lstrip().startswith(b'#'):
+                        disorder |= state.time < before[0]
+                        if pos - last_indexed >= self._INDEX_STRIDE and state.time > before[0]:
+                            index.append((state.time, pos))
+                            states[pos] = before
+                            last_indexed = pos
+                        self.max_time = state.max_time
+                    if event is not None:
+                        bid, _ = event
+                        if bid is None:
+                            for key in masters:
+                                first.setdefault(key, state.time)
+                        elif bid in masters:
+                            first.setdefault(bid, state.time)
+                    pos += len(raw)
+                    if pos - reported >= 1 << 20:
+                        reported = pos
+                        self._load_progress = min(99, pos * 100 // max(1, size))
+            if disorder:
+                # Bisect indexes require monotonic timestamps. The full
+                # reader can repair malformed out-of-order traces safely.
+                self._read_values(offset)
+                return
+            self._time_index = index
+            self._ti_times = [t for t, _ in index]
+            self._index_states = states
+            self._first_changes = first
             self._lazy_mode = True
             self._loaded_ranges = []
+            self._extent_known = True
             self._load_progress = 100
         except Exception as e:
             self._load_error = str(e)
         finally:
             self._loading = False
+
+    def require_loaded(self, t_start=0, t_end=None):
+        """Ensure an analysis interval is complete, or explain why it is not."""
+        if self.is_loading or not self._extent_known:
+            raise ValueError("Trace is still loading; retry the analysis when loading finishes")
+        if self._load_error:
+            raise ValueError("Trace loading failed: " + self._load_error)
+        self.ensure_loaded(t_start, self.max_time if t_end is None else t_end)
 
     def ensure_loaded(self, t_start, t_end):
         """Ensure value changes in [t_start, t_end] are loaded into memory.
@@ -706,72 +690,58 @@ class VCDFile:
             sig._times = mt
 
     def _parse_chunk(self, start_offset, end_offset, t_start, t_end):
-        """Parse value changes in a file range, returning {sig_id: (times, values)}
-        for changes within [t_start, t_end]. Does not mutate signals directly."""
-        signals = self.signals
-        # Bytes-keyed membership + result so the hot loop avoids decoding the id
-        # of every change; the keys are decoded once at return (per signal).
-        valid = {k.encode('ascii') for k in signals}
-        scalar_ids = {k.encode('ascii') for k, s in signals.items() if s._scalar}
-        bitbyte = _BITBYTE
-        _intern = sys.intern
-        result = {}
-        rget = result.get
-        current_time = 0
-        in_range = False
+        """Load complete timestamp groups and the predecessor of each signal.
 
-        with open(self._filename, 'rb', buffering=1 << 20) as f:
-            f.seek(start_offset)
-            bytes_to_read = end_offset - start_offset
-            bytes_read = 0
-            for raw_line in f:
-                bytes_read += len(raw_line)
-                if bytes_read > bytes_to_read + 10000:
-                    break
-                c0 = raw_line[0]
-                if c0 == 35:  # b'#'
-                    try:
-                        current_time = int(raw_line[1:])
-                        in_range = t_start <= current_time <= t_end
-                    except ValueError:
-                        pass
-                    continue
-                if not in_range:
-                    continue
-                if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
-                    bid = raw_line[1:].rstrip()
-                    if bid in valid:
-                        tv = rget(bid)
-                        if tv is None:
-                            tv = result[bid] = ([], [])
-                        if not tv[0] or tv[0][-1] != current_time:
-                            tv[0].append(current_time); tv[1].append(bitbyte[c0])
-                elif c0 == 98 or c0 == 66:
-                    sp = raw_line.find(32, 1)
-                    if sp > 0:
-                        bid = raw_line[sp + 1:].rstrip()
-                        if bid in valid:
-                            tv = rget(bid)
-                            if tv is None:
-                                tv = result[bid] = ([], [])
-                            if not tv[0] or tv[0][-1] != current_time:
-                                tv[0].append(current_time)
-                                if scalar_ids is not None and bid in scalar_ids:
-                                    tv[1].append(bitbyte.get(raw_line[sp - 1], 120))
-                                else:
-                                    tv[1].append(_intern(raw_line[1:sp].decode('ascii', 'ignore')))
-                elif c0 == 114 or c0 == 82:
-                    sp = raw_line.find(32, 1)
-                    if sp > 0:
-                        bid = raw_line[sp + 1:].rstrip()
-                        if bid in valid:
-                            tv = rget(bid)
-                            if tv is None:
-                                tv = result[bid] = ([], [])
-                            if not tv[0] or tv[0][-1] != current_time:
-                                tv[0].append(current_time)
-                                tv[1].append(_intern(raw_line[1:sp].decode('ascii', 'ignore')))
-        return {k.decode('ascii', 'ignore'): v for k, v in result.items()}
+        Cold seeks walk earlier index blocks only for unresolved predecessors.
+        A baseline retains the entire last timestamp group, so an overlapping
+        load cannot erase delta-cycle events or change their order.
+        """
+        masters = {k.encode('ascii'): s for k, s in self.signals.items() if s.owns_storage}
+        result = {}
+
+        def read_range(start, end, wanted):
+            state = ValueState(*self._index_states[start])
+            found = {}
+            with open(self._filename, 'rb', buffering=1 << 20) as f:
+                f.seek(start)
+                pos = start
+                while pos < end:
+                    raw = f.readline()
+                    if not raw:
+                        break
+                    pos += len(raw)
+                    event = state.feed(raw)
+                    if event is None or state.time > t_end:
+                        continue
+                    bid, value = event
+                    keys = wanted if bid is None else (bid,)
+                    for key in keys:
+                        if key not in wanted:
+                            continue
+                        ts, vs = found.setdefault(key, ([], []))
+                        if state.time < t_start and ts and ts[-1] != state.time:
+                            ts.clear()
+                            vs.clear()
+                        ts.append(state.time)
+                        vs.append(_BITBYTE.get(ord(value[-1:]) if value else 120, 120)
+                                  if masters[key]._scalar else value)
+            return found
+
+        result.update(read_range(start_offset, end_offset, masters))
+        missing = {k for k, t in self._first_changes.items() if t < t_start
+                   and (k not in result or result[k][0][0] >= t_start)}
+        offsets = [off for _, off in self._time_index]
+        block = bisect.bisect_left(offsets, start_offset)
+        while missing and block > 0:
+            older = read_range(offsets[block - 1], offsets[block], missing)
+            for key, (ts, vs) in older.items():
+                if key in result:
+                    result[key] = (ts + result[key][0], vs + result[key][1])
+                else:
+                    result[key] = (ts, vs)
+            missing.difference_update(older)
+            block -= 1
+        return {k.decode('ascii'): v for k, v in result.items()}
 
     # ══ Combined: choose strategy based on file size ══
 
@@ -791,16 +761,17 @@ class VCDFile:
     # ══ Live 'follow' mode: incrementally tail appended value changes ══
 
     def start_follow(self):
-        """Arm incremental tailing from the current end of the file."""
-        try:
-            self._tail_offset = os.path.getsize(self._filename)
-        except OSError:
-            self._tail_offset = 0
-        self._tail_time = self.max_time
-        self._tail_dump = True
-        self._tail_bget = {k.encode('ascii'): v for k, v in self.signals.items()}.get
-        # _compact_times may have narrowed timestamps to 32 bits; a live sim
-        # can run past that, so tail() widens them back the moment it has to.
+        """Resume after the bytes actually parsed, carrying directive state."""
+        size = os.path.getsize(self._filename)
+        self._tail_offset = getattr(self, '_parsed_offset', size)
+        state = getattr(self, '_value_state', None)
+        if state is None:
+            _, offset = self.parse_header(self._filename)
+            state = ValueState(*states_at_offsets(self._filename, offset,
+                                                  [self._tail_offset])[self._tail_offset])
+        self._tail_state = ValueState(*state.snapshot())
+        self._value_signals = {k.encode('ascii'): s for k, s in self.signals.items()
+                               if s.owns_storage}
         self._tail_narrow = any(s.owns_storage and s._times.typecode == 'i'
                                 for s in self.signals.values())
 
@@ -823,248 +794,38 @@ class VCDFile:
                 del vals[want:]
 
     def tail(self):
-        """Parse value changes appended since the last tail()/start_follow().
-
-        Reads only the new bytes (up to the last complete line), appends changes
-        to the existing signals (lock-free: values before times), advances
-        max_time, and returns the number of new changes. New signals can't appear
-        mid-stream in VCD, so only existing signals grow."""
-        if getattr(self, '_tail_offset', None) is None:
-            return 0
-        try:
-            size = os.path.getsize(self._filename)
-        except OSError:
-            return 0
-        if size <= self._tail_offset:
+        """Consume complete appended lines with the full reader's semantics."""
+        if self._tail_offset is None:
             return 0
         with open(self._filename, 'rb') as f:
             f.seek(self._tail_offset)
-            data = f.read(size - self._tail_offset)
-        nl = data.rfind(b'\n')
-        if nl < 0:
-            return 0                       # no complete new line yet
-        consumed = nl + 1
-        bget = self._tail_bget
-        bitbyte = _BITBYTE
-        ct, dump, mx, changes = self._tail_time, self._tail_dump, self.max_time, 0
-        narrow = getattr(self, '_tail_narrow', False)
+            data = f.read()
+        consumed = data.rfind(b'\n') + 1
+        if not consumed:
+            return 0
+        changes = 0
+        state = self._tail_state
         try:
-            for raw_line in data[:consumed].split(b'\n'):
-                if not raw_line:
-                    continue
-                c0 = raw_line[0]
-                if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
-                    if dump:
-                        sig = bget(raw_line[1:].rstrip())
-                        if sig is not None:
-                            sig._values.append(bitbyte[c0]); sig._times.append(ct); changes += 1
-                    continue
-                if c0 == 35:
-                    try:
-                        ct = int(raw_line[1:])
-                        if ct > mx:
-                            mx = ct
-                            if narrow and ct > _I32_MAX:
-                                self._widen_times()
-                                narrow = False
-                    except ValueError:
-                        pass
-                    continue
-                if c0 == 98 or c0 == 66 or c0 == 114 or c0 == 82:
-                    if dump:
-                        sp = raw_line.find(32, 1)
-                        if sp > 0:
-                            sig = bget(raw_line[sp + 1:].rstrip())
-                            if sig is not None:
-                                if sig._scalar:
-                                    if c0 == 98 or c0 == 66:   # 'b1 !' on a 1-bit var
-                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
-                                        sig._times.append(ct); changes += 1
-                                else:
-                                    v = raw_line[1:sp].decode('ascii', 'ignore')
-                                    sig._append_value(v)   # values before times
-                                    sig._times.append(ct); changes += 1
-                    continue
-                if c0 == 36:
-                    line = raw_line.decode('ascii', 'ignore').strip()
-                    if line.startswith('$dumpoff'):
-                        dump = False
-                    elif line.startswith('$dumpon'):
-                        dump = True
+            for raw in data[:consumed].splitlines():
+                event = state.feed(raw)
+                if self._tail_narrow and state.max_time > _I32_MAX:
+                    self._widen_times()
+                if event is not None:
+                    changes += self._append_event(*event, state.time)
         except Exception:
-            self._resync_storage()         # malformed tail: keep what aligned
+            self._resync_storage()
         self._tail_offset += consumed
-        self._tail_time, self._tail_dump, self.max_time = ct, dump, mx
+        self._parsed_offset = self._tail_offset
+        self._value_state = state
+        self.max_time = state.max_time
         return changes
 
     # ══ Original synchronous parse (unchanged, for compatibility) ══
 
     @staticmethod
     def parse(filename, progress_cb=None):
-        """Parse VCD file. Uses fast binary mode for value changes."""
-        vcd = VCDFile()
-        vcd._filename = filename
-        file_size = os.path.getsize(filename)
-
-        scope_stack = []
-        current_scope = ""
-        current_time = 0
-        in_header = True
-        dump_active = True
-        bytes_read = 0
-        last_progress = 0
-
-        # Fast-path: pre-fetch signal dict for inner loop
-        signals = vcd.signals
-        bget = None                  # bytes-keyed id->signal map, built at $enddefinitions
-        bitbyte = _BITBYTE
-
-        # Use binary mode for faster I/O (avoid unicode decode overhead)
-        with open(filename, 'rb', buffering=1 << 20) as f:
-            for raw_line in f:
-                bytes_read += len(raw_line)
-
-                # Fast skip blank lines
-                if len(raw_line) <= 1:
-                    continue
-
-                c0 = raw_line[0]
-
-                # ── Value changes hot path (binary mode; lock-free, bytes-keyed,
-                #    inlined appends — see _parse_values_background) ──
-                if not in_header:
-                    # Scalar: 0/1/x/z + identifier (the common case)
-                    if c0 == 48 or c0 == 49 or c0 == 120 or c0 == 88 or c0 == 122 or c0 == 90:
-                        if dump_active:
-                            sig = bget(raw_line[1:].rstrip())
-                            if sig is not None:
-                                sig._values.append(bitbyte[c0])  # bytearray; values before times
-                                sig._times.append(current_time)
-                        continue
-
-                    # Timestamp
-                    if c0 == 35:  # b'#'
-                        try:
-                            current_time = int(raw_line[1:])
-                            if current_time > vcd.max_time:
-                                vcd.max_time = current_time
-                        except ValueError:
-                            pass
-                        continue
-
-                    # Vector: b/B<binary> <id>
-                    if c0 == 98 or c0 == 66:  # b'b','B'
-                        if dump_active:
-                            sp = raw_line.find(32, 1)  # space
-                            if sp > 0:
-                                sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None:
-                                    if sig._scalar:        # 'b1 !' for a 1-bit var
-                                        sig._values.append(bitbyte.get(raw_line[sp - 1], 120))
-                                    else:                  # vector -> packed/list store
-                                        v = raw_line[1:sp].decode('ascii', 'ignore')
-                                        sig._append_value(v)   # values before times
-                                    sig._times.append(current_time)
-                        continue
-
-                    # Real: r/R<float> <id>
-                    if c0 == 114 or c0 == 82:  # b'r','R'
-                        if dump_active:
-                            sp = raw_line.find(32, 1)
-                            if sp > 0:
-                                sig = bget(raw_line[sp + 1:].rstrip())
-                                if sig is not None and not sig._scalar:
-                                    v = raw_line[1:sp].decode('ascii', 'ignore')
-                                    sig._append_value(v)   # reals stay strings
-                                    sig._times.append(current_time)
-                        continue
-
-                    if c0 == 36:  # b'$'
-                        line = raw_line.decode('ascii', errors='ignore').strip()
-                        if line.startswith('$dumpoff'):
-                            dump_active = False
-                            for sig in signals.values():
-                                if sig.owns_storage:
-                                    sig.add_change(current_time, 'x')  # type-aware append
-                        elif line.startswith('$dumpon'):
-                            dump_active = True
-                        elif line.startswith('$comment'):
-                            if '$end' not in line:
-                                for cont in f:
-                                    bytes_read += len(cont)
-                                    if b'$end' in cont:
-                                        break
-                        continue
-
-                    continue
-
-                # ── Header (text mode — only runs once) ──
-                # Whitespace handling
-                if c0 in (32, 9, 10, 13):  # space, tab, newline, cr
-                    line = raw_line.decode('ascii', errors='ignore').strip()
-                    if not line:
-                        continue
-                    c0_str = line[0]
-                else:
-                    line = raw_line.decode('ascii', errors='ignore').rstrip('\n\r')
-                    c0_str = chr(c0)
-
-                # Progress reporting
-                if progress_cb and file_size > 0:
-                    pct = bytes_read * 100 // file_size
-                    if pct >= last_progress + 5:
-                        last_progress = pct
-                        progress_cb(bytes_read, file_size)
-
-                if c0_str != '$':
-                    continue
-                if line.startswith('$timescale'):
-                    ts = _extract_block(line, '$timescale', _TextWrapper(f))
-                    vcd.timescale = ts
-                    m = re.match(r'(\d+)\s*(s|ms|us|ns|ps|fs)', ts)
-                    if m:
-                        vcd.timescale_number = int(m.group(1))
-                        vcd.timescale_unit = m.group(2)
-                elif line.startswith('$scope'):
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        scope_stack.append(parts[2])
-                        current_scope = ".".join(scope_stack)
-                elif line.startswith('$upscope'):
-                    if scope_stack:
-                        scope_stack.pop()
-                        current_scope = ".".join(scope_stack)
-                elif line.startswith('$var'):
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        _declare_var(vcd, parts, current_scope)
-                elif line.startswith('$enddefinitions'):
-                    in_header = False
-                    # Build the bytes-keyed id->signal map for the value hot loop.
-                    bget = {k.encode('ascii'): v for k, v in signals.items()}.get
-                    # Report progress at header end
-                    if progress_cb and file_size > 0:
-                        progress_cb(bytes_read, file_size)
-                elif line.startswith('$date'):
-                    vcd.date = _extract_block(line, '$date', _TextWrapper(f))
-                elif line.startswith('$version'):
-                    vcd.version = _extract_block(line, '$version', _TextWrapper(f))
-
-        # ── Post-parse: robustness checks ──
-        for sig in vcd.signals.values():
-            if sig.owns_storage and len(sig._times) >= 2:
-                is_sorted = True
-                for i in range(1, min(len(sig._times), 100)):
-                    if sig._times[i] < sig._times[i-1]:
-                        is_sorted = False
-                        break
-                if not is_sorted:
-                    sig._sort_by_time()   # storage-aware (scalar/packed/list)
-
-        _compact_times(vcd)          # 64-bit -> 32-bit timestamps when they fit
-        # Build scope tree
-        vcd.scopes = build_scope_tree(vcd)
-
+        vcd, offset = VCDFile.parse_header(filename)
+        vcd._read_values(offset, progress_cb)
         return vcd
 
 

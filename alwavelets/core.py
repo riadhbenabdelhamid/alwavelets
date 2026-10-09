@@ -7,6 +7,8 @@ on the standard library.
 import array
 import bisect
 import json
+import math
+import re
 import sys
 from enum import Enum
 
@@ -63,19 +65,58 @@ def clear_pack_memos():
         memo.clear()
 
 
+def numeric_value(value, signal_type="wire"):
+    """Interpret a value using its declaration, never its digit spelling."""
+    try:
+        if signal_type in ('real', 'realtime'):
+            n = float(value)
+            return n if math.isfinite(n) else None
+        return int(value, 2)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def ensure_trace_loaded(vcd, start=0, end=None):
+    """Honor an optional storage-loading hook on a trace-like object.
+
+    In-memory library callers need only supply signals and time metadata;
+    VCDFile additionally guarantees complete coverage through this hook.
+    """
+    load = getattr(vcd, 'require_loaded', None)
+    if load is not None:
+        load(start, end)
+
+
+def split_reference(reference):
+    """Separate a whitespace-delimited VCD/FST reference and declared range."""
+    m = re.fullmatch(r'(.*?)\s+\[\s*(-?\d+)\s*(?::\s*(-?\d+)\s*)?\]', reference)
+    if not m:
+        return reference, None
+    return m[1], (int(m[2]), int(m[3] if m[3] is not None else m[2]))
+
+
 class VCDSignal:
     """
     Signal with C-level array for timestamps and interned value strings.
     Uses __slots__ for minimal per-instance overhead.
     """
     __slots__ = ('name', 'full_name', 'identifier', 'size',
+                 'reference', 'declared_range',
                  'signal_type', 'scope', '_times', '_values', '_scalar',
                  '_packed', '_stride', '_memo',
                  'analog_mode', 'is_dumped', '_parent_sig', '_bit_idx')
     # False on AliasSignal: storage loops (sort/compact/dumpoff) skip aliases.
     owns_storage = True
 
-    def __init__(self, name, identifier, size=1, signal_type="wire", scope=""):
+    def __init__(self, name, identifier, size=1, signal_type="wire", scope="",
+                 declared_range=None):
+        self.reference = name
+        self.declared_range = declared_range
+        # Keep familiar names for conventional buses; disambiguate slices
+        # and separately declared bits in every name-based consumer.
+        if declared_range is not None and (size == 1 or declared_range != (size - 1, 0)):
+            hi, lo = declared_range
+            name += '[%d]' % hi if hi == lo else '[%d:%d]' % (hi, lo)
         self.name = name
         self.full_name = f"{scope}.{name}" if scope else name
         self.identifier = identifier
@@ -87,8 +128,8 @@ class VCDSignal:
         # 2..64-bit buses pack into a flat bytearray at _stride bytes/change
         # (see "packed bus value storage" above); reals and very wide buses
         # keep a list of interned value strings.
-        self._scalar = (size == 1 and signal_type != "real")
-        self._packed = (1 < size <= 64 and signal_type != "real")
+        self._scalar = (size == 1 and signal_type not in ('real', 'realtime'))
+        self._packed = (1 < size <= 64 and signal_type not in ('real', 'realtime'))
         if self._packed:
             self._stride = (size + 3) // 4
             self._memo = (_PACK_MEMOS.setdefault(self._stride, {})
@@ -98,10 +139,21 @@ class VCDSignal:
             self._stride = 0
             self._memo = None
             self._values = bytearray() if self._scalar else []
-        self.analog_mode = (signal_type == "real")
+        self.analog_mode = (signal_type in ('real', 'realtime'))
         self.is_dumped = True             # tracks $dumpoff/$dumpon state
         self._parent_sig = None           # set for expanded bus bits
         self._bit_idx = None              # bit index for expanded bus bits
+
+    def bit_label(self, offset):
+        if self.declared_range is None:
+            return offset
+        hi, lo = self.declared_range
+        return lo + offset if hi >= lo else lo - offset
+
+    def identity(self):
+        return {'name': (self.scope + '.' if self.scope else '') + self.reference,
+                'size': self.size, 'type': self.signal_type,
+                'range': list(self.declared_range) if self.declared_range is not None else None}
 
     @property
     def changes(self):
@@ -213,16 +265,16 @@ class VCDSignal:
         _values before _times to keep the lock-free-read contract."""
         vals = self._values
         if self._scalar:
-            pairs = sorted(zip(self._times, vals))
+            pairs = sorted(zip(self._times, vals), key=lambda p: p[0])
             new_values = bytearray(p[1] for p in pairs)
         elif type(vals) is bytearray:          # packed bus: sort stride chunks
             st = self._stride
             chunks = [bytes(vals[i * st:(i + 1) * st])
                       for i in range(len(vals) // st)]
-            pairs = sorted(zip(self._times, chunks))
+            pairs = sorted(zip(self._times, chunks), key=lambda p: p[0])
             new_values = bytearray(b''.join(p[1] for p in pairs))
         else:
-            pairs = sorted(zip(self._times, vals))
+            pairs = sorted(zip(self._times, vals), key=lambda p: p[0])
             new_values = [p[1] for p in pairs]
         self._values = new_values
         self._times = array.array(self._times.typecode, [p[0] for p in pairs])
@@ -328,42 +380,17 @@ class VCDSignal:
     def numeric_value_at(self, time):
         """Get numeric (float) value at time, for analog rendering.
 
-        A pure 0/1 string is a bus value and is read as unsigned binary (so
-        '00101010' is 42, not decimal 101010); other strings ('3.14') are read
-        as real numbers."""
-        val = self.value_at(time)
-        if val in ('x', 'z') or not val:
-            return None
-        if all(c in '01' for c in val):
-            try:
-                return float(int(val, 2))
-            except ValueError:
-                pass
-        try:
-            return float(val)
-        except ValueError:
-            return None
+        The declared type controls interpretation: real/realtime values use
+        decimal notation; logic vectors use unsigned binary."""
+        return numeric_value(self.value_at(time), self.signal_type)
 
     def numeric_range_in_window(self, t_start, t_end):
         """Get (min, max) numeric values in window for analog scaling.
 
-        Pure 0/1 bus values are read as unsigned binary (matching
-        numeric_value_at); other strings as real numbers."""
+        Values follow the declared signal type, matching numeric_value_at."""
         times, values = self.changes_in_window(t_start, t_end)
-        vals = []
-        for v in values:
-            if v in ('x', 'z') or not v:
-                continue
-            if all(c in '01' for c in v):
-                try:
-                    vals.append(float(int(v, 2)))
-                    continue
-                except ValueError:
-                    pass
-            try:
-                vals.append(float(v))
-            except ValueError:
-                pass
+        vals = [numeric_value(v, self.signal_type) for v in values]
+        vals = [v for v in vals if v is not None]
         if not vals:
             return (0, 1)
         mn, mx = min(vals), max(vals)
@@ -440,7 +467,7 @@ class VCDSignal:
     def make_expanded_bit(self, bit_idx):
         """Create a virtual 1-bit VCDSignal for bit_idx of this bus."""
         bit_sig = VCDSignal(
-            f"{self.name}[{bit_idx}]",
+            f"{self.reference}[{self.bit_label(bit_idx)}]",
             f"{self.identifier}__bit{bit_idx}",
             size=1, signal_type="wire", scope=self.scope
         )
@@ -475,15 +502,21 @@ class AliasSignal(VCDSignal):
     __slots__ = ('master',)
     owns_storage = False
 
-    def __init__(self, name, identifier, size, signal_type, scope, master):
+    def __init__(self, name, identifier, size, signal_type, scope, master,
+                 declared_range=None):
         self.master = master
+        self.reference = name
+        self.declared_range = declared_range
+        if declared_range is not None and (size == 1 or declared_range != (size - 1, 0)):
+            hi, lo = declared_range
+            name += '[%d]' % hi if hi == lo else '[%d:%d]' % (hi, lo)
         self.name = name
         self.full_name = f"{scope}.{name}" if scope else name
         self.identifier = identifier
         self.size = size
         self.signal_type = signal_type
         self.scope = scope
-        self.analog_mode = (signal_type == "real")
+        self.analog_mode = (signal_type in ('real', 'realtime'))
         self.is_dumped = True
         self._parent_sig = None
         self._bit_idx = None
@@ -506,6 +539,18 @@ class Radix(Enum):
     FLOAT64 = "f64"
 
 
+class TimeScaledSignal(AliasSignal):
+    """Read-only signal view on another trace's time axis (exact ratios)."""
+    __slots__ = ('_scaled_times',)
+
+    def __init__(self, signal, ratio):
+        super().__init__(signal.reference, signal.identifier, signal.size,
+                         signal.signal_type, signal.scope, signal, signal.declared_range)
+        self._scaled_times = [t * ratio for t in signal._times]
+
+    _times = property(lambda self: self._scaled_times)
+
+
 class Marker:
     __slots__ = ('time', 'label')
     def __init__(self, time, label=""):
@@ -521,8 +566,8 @@ class VirtualBitSignal:
     def __init__(self, parent, bit_index):
         self.parent = parent
         self.bit_index = bit_index
-        self.name = f"{parent.name}[{bit_index}]"
-        self.full_name = f"{parent.full_name}[{bit_index}]"
+        self.name = f"{parent.reference}[{parent.bit_label(bit_index)}]"
+        self.full_name = f"{parent.scope}.{self.name}" if parent.scope else self.name
         self.identifier = f"{parent.identifier}__bit{bit_index}"
         self.size = 1
         self.signal_type = "wire"
@@ -884,6 +929,12 @@ def format_value(val, radix, size=1):
     elif radix == Radix.UNSIGNED:
         return str(int_val)
     return val
+
+
+def format_typed_value(sig, val, radix):
+    if getattr(sig, 'signal_type', 'wire') in ('real', 'realtime'):
+        return format_real(val)
+    return format_value(val, radix, sig.size)
 
 
 def format_value_decoded(val, decode_map, radix, size=1):

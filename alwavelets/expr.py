@@ -22,13 +22,13 @@ import fnmatch
 import operator
 import re
 
-from .core import VCDSignal
+from .core import VCDSignal, ensure_trace_loaded, numeric_value
 
 _TOKEN = re.compile(r"""\s*(?:
       (?P<num>0[xX][0-9a-fA-F]+|0[bB][01]+|\d+\.\d+|\d+)
     | (?P<str>'[^']*'|"[^"]*")
     | (?P<op>==|!=|<=|>=|<<|>>|&&|\|\||[<>!()+*/%&|^~\-])
-    | (?P<ident>[A-Za-z_][\w.$/\[\]]*)
+    | (?P<ident>[A-Za-z_][\w.$/]*(?:\[[^\]\s]+\][\w.$/]*)*)
     )""", re.VERBOSE)
 
 _KEYWORD_OPS = {'and': '&&', 'or': '||', 'not': '!'}
@@ -246,7 +246,12 @@ def _value(node, resolved, t):
     if k == 'num' or k == 'str':
         return node[1]
     if k == 'sig':
-        return resolved[node[1]].value_at(t)
+        sig = resolved[node[1]]
+        value = sig.value_at(t)
+        if sig.signal_type in ('real', 'realtime'):
+            number = numeric_value(value, sig.signal_type)
+            return value if number is None else number
+        return value
     if k == 'cmp':
         return _compare(node[1], _value(node[2], resolved, t), _value(node[3], resolved, t))
     if k == 'and':
@@ -314,6 +319,8 @@ def _candidate_times(resolved, start, end):
     signal changes, ascending and deduplicated. A lazy k-way merge of the
     per-signal slices: a first-match search stops at the hit instead of
     first building a set of every change time in the trace."""
+    if end < start:
+        return
     yield start
     slices = []
     for s in resolved.values():
@@ -321,7 +328,7 @@ def _candidate_times(resolved, start, end):
         lo = bisect.bisect_right(ts, start)
         hi = bisect.bisect_right(ts, end)
         if hi > lo:
-            slices.append(ts[lo:hi])
+            slices.append(_time_slice(ts, lo, hi))
     prev = start
     for t in heapq.merge(*slices):
         if t != prev:
@@ -329,11 +336,26 @@ def _candidate_times(resolved, start, end):
             prev = t
 
 
+def _time_slice(times, lo, hi):
+    for i in range(lo, hi):
+        yield times[i]
+
+
+def _load_interval(vcd, start, end):
+    try:
+        ensure_trace_loaded(vcd, start, end)
+    except ValueError as exc:
+        raise ExprError(str(exc)) from exc
+
+
 def find_expression(vcd, expr, start_time=0, end_time=None):
     """Return the first time >= start_time where `expr` holds, or None."""
+    _load_interval(vcd, start_time, end_time)
     ast, resolved = _prepare(vcd, expr)
     if end_time is None:
         end_time = vcd.max_time
+    if start_time > end_time:
+        return None
     if not resolved:                           # constant expression
         return start_time if evaluate(ast, resolved, start_time) else None
     for t in _candidate_times(resolved, start_time, end_time):
@@ -344,9 +366,12 @@ def find_expression(vcd, expr, start_time=0, end_time=None):
 
 def find_all_expression(vcd, expr, start_time=0, end_time=None, limit=1000):
     """Return up to `limit` times where `expr` *becomes* true (rising matches)."""
+    _load_interval(vcd, start_time, end_time)
     ast, resolved = _prepare(vcd, expr)
     if end_time is None:
         end_time = vcd.max_time
+    if limit <= 0:
+        return []
     hits, prev = [], False
     for t in _candidate_times(resolved, start_time, end_time):
         cur = evaluate(ast, resolved, t)
@@ -371,6 +396,7 @@ def make_derived_signal(vcd, name, expr_str, size=None, scope="derived"):
     The result is sampled at every time a referenced signal changes; x/z inputs
     propagate to an x result. `size` (bit width) is inferred from the values if
     not given. Returns a VCDSignal not attached to `vcd`."""
+    _load_interval(vcd, 0, None)
     ast, resolved = _prepare(vcd, expr_str)
     cand = _candidate_times(resolved, 0, vcd.max_time) if resolved else [0]
     results = []

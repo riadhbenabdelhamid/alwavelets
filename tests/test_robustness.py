@@ -148,13 +148,10 @@ def test_lazy_matches_full_parse(w, tmp_path):
     lazy._build_time_index(off)
     lazy.ensure_loaded(100, 200)
 
-    shared = disagree = 0
     for sid in full.signals:
         ft, fv = full.signals[sid].changes_in_window(100, 200)
         lt, lv = lazy.signals[sid].changes_in_window(100, 200)
-        fmap = dict(zip(ft, fv))
-        for t, v in zip(lt, lv):
-            if t in fmap:
-                shared += 1
-                disagree += (fmap[t] != v)
-    assert shared > 0 and disagree == 0          # every loaded value matches
+        assert list(lt) == list(ft)  # missing events and baselines must fail
+        assert lv == fv
+        for t in range(100, 201):
+            assert lazy.signals[sid].value_at(t) == full.signals[sid].value_at(t)
