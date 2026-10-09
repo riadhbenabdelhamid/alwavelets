@@ -1,11 +1,41 @@
 """Streaming file output. Incomplete exports never replace a destination."""
 import contextlib
 import csv
+import json
 import os
 import shutil
 import tempfile
 
 from .streaming import check_cancel, iter_window
+
+
+def write_instruction_csv(matches, destination, *, cancel=None, progress=None):
+    """Stream the complete selection, including same-tick records in capture order."""
+    fields = ('time', 'hart_id', 'thread_id', 'pc', 'bits', 'rd_addr', 'rd_data',
+              'mem_addr', 'mem_wdata', 'mem_rdata', 'csr_addr', 'csr_wdata', 'stall')
+    count = 0
+    check_cancel(cancel)
+    with atomic_output(destination) as output:
+        writer = csv.writer(output, lineterminator='\n')
+        writer.writerow(fields + ('mnemonic', 'asm', 'decoded_json'))
+        iterator = iter(matches)
+        try:
+            for entry in iterator:
+                check_cancel(cancel)
+                decoded = entry.get('decoded', {})
+                writer.writerow(tuple(entry.get(field) for field in fields) +
+                                (decoded.get('mnemonic'), decoded.get('asm'), json.dumps(decoded, sort_keys=True)))
+                count += 1
+                if progress and count % 4096 == 0:
+                    progress(count, len(matches))
+        finally:
+            close = getattr(iterator, 'close', None)
+            if close:
+                close()
+        if progress:
+            progress(count, len(matches))
+        check_cancel(cancel)
+    return count
 
 
 @contextlib.contextmanager

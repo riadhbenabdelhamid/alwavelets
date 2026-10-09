@@ -13,6 +13,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
+from .ui_results import InstructionResultsMixin
 
 
 
@@ -25,8 +26,8 @@ def load_analysis_data(viewer, start=0, end=None):
     return True
 
 
-class DebugActionsMixin:
-    def _start_decode_results(self, factory, item_type, complete, title, end=None, kind='decode', collector=None):
+class DebugActionsMixin(InstructionResultsMixin):
+    def _start_decode_results(self, factory, item_type, complete, title, end=None, kind='decode', collector=None, compute_results=None):
         from .background import AnalysisJob
         from .results import PagedResults, close_results
         if getattr(self, '_analysis_job', None) is not None:
@@ -36,6 +37,8 @@ class DebugActionsMixin:
         end = vcd.max_time if end is None else end
         def compute(cancel, progress):
             progress(0, end)
+            if compute_results is not None:
+                return compute_results(cancel, progress)
             return (collector or PagedResults).collect(factory(cancel), item_type, owner=vcd,
                                         cancel=cancel, progress=progress, end=end)
         def apply(results):
@@ -90,6 +93,7 @@ class DebugActionsMixin:
             close_results(frames)
         self.decode_overlays = {}
         if all_results:
+            self._reset_instruction_browser()
             close_results(getattr(self, '_instruction_query_result', None))
             self._instruction_query_result = None
             close_results(getattr(self, 'bus_transactions', None))
@@ -194,15 +198,18 @@ class DebugActionsMixin:
             queries = getattr(self, '_queries', None)
             if queries is not None:
                 queries.invalidate('registers')
+            self._reset_instruction_browser()
             close_results(getattr(self, '_instruction_query_result', None))
             self._instruction_query_result = None
             close_results(trace.entries)
             trace.entries = entries
             trace.tags, trace.decoder, trace.built = tags, decoder, True
-            self._show_message(f'Trace built: {len(entries)} instructions')
-        from .instruction_store import InstructionResults
-        self._start_decode_results(lambda cancel: trace.iter_entries(vcd, tags, decoder, cancel=cancel),
-                                    dict, complete, 'instructions', collector=InstructionResults)
+            suffix = ' (cache hit)' if getattr(entries, 'cache_hit', False) else ''
+            self._show_message(f'Trace built: {len(entries)} instructions{suffix}')
+        from .analysis_cache import collect_instructions
+        self._start_decode_results(None, dict, complete, 'instructions',
+                                   compute_results=lambda cancel, progress: collect_instructions(
+                                       trace, vcd, tags, decoder, cancel=cancel, progress=progress))
 
     def _trace_query_prompt(self):
         """Interactive trace query."""
@@ -232,8 +239,10 @@ class DebugActionsMixin:
             if self.vcd is not vcd or self.instr_trace.entries is not entries:
                 result.close()
                 return
-            close_results(getattr(self, '_instruction_query_result', None))
-            self._instruction_query_result = result
+            if result.matches is not None:
+                self._reset_instruction_browser()
+                close_results(getattr(self, '_instruction_query_result', None))
+                self._instruction_query_result = result
             if result.replace_markers:
                 self.markers.clear()
             self.markers.extend(Marker(t, label) for t, label in result.markers)

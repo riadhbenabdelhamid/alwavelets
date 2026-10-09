@@ -284,6 +284,8 @@ class FSTReader:
         from .parsers import VCDFile, build_scope_tree, _compact_times
         vcd = VCDFile()
         vcd._filename = self.filename
+        from .analysis_cache import stamp_source
+        stamp_source(vcd, self.filename)
         file_size = os.path.getsize(self.filename)
 
         with open(self.filename, 'rb') as f:
@@ -291,7 +293,9 @@ class FSTReader:
             if not first:
                 return vcd
             if first[0] == self.BL_ZWRAPPER:
-                return self._parse_zwrapped(f, progress_cb, writer_factory, metadata_only)
+                wrapped = self._parse_zwrapped(f, progress_cb, writer_factory, metadata_only)
+                wrapped._analysis_source = vcd._analysis_source
+                return wrapped
             if first[0] != self.BL_HDR:
                 raise ValueError("Not an FST file (first byte: 0x%02x)" % first[0])
             self._parse_header(f, vcd)

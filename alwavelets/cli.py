@@ -211,7 +211,11 @@ def main():
     parser.add_argument('--loadunchecked', action='store_true', help="Load with no signals shown (select via B tree browser)")
     parser.add_argument('--expanded', action='store_true', help="Start with all modules expanded (default: collapsed)")
     parser.add_argument('--mcp', action='store_true', help="Run as an MCP server (stdio) instead of the viewer")
-    parser.add_argument('--no-cache', action='store_true', help="Disable the persistent parse cache (force a fresh parse)")
+    parser.add_argument('--no-cache', action='store_true', help="Disable persistent waveform and instruction caches")
+    parser.add_argument('--analysis-cache-mib', type=int, default=8192, metavar='N',
+                        help="Persistent instruction cache quota in MiB (default: 8192; 0 disables)")
+    parser.add_argument('--purge-analysis-cache', action='store_true',
+                        help="Remove cached instruction indexes and exit")
     parser.add_argument('--no-config', action='store_true', help="Ignore ~/.config/alwavelets/config.json")
     parser.add_argument('--no-session', action='store_true',
                         help="Ignore a saved session sidecar (open the trace fresh)")
@@ -227,6 +231,16 @@ def main():
     args = parser.parse_args()
     if args.memory_mib <= 0:
         parser.error('--memory-mib must be positive')
+    if args.analysis_cache_mib < 0:
+        parser.error('--analysis-cache-mib must be nonnegative')
+    from . import analysis_cache, cache as _cache
+    analysis_cache.QUOTA_BYTES = args.analysis_cache_mib * 1024 * 1024
+    if args.no_cache:
+        _cache.ENABLED = False
+    if args.purge_analysis_cache:
+        count, size = analysis_cache.InstructionCache().purge()
+        print(f'Removed {count} instruction indexes ({size / 1024 ** 2:.1f} MiB)')
+        return
     if getattr(args, 'no_config', False):
         from . import config as _config
         _config.ENABLED = False

@@ -533,18 +533,17 @@ class InstructionTrace(InstructionAnalysis):
         self.thread_id = 0
         self.built = False
 
-    def build(self, vcd, tags, decoder=None, *, storage='memory', cancel=None, progress=None):
-        """Build an eager index by default, or an indexed temporary disk store."""
+    def build(self, vcd, tags, decoder=None, *, storage='memory', use_cache=True, cancel=None, progress=None):
+        """Build eagerly by default; disk indexes can reuse the instruction cache."""
         if storage not in ('memory', 'disk'):
             raise ValueError('instruction storage must be memory or disk')
         selected_decoder = decoder or RV32Decoder()
-        items = self.iter_entries(vcd, tags, selected_decoder, cancel=cancel)
         if storage == 'disk':
-            from .instruction_store import InstructionResults
-            result = InstructionResults.collect(items, dict, owner=vcd, cancel=cancel,
-                                                 progress=progress, end=vcd.max_time)
+            from .analysis_cache import collect_instructions
+            result = collect_instructions(self, vcd, tags, selected_decoder, use_cache=use_cache,
+                                          cancel=cancel, progress=progress)
         else:
-            result = list(items)
+            result = list(self.iter_entries(vcd, tags, selected_decoder, cancel=cancel))
         from .results import close_results
         close_results(self.entries)
         self.entries = result

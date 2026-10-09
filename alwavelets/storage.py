@@ -566,6 +566,8 @@ def create_derived_store(parent, signal):
 
 def _restore(store, source):
     from .parsers import VCDFile, build_scope_tree
+    from .analysis_cache import source_signature
+    source_state = source_signature(source)
     row = store.db.execute('SELECT value FROM meta WHERE key="trace"').fetchone()
     if row is None:
         return None
@@ -576,6 +578,7 @@ def _restore(store, source):
     vcd.signals = {}
     store.definitions = SignalDefinitions(vcd.signals)
     vcd._filename = source
+    vcd._analysis_source = source_state
     for field in ('timescale', 'timescale_number', 'timescale_unit', 'date', 'max_time', 'min_time'):
         setattr(vcd, field, meta[field])
     vcd.version = meta['simulator_version']

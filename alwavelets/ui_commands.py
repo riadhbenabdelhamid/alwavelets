@@ -75,6 +75,8 @@ class CommandLineMixin:
             'eval': lambda: self._cmd_eval_tcl(args),
             'trace': lambda: self._build_trace(),
             'query': lambda: self._trace_query_prompt(),
+            'results': lambda: self._cmd_instruction_results(args),
+            'analysis-cache': lambda: self._cmd_analysis_cache(args),
             'tags': lambda: self._show_message(f"Tags: {len(self.signal_tags.tags)} ({', '.join(list(self.signal_tags.tags.keys())[:5])})"),
             'autotag': lambda: self._show_message(f"Auto-detected {self.signal_tags.auto_detect_roles(self.vcd)} roles"),
             'manual': lambda: setattr(self, 'show_manual', True),
@@ -149,7 +151,9 @@ class CommandLineMixin:
             "group NAME— Collapsible group from the V selection (Tab folds header)",
             "ungroup   — Remove the focused (or named) group",
             "follow    — Live-tail appended changes + auto-scroll (running sim)",
-            "cancel    — Stop a background expression search",
+            "cancel    — Stop a background analysis or export",
+            "results   — Browse all instruction matches (next/prev/goto N/export PATH)",
+            "analysis-cache purge — Remove saved instruction indexes",
             "loadgtkw F— Apply a GTKWave .gtkw save (signals + radixes)",
             "savegtkw F— Write current view as a GTKWave .gtkw save file",
             "session   — Save session sidecar (auto-restores on reopen);",
@@ -269,6 +273,22 @@ class CommandLineMixin:
         else:
             job.cancel.set()
             self._show_message('Cancelling analysis…')
+
+    def _cmd_analysis_cache(self, args):
+        from .analysis_cache import InstructionCache
+        if args.strip() != 'purge':
+            self._show_message('Usage: analysis-cache purge')
+            return
+        if getattr(self, '_analysis_job', None) is not None:
+            self._show_message('Wait for the active analysis or cancel it before purging')
+            return
+        from .background import AnalysisJob
+        def complete(result):
+            count, size = result
+            self._show_message(f'Removed {count} instruction indexes ({size / 1024 ** 2:.1f} MiB)')
+        self._analysis_job = AnalysisJob(lambda cancel, progress: InstructionCache().purge(cancel), complete)
+        self._analysis_job.kind, self._analysis_job.label = 'cache-purge', 'Cache'
+        self._show_message('Removing saved instruction indexes…')
 
     def _cmd_glitches(self, args):
         """glitches [max_pulse]: scan displayed signals for x-hazards and

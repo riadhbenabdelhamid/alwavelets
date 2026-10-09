@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -26,7 +27,7 @@ def timestamp(i):
     return i // 2 + (i // 10000) * 7
 
 
-def worker(count):
+def worker(count, cache_roundtrip=False):
     from alwavelets.instruction_store import InstructionResults
     from alwavelets.decoders import InstructionTrace
     from alwavelets.parsers import VCDFile
@@ -68,6 +69,30 @@ def worker(count):
         state = trace.register_panel_state(timestamp(count // 2))
         assert state[1][0] == 0 and state[3]['time'] <= timestamp(count // 2)
         result['register_panel_s'] = time.perf_counter() - before
+        if cache_roundtrip:
+            from alwavelets.analysis_cache import InstructionCache, identity_for, stamp_source
+            from alwavelets.decoders import RV32Decoder
+            from alwavelets.persistence import SignalTagStore
+            with tempfile.TemporaryDirectory(prefix='wavelet-instruction-cache-stress-') as directory:
+                source = Path(directory) / 'synthetic.source'
+                source.write_text('Synthetic instruction records: %d\n' % count)
+                owner._filename = str(source)
+                stamp_source(owner, source)
+                identity = identity_for(owner, SignalTagStore(), RV32Decoder())
+                manager = InstructionCache(Path(directory) / 'cache', quota=16 * 1024 ** 3)
+                before = phase('Persisting completed instruction index…')
+                assert manager.publish(trace.entries, identity)
+                result['cache_write_s'] = time.perf_counter() - before
+                before = phase('Reopening instruction index…')
+                with manager.load(identity) as reopened:
+                    assert len(reopened) == count and reopened.cache_hit
+                    result['cache_reopen_s'] = time.perf_counter() - before
+                    with reopened.select() as matches:
+                        before = phase('Reading final result page…')
+                        page = matches.read_page(count - 32, 32)
+                        assert len(page) == 32 and page[-1]['rd_data'] == count - 1
+                        result['last_page_s'] = time.perf_counter() - before
+                assert manager.purge()[0] == 1
         result['peak_rss_mib'] = peak_rss()
         path = trace.entries.path
     assert not Path(path).exists()
@@ -79,13 +104,17 @@ def main():
     parser.add_argument('--records', type=int, default=10000000)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--worker', action='store_true')
+    parser.add_argument('--cache-roundtrip', action='store_true', help='Also validate persistent reuse and final-page access')
     args = parser.parse_args()
     if args.records < 32:
         parser.error('--records must be at least 32')
     if args.worker:
-        print(json.dumps(worker(args.records)))
+        print(json.dumps(worker(args.records, args.cache_roundtrip)))
         return
-    run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--worker', '--records', str(args.records)],
+    command = [sys.executable, str(Path(__file__).resolve()), '--worker', '--records', str(args.records)]
+    if args.cache_roundtrip:
+        command.append('--cache-roundtrip')
+    run = subprocess.run(command,
                          check=True, stdout=subprocess.PIPE, text=True)
     result = json.loads(run.stdout)
     if args.output:

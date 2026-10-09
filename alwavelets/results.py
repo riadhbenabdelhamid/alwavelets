@@ -14,7 +14,8 @@ from .streaming import check_cancel
 class PagedResults(Sequence):
     """Read-only snapshots of frames, transactions, or instruction dictionaries.
 
-    The process-private database is never reopened from a user-supplied path.
+    The database is never reopened from a user-supplied path; instruction
+    subclasses may reopen validated, application-owned persistent indexes.
     Only primitive field values are marshalled; each read returns a fresh object.
     SQLite's page cache is bounded, and Python retains one record at a time.
     """
@@ -128,6 +129,22 @@ class PagedResults(Sequence):
     def iter_range(self, start, end):
         return self._rows('SELECT data FROM results WHERE seq>=? AND seq<? ORDER BY seq', (start, end))
 
+    def read_page(self, start, size=100, cancel=None):
+        """A bounded page, releasing the SQL cursor before returning to the UI."""
+        if not 0 <= size <= 256 or start < 0:
+            raise ValueError('Invalid result page')
+        with self._lock:
+            check_cancel(cancel)
+            if self._closed.is_set():
+                raise ValueError('Decoded results are closed')
+            cursor = self._db.execute('SELECT data FROM results WHERE seq>=? AND seq<? ORDER BY seq', (start, start + size))
+            try:
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        check_cancel(cancel)
+        return [self._restore(row[0]) for row in rows]
+
     def __iter__(self):
         return self.iter_range(0, len(self))
 
@@ -175,7 +192,8 @@ class PagedResults(Sequence):
                 return
             self._closed.set()
             self._db.close()
-            self._temporary.cleanup()
+            if self._temporary is not None:
+                self._temporary.cleanup()
             if self._owner is not None:
                 self._owner._result_stores.discard(self)
                 self._owner = None

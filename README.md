@@ -91,7 +91,9 @@ Flags:
 | `--expanded` | Start with all scope modules expanded |
 | `--demo` | Generate and view a demo trace (written under a per-user temp directory) |
 | `--mcp` | Run as an MCP server (stdio) instead of the viewer |
-| `--no-cache` | Disable the persistent parse cache (force a fresh parse) |
+| `--no-cache` | Disable persistent waveform and instruction caches |
+| `--analysis-cache-mib N` | Saved instruction-index quota, default 8192 MiB; 0 disables reuse and saving |
+| `--purge-analysis-cache` | Remove saved instruction indexes and exit |
 | `--no-config` | Ignore `~/.config/alwavelets/config.json` |
 | `--no-session` | Ignore a saved session sidecar (open the trace fresh). `--expanded` / `--loadunchecked` imply this |
 | `--control` | Expose a token-authenticated control socket so an authorized local agent can drive this live session (see [SKILL.md](SKILL.md)) |
@@ -149,18 +151,49 @@ AXI spills unmatched responses to a temporary disk queue.
 
 Viewer protocol decoding, bus decoding, and instruction-trace building run in
 the background with progress and `cancel`. Their complete results are indexed
-in temporary SQLite files, including when the source uses in-memory storage.
+in SQLite files, including when the source uses in-memory storage.
 Overlays read the visible time range on a worker and cache only the painted
 terminal cells. Changing the viewport cancels obsolete overlay reads. Successful
 decodes replace prior results; cancellation or failure leaves prior results
 available. Replacing/clearing results, reloading, or closing the trace releases
 their temporary storage. No frame-count limit is imposed.
 
+Completed instruction indexes are saved under the user cache directory and
+reused by `;trace` on subsequent opens. Reuse requires matching source identity,
+size and timestamps, signal tags, decoder settings, Python and implementation
+versions. Changed or incomplete indexes rebuild; custom decoder classes and
+sources without a stable parse-time identity use temporary storage. Only
+completed indexes are published, and concurrent publishers coordinate through
+a cache lock. Cache errors leave the temporary index usable.
+
+Saved instruction indexes have a separate 8 GiB quota, evicting the least
+recently used first. Larger individual indexes remain temporary. Building and
+publishing need additional temporary disk space, including a copy of the index;
+the quota covers completed cache files. `--no-cache` disables reuse and saving.
+Use `;analysis-cache purge` in the viewer, or
+`alwavelets --purge-analysis-cache`, to reclaim saved instruction indexes.
+Open analyses remain usable after eviction or purge.
+
 Instruction searches also run in the background. PC, hart, thread ID, exact
 mnemonic, time, register-write, and memory-address filters use indexed fields;
 matches retain record IDs on disk instead of duplicating instruction payloads.
-The first 100 matches become navigation markers, while the complete selection
-remains available. Regex mnemonic searches and custom Python predicates can
+The first 100 matches become navigation markers. `;results` opens a paged
+browser of the complete selection alongside the waveform; moving between rows
+updates the waveform cursor, including matches sharing a timestamp. Use
+Up/Down or `n`/`p`, Page Up/Down, Home/End, and `g` to jump to a row. Enter or
+Escape closes the browser. These commands also work from the command prompt:
+
+```text
+results goto 1000000
+results next
+results prev
+results export /path/to/all-matches.csv
+```
+
+Export writes every match in capture order, runs in the background, and accepts
+`;cancel`. Cancellation or errors preserve any existing destination. Summary
+queries keep the last match selection available; a new filter replaces it.
+Regex mnemonic searches and custom Python predicates can
 require a scan. `cancel` stops scans, SQLite sorting, and index construction;
 a single user-supplied predicate must return before cancellation can proceed.
 
@@ -177,12 +210,14 @@ it does not normalize by a separately tagged clock.
 Explicit materialization such as `signal.changes`, `render_svg()`, and decoder
 `decode()`/`decode_all()` result lists still uses memory proportional to the
 requested output. Library `InstructionTrace.build()` defaults to memory; pass
-`storage='disk'` for indexed storage tied to the source trace's lifetime.
+`storage='disk'` for indexed storage whose open handle is tied to the source
+trace's lifetime. Pass `use_cache=False` to disable instruction-cache reuse and
+saving for that build.
 Use `trace.select(...)` as a context manager for paged matches, or
 `trace.iter_matching(...)` for streaming iteration. Existing `find_*`, `query()`,
 and thread-extraction methods still return lists for compatibility. Prefer the
 streaming APIs for large captures; individual transactions still retain their
-payloads. File exports from the viewer remain synchronous.
+payloads. Waveform file exports from the viewer remain synchronous.
 Live tailing requires `--storage memory`; disk indexes are snapshots.
 
 Library callers can explicitly select storage and should close traces:
@@ -366,6 +401,8 @@ whenever an agent is connected and acting.
 | `background` | Bounded UI read queue and cancellable analysis jobs |
 | `instruction_store` | Indexed instruction fields and paged record-ID selections |
 | `instruction_analysis` | Streaming instruction filters, statistics, and register snapshots |
+| `analysis_cache` | Reusable instruction indexes, validation, quotas, and eviction |
+| `ui_results` | Background paging, waveform jumps, and full-selection CSV export |
 | `parallel` | Opt-in multi-process parsing of large VCDs (`--jobs N`) |
 | `expr` | Cross-signal boolean expression search + derived signals (`when`/`derive`) |
 | `gtkw` | GTKWave `.gtkw` save-file import/export (interop) |
@@ -463,10 +500,13 @@ and register reconstruction in a fresh process:
 
 ```sh
 python3 tools/stress_instructions.py --records 10000000 --output instructions.json
+python3 tools/stress_instructions.py --records 10000000 --cache-roundtrip --output instruction-cache.json
 ```
 
 The report includes index size, query/build times, and total process peak RSS.
 The synthetic workload includes repeated timestamps and unsigned 64-bit PCs.
+The cache roundtrip additionally checks persistence, reopening, final-page
+access, and purge. It needs space for both the temporary and saved index.
 
 ## License
 

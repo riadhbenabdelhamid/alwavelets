@@ -128,6 +128,8 @@ def load_cache(source):
     if not ENABLED:
         return None
     try:
+        from .analysis_cache import source_signature
+        source_state = source_signature(source)
         st = os.stat(source)
         with open(cache_path(source), 'rb') as f:
             head = f.read(_HDR)
@@ -146,6 +148,7 @@ def load_cache(source):
         pos = 0
         vcd = VCDFile()
         vcd._filename = source
+        vcd._analysis_source = source_state
         vcd._parsed_offset = st.st_size
         vcd.timescale, pos = _rstr(mv, pos)
         (vcd.timescale_number,) = struct.unpack_from('<i', mv, pos); pos += 4

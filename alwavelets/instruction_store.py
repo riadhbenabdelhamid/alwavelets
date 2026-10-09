@@ -2,8 +2,10 @@
 from contextlib import contextmanager
 import marshal
 import operator
+from pathlib import Path
 import re
 import sqlite3
+import threading
 
 from .results import PagedResults
 from .storage import SequenceView
@@ -36,8 +38,53 @@ class InstructionResults(PagedResults):
                            ('rd', 'BLOB'), ('mem', 'BLOB'), ('csr', 'BLOB'), ('is_store', 'INTEGER'),
                            ('is_csr', 'INTEGER'), ('stall', 'INTEGER')]:
             self._db.execute('ALTER TABLE results ADD COLUMN ' + name + ' ' + kind)
+        self._configure_queries()
+
+    def _configure_queries(self):
         self._db.create_function('matches', 2, lambda pattern, text: bool(re.search(pattern, text or '', re.I)))
         self._selection_id = 0
+        self.cache_hit = False
+
+    @classmethod
+    def open_cached(cls, path, identity, owner=None):
+        """Open an application-owned, completed index; selections stay temporary."""
+        import json
+        result = cls.__new__(cls)
+        result.path = str(path)
+        result.item_type, result.fields = dict, None
+        result._lock, result._closed = threading.RLock(), threading.Event()
+        result._temporary, result._owner = None, None
+        result._db = sqlite3.connect(Path(path).absolute().as_uri() + '?mode=ro&immutable=1', check_same_thread=False)
+        try:
+            result._db.execute('PRAGMA cache_size=-1024')
+            result._db.execute('PRAGMA temp_store=FILE')
+            meta = dict(result._db.execute('SELECT key,value FROM analysis_meta'))
+            if json.loads(meta['identity']) != identity or meta['complete'] != '1':
+                raise ValueError('Stale instruction index')
+            result._count, result._max_duration = int(meta['count']), 0
+            if result._count < 0:
+                raise ValueError('Invalid instruction count')
+            indexes = {row[1] for row in result._db.execute('PRAGMA index_list(results)')}
+            if not {'result_time', *("instruction_" + name for name in ('pc', 'hart', 'thread', 'mnemonic', 'rd', 'reg', 'mem', 'csr'))} <= indexes:
+                raise ValueError('Incomplete instruction indexes')
+            last = result._db.execute('SELECT seq FROM results ORDER BY seq DESC LIMIT 1').fetchone()
+            if (last[0] + 1 if last else 0) != result._count:
+                raise ValueError('Incomplete instruction records')
+            result._configure_queries()
+            if result._count:
+                for entry in (result[0], result[-1]):
+                    if not isinstance(entry, dict) or not isinstance(entry['decoded'], dict):
+                        raise ValueError('Invalid instruction record')
+            result.cache_hit = True
+            if owner is not None:
+                if not hasattr(owner, '_result_stores'):
+                    owner._result_stores = set()
+                owner._result_stores.add(result)
+                result._owner = owner
+            return result
+        except BaseException:
+            result.close()
+            raise
 
     def _append(self, item):
         decoded = item.get('decoded', {})
@@ -203,6 +250,21 @@ class InstructionSelection:
 
     def __iter__(self):
         return self.iter_range(0, len(self))
+
+    def read_page(self, start, size=100, cancel=None):
+        if not 0 <= size <= 256 or start < 0:
+            raise ValueError('Invalid result page')
+        with self.source.sql_operation(cancel) as db:
+            if self.closed:
+                raise ValueError('Instruction selection is closed')
+            cursor = db.execute('SELECT r.data FROM ' + self.table + ' s JOIN results r ON r.seq=s.source '
+                                'WHERE s.ordinal>? AND s.ordinal<=? ORDER BY s.ordinal', (start, start + size))
+            try:
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        check_cancel(cancel)
+        return [self.source._restore(row[0]) for row in rows]
 
     def close(self):
         with self.source._lock:

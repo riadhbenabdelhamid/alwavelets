@@ -2376,22 +2376,12 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         # that would prompt become no-ops; agents pass arguments inline.
         if self._remote_depth:
             return ""
-        row = self.height - 1
+        from .ui_prompt import read_prompt
         try:
-            self.stdscr.addstr(row, 0, prompt_text.ljust(self.width - 1), curses.color_pair(self.C_PROMPT))
-        except curses.error:
-            pass
-        self.stdscr.refresh()
-        curses.echo()
-        curses.curs_set(1)
-        try:
-            inp = self.stdscr.getstr(row, len(prompt_text), 40)
-            return inp.decode('utf-8', errors='ignore').strip()
-        except Exception:
-            return ""
+            return read_prompt(self.stdscr, prompt_text, curses.color_pair(self.C_PROMPT))
         finally:
-            curses.noecho()
-            curses.curs_set(0)
+            self._needs_layout = True  # the terminal can resize while prompting
+            self._dirty = True
 
     # (do_search was replaced by the fuzzy finder — see finder.py. Committing
     # the finder seeds search_term/search_results, so `n` still cycles.)
@@ -2625,6 +2615,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     self._dirty = True
                 if queries is not None and queries.errors:
                     self._show_message('Read failed: ' + queries.errors.pop(0))
+                self.poll_instruction_results()
                 job = getattr(self, '_analysis_job', None)
                 if job is not None and job.progress != getattr(self, '_analysis_progress', None):
                     self._analysis_progress = job.progress
@@ -2680,6 +2671,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                             self.draw_register_panel()
                         if self._drag_cur is not None:
                             self.draw_drag_selection()
+                        if getattr(self, 'show_instruction_results', False):
+                            self.draw_instruction_results()
                         self.draw_status_bar()
 
                     self.stdscr.refresh()
@@ -2747,6 +2740,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 if self.show_tree:
                     if not self.tree_handle_key(key):
                         self.show_tree = False
+                    continue
+
+                if getattr(self, 'show_instruction_results', False):
+                    if self.instruction_results_handle_key(key) == 'QUIT':
+                        break
                     continue
 
                 # Panel mode: the tree gets first dibs on the key. Anything it

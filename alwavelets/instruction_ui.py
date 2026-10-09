@@ -129,7 +129,7 @@ def run_query(trace, query, start, end, cursor, width, *, cancel=None, progress=
         else:
             out.replace_markers = True
             out.markers = [(e['time'], e['decoded']['asm'][:20]) for e in out.matches[:100]]
-            out.message = f'{n} matches ({len(out.markers)} markers placed). < > to navigate.'
+            out.message = f'{n} matches ({len(out.markers)} markers). Use ;results to browse all.'
         if hart is not None:
             ipc = trace.hart_ipc(hart, filters.get('time_lo', 0), filters.get('time_hi'), cancel=cancel, progress=progress)
             out.message = f'Hart {hart}: {n} instrs, IPC={ipc:.3f} ({len(out.markers)} markers)'

@@ -328,6 +328,8 @@ class VCDFile:
         if metadata_only:
             vcd.signals = {}  # insertion order without linked-list overhead
         vcd._filename = filename
+        from .analysis_cache import stamp_source
+        stamp_source(vcd, filename)
         vcd._extent_known = False
         scope_stack = []
         current_scope = ""
