@@ -213,12 +213,23 @@ def main():
     parser.add_argument('--expanded', action='store_true', help="Start with all modules expanded (default: collapsed)")
     parser.add_argument('--mcp', action='store_true', help="Run as an MCP server (stdio) instead of the viewer")
     parser.add_argument('--no-cache', action='store_true', help="Disable persistent waveform and instruction caches")
+    parser.add_argument('--cache-dir', metavar='PATH',
+                        help="Cache directory (also ALWAVELETS_CACHE_DIR; default follows XDG_CACHE_HOME)")
+    parser.add_argument('--waveform-cache-mib', type=int, metavar='N',
+                        help="Saved waveform cache quota in MiB (default: unlimited; 0 disables)")
     parser.add_argument('--analysis-cache-mib', type=int, default=8192, metavar='N',
                         help="Persistent instruction cache quota in MiB (default: 8192; 0 disables)")
-    parser.add_argument('--purge-analysis-cache', action='store_true',
+    maintenance = parser.add_mutually_exclusive_group()
+    maintenance.add_argument('--purge-analysis-cache', action='store_true',
                         help="Remove cached instruction indexes and exit")
-    parser.add_argument('--purge-partial-indexes', action='store_true',
+    maintenance.add_argument('--purge-partial-indexes', action='store_true',
                         help="Remove idle incomplete waveform indexes and exit")
+    maintenance.add_argument('--list-waveform-cache', action='store_true',
+                             help="Show waveform cache entries, usage, and free space as JSON, then exit")
+    maintenance.add_argument('--purge-waveform-cache', action='store_true',
+                             help="Remove all idle waveform caches and checkpoints, then exit")
+    maintenance.add_argument('--remove-waveform-cache', action='append', metavar='NAME',
+                             help="Remove a named idle cache entry (repeatable); get names from --list-waveform-cache")
     parser.add_argument('--no-config', action='store_true', help="Ignore ~/.config/alwavelets/config.json")
     parser.add_argument('--no-session', action='store_true',
                         help="Ignore a saved session sidecar (open the trace fresh)")
@@ -236,7 +247,13 @@ def main():
         parser.error('--memory-mib must be positive')
     if args.analysis_cache_mib < 0:
         parser.error('--analysis-cache-mib must be nonnegative')
-    from . import analysis_cache, cache as _cache
+    if args.waveform_cache_mib is not None and args.waveform_cache_mib < 0:
+        parser.error('--waveform-cache-mib must be nonnegative')
+    from . import analysis_cache, index_cache, cache as _cache
+    if args.cache_dir:
+        _cache.DIRECTORY = args.cache_dir
+    if args.waveform_cache_mib is not None:
+        index_cache.QUOTA_BYTES = args.waveform_cache_mib * 1024 * 1024
     analysis_cache.QUOTA_BYTES = args.analysis_cache_mib * 1024 * 1024
     if args.no_cache:
         _cache.ENABLED = False
@@ -244,10 +261,19 @@ def main():
         count, size = analysis_cache.InstructionCache().purge()
         print(f'Removed {count} instruction indexes ({size / 1024 ** 2:.1f} MiB)')
         return
-    if args.purge_partial_indexes:
-        from .index_cache import purge_partial_indexes
-        count, size, skipped = purge_partial_indexes()
-        print(f'Removed {count} incomplete waveform indexes ({size / 1024 ** 2:.1f} MiB); skipped {skipped} busy or unavailable')
+    if args.purge_partial_indexes or args.list_waveform_cache or args.purge_waveform_cache or args.remove_waveform_cache:
+        import sqlite3
+        try:
+            manager = index_cache.WaveformCache()
+            if args.list_waveform_cache:
+                print(json.dumps(manager.inspect(), indent=2))
+            else:
+                count, size, skipped = manager.purge(args.remove_waveform_cache, partial_only=args.purge_partial_indexes)
+                label = 'incomplete waveform indexes' if args.purge_partial_indexes else 'waveform cache entries'
+                print(f'Removed {count} {label} ({size / 1024 ** 2:.1f} MiB); skipped {skipped} busy or unavailable')
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            print(f'Waveform cache error: {exc}', file=sys.stderr)
+            sys.exit(1)
         return
     if getattr(args, 'no_config', False):
         from . import config as _config

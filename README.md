@@ -92,6 +92,12 @@ Flags:
 | `--demo` | Generate and view a demo trace (written under a per-user temp directory) |
 | `--mcp` | Run as an MCP server (stdio) instead of the viewer |
 | `--no-cache` | Disable persistent waveform and instruction caches |
+| `--cache-dir PATH` | Cache directory; overrides `ALWAVELETS_CACHE_DIR` and the default XDG location |
+| `--waveform-cache-mib N` | Saved waveform cache retention quota in MiB, unlimited by default; 0 disables reuse and saving |
+| `--list-waveform-cache` | Print cache entries, sizes, busy status, usage, and free disk space as JSON, then exit |
+| `--remove-waveform-cache NAME` | Remove one idle entry by its exact listed name; repeat for multiple entries |
+| `--purge-waveform-cache` | Remove all idle waveform caches and checkpoints, then exit |
+| `--purge-partial-indexes` | Remove only idle incomplete VCD indexes, then exit |
 | `--analysis-cache-mib N` | Saved instruction-index quota, default 8192 MiB; 0 disables reuse and saving |
 | `--purge-analysis-cache` | Remove saved instruction indexes and exit |
 | `--no-config` | Ignore `~/.config/alwavelets/config.json` |
@@ -163,12 +169,44 @@ modification/change times must still match; otherwise indexing starts over.
 FST indexing currently restarts after interruption. Selective signal loading
 remains optional, and all VCD declarations are retained across checkpoints.
 
-Incomplete VCD indexes consume cache disk space until completed or removed.
-Run `alwavelets --purge-partial-indexes` to remove idle incomplete indexes;
-indexes owned by open viewers are skipped. `--no-cache` disables both saving
-and resuming. If another viewer owns the partial index or its cache directory
-is unavailable, opening uses temporary storage. Small lock files remain in the
-cache directory so concurrent opens and cleanup can coordinate safely.
+Caches default to `${XDG_CACHE_HOME:-~/.cache}/alwavelets`. Set `--cache-dir`
+or `ALWAVELETS_CACHE_DIR` to put waveform and instruction caches on another
+drive. Explicitly choosing a directory also places temporary waveform indexes
+there when possible; decompression spill files still use the system temporary
+directory (`TMPDIR`). Existing caches are not moved automatically.
+
+Waveform cache retention is unlimited by default. Set `--waveform-cache-mib N`
+to evict the least recently used inactive entries on opens, VCD checkpoints,
+completion, and close. This covers eager parse caches, completed disk indexes,
+incomplete VCD checkpoints, and their SQLite sidecars. It excludes small lock
+files, temporary work files, and instruction caches (which have a separate
+`--analysis-cache-mib` quota). Open viewers and builders are protected and can
+exceed the retention quota; it is not a hard disk-usage limit. A completed index
+larger than the quota remains usable until its last viewer closes. Zero disables
+waveform cache reuse and saving without deleting existing files.
+
+For example, use a cache on a larger drive with a 20 GiB retention quota:
+
+```sh
+alwavelets trace.vcd --storage disk --cache-dir /large-drive/alwavelets --waveform-cache-mib 20480
+alwavelets --cache-dir /large-drive/alwavelets --list-waveform-cache
+alwavelets --cache-dir /large-drive/alwavelets --remove-waveform-cache 'NAME_FROM_LIST'
+```
+
+`--purge-waveform-cache` removes all idle waveform entries;
+`--purge-partial-indexes` removes only idle incomplete indexes. Both skip files
+held by open viewers. `--no-cache` disables both saving and resuming. If another
+viewer owns the partial index or its cache directory is unavailable, opening
+uses temporary storage. Small lock files remain in the cache directory so
+concurrent opens and cleanup can coordinate safely.
+
+If disk space or a filesystem quota runs out, indexing reports the affected
+directory. When a VCD checkpoint has already been committed, that prefix stays
+readable and survives closing the viewer, even if it exceeds the retention
+quota. Free space and reopen the unchanged source to resume; choosing another
+cache directory starts a new index. Later cache maintenance may evict the idle
+checkpoint under the normal retention policy. FST indexing restarts after a
+disk-space failure.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, display edits, SQLite,

@@ -268,6 +268,8 @@ class TraceStore:
         self.thread = None
         self.temporary = None
         self.index_lease = None
+        self.cache_manager = None
+        self.preserve_checkpoint = False
         self.closed = False
 
     def bisect(self, key, timestamp, right=False):
@@ -411,6 +413,41 @@ class TraceStore:
             if self.index_lease:
                 self.index_lease.close()
                 self.index_lease = None
+            if self.cache_manager:
+                self.cache_manager.trim(exclude=(self.path,) if self.preserve_checkpoint else ())
+
+
+def _storage_error(exc, store=None):
+    """Restore the durable readable prefix after SQLite rolls back a full disk."""
+    from .index_cache import disk_full
+    if not disk_full(exc):
+        return str(exc)
+    saved = False
+    if store is not None and not store.closed:
+        store.preserve_checkpoint = store.cache_manager is not None and str(store.path).endswith('.partial')
+        with store.lock:
+            try:
+                store.db.rollback()
+                row = store.db.execute('SELECT value FROM meta WHERE key="trace"').fetchone()
+                meta = json.loads(row[0]) if row else {}
+                saved = bool(meta.get('checkpoint')) and store.temporary is None
+                if saved:
+                    store.preserve_checkpoint = True
+                    store.pages.clear()
+                    store.cache_bytes = 0
+                    store.counts.cache.clear()
+                    store.total_changes = meta['total_changes']
+                    store.vcd._load_changes = meta['changes']
+                    store.vcd.max_time = meta['max_time']
+                    store.vcd._load_progress = min(99, meta['checkpoint']['offset'] * 100 // max(1, meta['signature'][0]))
+                    store.generation += 1
+            except (sqlite3.Error, ValueError, KeyError, AttributeError):
+                pass
+    location = os.path.dirname(store.path) if store is not None else 'the index directory'
+    message = f'Not enough disk space for waveform indexing in {location}. '
+    if saved:
+        return message + 'The last VCD checkpoint is saved; free space and reopen to resume, or choose another --cache-dir.'
+    return message + 'Free space or choose another --cache-dir and reopen.'
 
 
 class PageWriter:
@@ -953,6 +990,8 @@ class PageWriter:
             self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
             self.store.db.commit()
             self.summary_groups.clear()
+        if self.store.cache_manager:
+            self.store.cache_manager.trim()
 
     def finish(self, source, signature, *, source_state=None):
         if self.store.cancel.is_set():
@@ -1034,14 +1073,13 @@ def _restore(store, source, *, allow_partial=False):
     return vcd
 
 
-def _open_partial(source, memory):
+def _open_partial(source, memory, manager):
     """Acquire or create a checkpoint, falling back if its cache is unavailable."""
-    from .index_cache import IndexLease, discard_partial
+    from .index_cache import discard_partial
     path = partial_index_path(source)
     store = lease = vcd = None
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        lease = IndexLease(path)
+        lease = manager.acquire(path)
         if os.path.exists(path):
             try:
                 store = TraceStore(path, memory)
@@ -1056,6 +1094,7 @@ def _open_partial(source, memory):
         if store is None:
             store = TraceStore(path, memory)
         store.index_lease = lease
+        store.cache_manager = manager
         return store, vcd
     except (OSError, sqlite3.Error):
         if store is not None:
@@ -1069,7 +1108,9 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     """Open VCD/FST into paged storage; all declarations remain available."""
     from .parsers import VCDFile
     from . import cache
-    use_cache = use_cache and cache.ENABLED
+    from .index_cache import WaveformCache, disk_full
+    manager = WaveformCache()
+    use_cache = use_cache and cache.ENABLED and manager.quota != 0
     source = os.path.abspath(source)
     if memory_mib <= 0:
         raise ValueError('memory_mib must be positive')
@@ -1078,17 +1119,25 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     check_cancel(cancel)
     memory = int(memory_mib * 1024 * 1024)
     target = index_path(source)
+    if use_cache:
+        manager.trim(exclude=(target, partial_index_path(source), cache.cache_path(source)))
     if use_cache and os.path.isfile(target):
-        store = None
+        store = lease = None
         try:
+            lease = manager.acquire(target, shared=True)
             store = TraceStore(target, memory)
+            store.index_lease = lease
             vcd = _restore(store, source)
             if vcd is not None:
+                store.cache_manager = manager
+                manager.touch(target)
                 return vcd
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             pass
         if store is not None:
             store.close()
+        elif lease is not None:
+            lease.close()
     signature = _signature(source)
     from .analysis_cache import source_signature
     source_state = source_signature(source)
@@ -1101,15 +1150,18 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     try:
         if use_cache:
             if not is_fst:
-                store, vcd = _open_partial(source, memory)
+                store, vcd = _open_partial(source, memory, manager)
                 use_cache = store is not None
                 if store is not None:
                     lease, path = store.index_lease, store.path
             else:
                 try:
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    lease = manager.acquire(target)
                     temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
-                except OSError:
+                except (OSError, sqlite3.Error):
+                    if lease is not None:
+                        lease.close()
+                        lease = None
                     use_cache = False
         if vcd is not None and not hasattr(vcd, '_checkpoint'):
             # A crash can occur after the final commit but before rename.
@@ -1118,15 +1170,24 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                 store.path = target
             except OSError:
                 pass
+            manager.touch(store.path)
+            manager.share(store.index_lease)
             store.cancel = cancel
             return vcd
         if not use_cache:
-            temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
+            directory = cache.configured_directory()
+            try:
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=directory)
+            except OSError:
+                temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
         if temporary is not None:
             path = os.path.join(temporary.name, 'trace.sqlite')
         if store is None:
             store = TraceStore(path, memory)
         store.index_lease = lease
+        store.cache_manager = manager if use_cache else None
         store.cancel = cancel
         store.temporary = temporary
         if vcd is not None:
@@ -1145,12 +1206,13 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                 vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
         if not vcd.signal_order:
             raise ValueError('Trace has no signal declarations')
-        writer = PageWriter(store, vcd, checkpointed=lease is not None, resume=resume)
+        writer = PageWriter(store, vcd, checkpointed=lease is not None and not is_fst, resume=resume)
         if writer.checkpointed and resume is None:
             writer.checkpoint(source, signature, source_state, offset, state)
         vcd._loading = True
         vcd._extent_known = False
-    except BaseException:
+    except BaseException as exc:
+        message = _storage_error(exc, store) if disk_full(exc) else None
         preparation.close()
         if store is not None:
             store.close()
@@ -1158,6 +1220,8 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             temporary.cleanup()
         if lease is not None:
             lease.close()
+        if message is not None:
+            raise ValueError(message) from exc
         raise
 
     def build():
@@ -1178,8 +1242,11 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                     store.path = target
                 except OSError:
                     pass  # the complete temporary index remains usable
+                manager.touch(store.path)
+                manager.share(store.index_lease)
+                manager.trim()
         except Exception as exc:
-            vcd._load_error = str(exc)
+            vcd._load_error = _storage_error(exc, store)
         finally:
             vcd._loading = False
 

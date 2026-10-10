@@ -11,8 +11,10 @@ any failure falls back to a normal parse.
 import array
 import hashlib
 import os
+import sqlite3
 import struct
 import sys
+import tempfile
 import zlib
 
 from .core import VCDSignal, AliasSignal
@@ -24,9 +26,18 @@ _BO = 0 if sys.byteorder == 'little' else 1
 
 # Module-level switch so `--no-cache` can disable load + save in one place.
 ENABLED = True
+DIRECTORY = None
+
+
+def configured_directory():
+    selected = DIRECTORY or os.environ.get('ALWAVELETS_CACHE_DIR')
+    return os.path.abspath(os.path.expanduser(selected)) if selected else None
 
 
 def _cache_dir():
+    selected = configured_directory()
+    if selected:
+        return selected
     base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
     return os.path.join(base, 'alwavelets')
 
@@ -54,8 +65,11 @@ def _rstr(mv, pos):
 
 def save_cache(vcd, source):
     """Write `vcd` to its cache file. Returns True on success, False otherwise."""
-    if not ENABLED:
+    from .index_cache import WaveformCache
+    manager = WaveformCache()
+    if not ENABLED or manager.quota == 0:
         return False
+    lease = tmp = None
     try:
         st = os.stat(source)
         if (getattr(vcd, '_store', None) is not None or getattr(vcd, '_lazy_mode', False) or not vcd._extent_known
@@ -108,16 +122,28 @@ def save_cache(vcd, source):
                 body += blob
         comp = zlib.compress(bytes(body), 6)
         header = _MAGIC + struct.pack('<IBQQ', _VERSION, _BO, st.st_size, st.st_mtime_ns)
-        os.makedirs(_cache_dir(), exist_ok=True)
         path = cache_path(source)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, 'wb') as f:
+        if manager.quota is not None and len(header) + len(comp) > manager.quota:
+            return False
+        manager.trim(exclude=(path,))
+        lease = manager.acquire(path)
+        descriptor, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.', suffix='.tmp', dir=_cache_dir())
+        with os.fdopen(descriptor, 'wb') as f:
             f.write(header)
             f.write(comp)
         os.replace(tmp, path)
         return True
     except Exception:
         return False
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if lease is not None:
+            lease.close()
+            manager.trim()
 
 
 _HDR = struct.calcsize('<IBQQ') + 4   # magic + version + bo + size + mtime
@@ -125,8 +151,29 @@ _HDR = struct.calcsize('<IBQQ') + 4   # magic + version + bo + size + mtime
 
 def load_cache(source):
     """Return a fully-loaded VCDFile from a valid cache, or None."""
-    if not ENABLED:
+    from .index_cache import WaveformCache
+    manager = WaveformCache()
+    if not ENABLED or manager.quota == 0:
         return None
+    path = cache_path(source)
+    if not os.path.isfile(path):
+        return None
+    lease = None
+    try:
+        lease = manager.acquire(path, shared=True)
+        result = _load_cache(source)
+        if result is not None:
+            manager.touch(path)
+        return result
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        if lease is not None:
+            lease.close()
+            manager.trim()
+
+
+def _load_cache(source):
     try:
         from .analysis_cache import source_signature
         source_state = source_signature(source)
