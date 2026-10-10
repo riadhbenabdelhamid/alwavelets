@@ -141,7 +141,7 @@ Changed sources and older index formats rebuild the index;
 incomplete/cancelled indexes are never reused.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
-pages, **not total process memory**: Python, scopes, selected signal IDs, SQLite,
+pages, **not total process memory**: Python, scopes, display edits, SQLite,
 builder buffers, and active query pages need additional memory. FST chains,
 frames, hierarchies, handle geometry, block/chain indexes, and timestamp tables use bounded buffers that
 spill to temporary files. zlib, LZ4, FastLZ, and outer gzip decompression process
@@ -153,15 +153,20 @@ Declarations, declaration order, and direct scope membership live in SQLite
 during both the first parse and cached reopening. Signal objects use a bounded
 cache; held objects and alias masters retain their identity across eviction.
 Event counts, ingestion timestamps, and pending summary groups also use bounded
-caches. The scope tree still grows with the number of scopes, and displaying or
-explicitly collecting every signal ID still requires space proportional to that
+caches. Display order uses compact catalog ranges, with space proportional to
+the number of runs and explicit edits. The scope tree still grows with the
+number of scopes. Highly fragmented selections, explicit group memberships,
+or collecting every signal ID can still require memory proportional to the
 selection. All declarations remain available without selecting a shortlist.
 
 The signal browser indexes scope runs and creates signal rows only when they
 are visible. Expanding a large scope does not create one UI entry per signal.
 The split panel reads the selected scope directly; subtree counts and
 checkmarks are cached. Home/End and Page Up/Down navigate both tree views.
-Selecting an entire scope still visits its signals.
+Scope selection and checkmarks use catalog ranges. Contiguous scopes can be
+toggled without visiting each signal; interleaved declarations may require a
+scan to find their runs. Reordering, undo, and small display groups preserve
+the surrounding ranges. Finder navigation snapshots also share these runs.
 
 The `/` finder reads names without materializing the catalog. Disk-backed and
 large in-memory traces rank fuzzy matches on a cancellable background worker;
@@ -307,12 +312,16 @@ results; a whole-trace search can therefore load substantially more data than
 the visible window. Commands report when the initial background load is still
 in progress instead of searching incomplete data.
 
-New session and arrangement files identify signals by hierarchical reference,
-declared range, width, and type, so layouts survive regenerated VCD identifier
-codes. Missing or ambiguous references are reported. Older version-1 files
-remain readable using their original identifiers; save them again against the
-original trace to upgrade their references. Saved time positions are restored
-after background loading establishes the trace extent.
+Sessions and arrangements preserve hierarchical references, declared ranges,
+widths, and types, so layouts survive regenerated VCD identifier codes.
+Disk-backed views save compact version-3 display ranges and a declaration-layout
+fingerprint. They require the same declaration identities and order; a changed
+layout is reported and the saved view is left unapplied. Versions 1 and 2 remain
+readable: version 2 resolves names and reports missing or ambiguous references,
+while version 1 uses original identifiers. Older waveform indexes compute the
+fingerprint with a bounded scan when first needed in that open session; newly
+built indexes store it. Saved time positions are restored after background
+loading establishes the trace extent.
 
 Diff comparison normalizes both traces to the same time units and compares
 their overlapping time extent, including values held through the end of that
@@ -603,8 +612,9 @@ uses the real viewer constructor with all signals selected and a recording
 screen; terminal I/O and waveform painting are excluded. `--formats vcd` or
 `--formats fst` restricts the generated inputs.
 
-A local million-signal run against `312c8c6`, with an 8 MiB waveform cache,
-measured the following (timings depend on the machine and storage):
+A local million-signal comparison of `ae4ed59` against `312c8c6`, with an
+8 MiB waveform cache, measured the following (timings depend on the machine
+and storage):
 
 | Measurement | Before | Batched ingestion + inline histories |
 | --- | ---: | ---: |
@@ -616,15 +626,45 @@ measured the following (timings depend on the machine and storage):
 | Cached reopen | 6–7 ms | 6–7 ms |
 
 These synthetic traces contain one initial value per signal; gains depend on
-history length and value width. Headless browsing/search with all signals
-selected still used about 128 MiB. Fuzzy ranking completed in 1.5–2.3 seconds
+history length and value width. At `ae4ed59`, headless browsing/search with all
+signals selected used about 128 MiB. Fuzzy ranking completed in 1.5–2.3 seconds
 in the background, and the first all-selected scope checkmark paint took about
-0.5 seconds; subsequent paints reuse its cached state.
+0.5 seconds. Compact display ranges address this remaining selection overhead.
 
 A separate background FST run with 100,000 signals made metadata available in
 1.1 seconds and the first waveform readable in 1.6 seconds, before indexing
 finished at 2.0 seconds. A ten-million-event scalar FST indexed in 8.9 seconds
 with 25 MiB peak RSS. These startup measurements exclude terminal rendering.
+
+Selection/session checks use real FSTs, prebuilt indexes, fresh viewer processes,
+and a recording screen. They exercise scope toggles, distant navigation,
+move/delete undo, a small nested group, and session serialization/restoration:
+
+```sh
+python3 tools/stress_selection.py --signals 1000000 10000000 --output selection.json
+python3 tools/stress_selection.py --signals 1000000 --repo /path/to/baseline --output selection-baseline.json
+```
+
+A local run comparing `ae4ed59` to compact display ranges measured:
+
+| Measurement | Before, 1M signals | Compact, 1M signals | Compact, 10M signals |
+| --- | ---: | ---: | ---: |
+| Viewer construction | 507 ms | below 1 ms | below 1 ms |
+| First scope paint | 571 ms | below 1 ms | below 1 ms |
+| Remove/add entire scope | 566–833 ms | below 1 ms | below 1 ms |
+| Session serialization | 29.8 s | below 1 ms | below 1 ms |
+| Session JSON | 91.7 MB | below 1 KiB | below 1 KiB |
+| Session restoration | 36.3 s | below 1 ms | below 1 ms |
+| Peak RSS, including session roundtrip | 1,350 MiB | 26 MiB | 27 MiB |
+
+These are flat, all-selected catalogs with one value per signal. Preparation,
+terminal I/O, and waveform painting are excluded. The JSON metric uses compact
+formatting; the application's indented default session also stays below 1 KiB.
+Fragmented orders, many scopes, or large explicit groups need more memory/work.
+The separate million-signal FST browsing/finder workflow used 29 MiB with compact
+display ranges, versus about 128 MiB at `ae4ed59`. Cached reopening stayed near
+6 ms. Computing declaration fingerprints adds work to the initial indexing
+pass; cold indexing measured 24.7 seconds in this run.
 
 ## License
 

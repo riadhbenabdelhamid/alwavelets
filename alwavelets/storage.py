@@ -439,6 +439,7 @@ class PageWriter:
             attach_catalog(store, vcd, catalog)
             vcd.scopes = None
         vcd.signals.flush_declarations()
+        db.execute('INSERT INTO meta VALUES(?,?)', ('catalog_layout', vcd.signals.layout_signature))
         db.commit()
         vcd._store = store
         vcd._lazy_mode = False

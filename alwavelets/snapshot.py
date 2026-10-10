@@ -116,8 +116,8 @@ def _resolve_palette(theme):
 def load_arrangement(vcd, path):
     """Read a saved arrangement file and return (signal_full_names, radix_name).
 
-    Version 2 resolves declaration identities before mapping display order to
-    full names; legacy files use raw identifiers. Missing signals are skipped."""
+    Versions 2/3 resolve identities or validated catalog ranges before mapping
+    display order to full names; legacy files use raw identifiers."""
     with open(path) as f:
         data = json.load(f)
     from .persistence import remap_view_state

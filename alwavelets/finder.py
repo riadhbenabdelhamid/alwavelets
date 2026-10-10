@@ -285,8 +285,8 @@ class FinderMixin:
 
             def _undo(sids=added_sids):
                 gone = set(sids)
-                self.display_order[:] = [s for s in self.display_order
-                                         if s not in gone]
+                from .display_order import remove_display_ids
+                remove_display_ids(self.display_order, gone)
             self.push_undo(f"add {added} signal{'s' if added != 1 else ''}", _undo)
 
         # Jump to the first chosen signal, unfolding its group if collapsed.
@@ -310,7 +310,8 @@ class FinderMixin:
         self.search_results = []
         if q and len(self.display_order) > 4096:
             from .finder_search import FinderCandidates, FinderSearch
-            self._finder_next_order = list(self.display_order)
+            from .display_order import copy_order
+            self._finder_next_order = copy_order(self.display_order)
             self._finder_next_worker = FinderSearch(self.vcd)
             self._finder_next_worker.request(FinderCandidates(self.vcd, self._finder_next_order,
                                                              dict(getattr(self, 'virtual_signals', {}))), q,

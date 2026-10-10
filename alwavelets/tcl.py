@@ -229,8 +229,9 @@ class TclEngine:
             self.output.append(f"Current: {self.viewer.current_theme}. Available: {', '.join(self.viewer.THEME_ORDER)}")
 
     def _cmd_expand(self, args):
+        from .display_order import copy_order
         for pat in args:
-            for sid in list(self.viewer.display_order):
+            for sid in copy_order(self.viewer.display_order):
                 sig = self.viewer.vcd.signals.get(sid)
                 if sig and sig.size > 1 and fnmatch.fnmatch(sig.name, pat):
                     self.viewer.expand_bus(sid)

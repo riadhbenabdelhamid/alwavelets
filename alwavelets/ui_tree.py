@@ -7,7 +7,8 @@ from .rendering import *  # noqa: F401,F403
 from .decoders import *  # noqa: F401,F403
 from .parsers import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
-from .hierarchy import scope_signal_ids, scope_all_selected
+from .hierarchy import scope_signal_ids, scope_all_selected, walk_scopes
+from .display_order import DisplayOrder
 
 
 class TreePanelMixin:
@@ -158,6 +159,11 @@ class TreePanelMixin:
 
     def _tree_add_scope_signals(self, scope_node):
         """Add all signals in scope (and subscopes) to display."""
+        if isinstance(self.display_order, DisplayOrder):
+            order = self.display_order
+            order.add_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
+            self._scope_check_cache = {}
+            return
         self._sync_display_set()
         present = self._display_order_set
         for sid in self._scope_signal_ids(scope_node):
@@ -168,6 +174,11 @@ class TreePanelMixin:
 
     def _tree_remove_scope_signals(self, scope_node):
         """Remove all signals in scope (and subscopes) from display."""
+        if isinstance(self.display_order, DisplayOrder):
+            order = self.display_order
+            order.remove_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
+            self._scope_check_cache = {}
+            return
         drop = set(self._scope_signal_ids(scope_node))
         if drop:
             self.display_order = [s for s in self.display_order if s not in drop]
@@ -181,6 +192,9 @@ class TreePanelMixin:
 
     def _tree_scope_all_checked(self, scope_node):
         """Check if all signals in scope (and subscopes) are in display. Cached."""
+        if isinstance(self.display_order, DisplayOrder):
+            order = self.display_order
+            return order.contains_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
         return scope_all_selected(scope_node, self._display_order_set, self._scope_check_cache)
 
     # ── Bus Expansion ──

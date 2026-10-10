@@ -1,6 +1,8 @@
 """Disk-backed declarations, order and scope membership for wide traces."""
 from collections import OrderedDict
 from collections.abc import Mapping, MutableMapping, Sequence
+import hashlib
+from itertools import islice
 import json
 import operator
 import weakref
@@ -71,6 +73,10 @@ class SignalCatalog(Mapping):
         self.live = weakref.WeakValueDictionary()
         self.pending = []
         self.pending_bytes = 0
+        self._ordinals = OrderedDict()
+        self._scope_ranges = OrderedDict()
+        self._layout_hash = hashlib.sha256() if create else None
+        self._layout_signature = None
         if create:
             store.db.executescript('''
                 CREATE TABLE signals(seq INTEGER PRIMARY KEY,sid TEXT UNIQUE,definition TEXT,
@@ -118,6 +124,7 @@ class SignalCatalog(Mapping):
                         continue
                 key = identifier if old is None else '%s #%d' % (identifier, self.count)
                 encoded = json.dumps(definition)
+                self._layout_hash.update(json.dumps([name, size, kind, scope, definition[5]]).encode() + b'\n')
                 full = signal_display_name(name, size, bounds)
                 if scope:
                     full = scope + '.' + full
@@ -137,6 +144,87 @@ class SignalCatalog(Mapping):
                            ((n, key) for key, n in aliases.items()))
             self.pending.clear()
             self.pending_bytes = 0
+            self._ordinals.clear()
+            self._scope_ranges.clear()
+
+    @property
+    def layout_signature(self):
+        """Declaration identity/order, independent of VCD/FST handle spelling."""
+        self.flush_declarations()
+        if self._layout_hash is not None:
+            return self._layout_hash.hexdigest()
+        if self._layout_signature is None:
+            with self.store.lock:
+                row = self.store.db.execute('SELECT value FROM meta WHERE key="catalog_layout"').fetchone()
+            if row is not None:
+                self._layout_signature = row[0]
+            else:
+                # Older indexes remain usable; only their first session save
+                # needs this bounded scan, without constructing signal objects.
+                digest = hashlib.sha256()
+                for definition, in self.rows('definition'):
+                    name, _, size, kind, scope, bounds = json.loads(definition)
+                    digest.update(json.dumps([name, size, kind, scope, bounds]).encode() + b'\n')
+                self._layout_signature = digest.hexdigest()
+        return self._layout_signature
+
+    def ordinal(self, sid):
+        with self.store.lock:
+            if sid in self._ordinals:
+                self._ordinals.move_to_end(sid)
+                return self._ordinals[sid]
+            row = self.store.db.execute('SELECT seq FROM signals WHERE sid=?', (sid,)).fetchone()
+            value = row[0] if row else None
+            self._ordinals[sid] = value
+            if len(self._ordinals) > 1024:
+                self._ordinals.popitem(last=False)
+            return value
+
+    def ordinal_items(self, items):
+        """Resolve an explicit selection in bounded batches, in input order."""
+        items = iter(items)
+        while True:
+            batch = list(islice(items, 512))
+            if not batch:
+                return
+            keys = [item for item in batch if isinstance(item, str)]
+            with self.store.lock:
+                found = dict(self.store.db.execute('SELECT sid,seq FROM signals WHERE sid IN (' +
+                                                   ','.join('?' for _ in keys) + ')', keys)) if keys else {}
+            for item in batch:
+                yield item, found.get(item)
+
+    def scope_ranges(self, path):
+        """Direct scope membership as ordinal runs, preserving declaration order."""
+        cached = self._scope_ranges.get(path)
+        if cached is not None:
+            self._scope_ranges.move_to_end(path)
+            return cached
+        with self.store.lock:
+            db = self.store.db
+            row = db.execute('SELECT n FROM scopes WHERE path=?', (path,)).fetchone()
+            count = row[0] if row else 0
+            if not count:
+                return []
+            lo = db.execute('SELECT seq FROM signals WHERE scope=? AND local_seq=0', (path,)).fetchone()[0]
+            hi = db.execute('SELECT seq FROM signals WHERE scope=? AND local_seq=?', (path, count - 1)).fetchone()[0]
+        if hi - lo + 1 == count:
+            runs = [range(lo, hi + 1)]
+        else:
+            runs = []
+            for start in range(0, count, 256):
+                with self.store.lock:
+                    rows = self.store.db.execute('SELECT seq FROM signals WHERE scope=? AND local_seq>=? '
+                                                 'AND local_seq<? ORDER BY local_seq', (path, start, start + 256)).fetchall()
+                for seq, in rows:
+                    if runs and runs[-1].stop == seq:
+                        runs[-1] = range(runs[-1].start, seq + 1)
+                    else:
+                        runs.append(range(seq, seq + 1))
+        self._scope_ranges[path] = runs
+        if len(self._scope_ranges) > 128:
+            self._scope_ranges.popitem(last=False)
+        return runs
 
     def __len__(self):
         self.flush_declarations()

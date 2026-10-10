@@ -22,6 +22,8 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .finder import FinderMixin
 from .hierarchy import ScopeIndex, TreeRows
+from .display_order import (DisplayOrder, DisplayMembership, copy_order,
+                            remove_display_ids, member_positions, grouped_rows)
 from .ui_livereload import LiveReloadMixin
 from .ui_tree import TreePanelMixin
 from .ui_export import ExportMixin
@@ -175,6 +177,21 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     }
     THEME_ORDER = ['dark', 'light', 'phosphor', 'futuristic', 'mono']
 
+    @property
+    def display_order(self):
+        return self._display_order
+
+    @display_order.setter
+    def display_order(self, order):
+        from .catalog import SignalCatalog
+        catalog = getattr(getattr(self, 'vcd', None), 'signals', None)
+        if isinstance(catalog, SignalCatalog):
+            order = DisplayOrder.from_order(catalog, order)
+        self._display_order = order
+        if isinstance(order, DisplayOrder):
+            self._display_order_set = DisplayMembership(order)
+            self._scope_check_cache = {}
+
     def __init__(self, stdscr, vcd):
         self.stdscr = stdscr
         self.vcd = vcd
@@ -207,8 +224,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.search_idx = 0
 
         # Signal ordering (mutable copy)
-        self.display_order = list(vcd.signal_order)
-        self._display_order_set = set(self.display_order)
+        from .catalog import SignalCatalog
+        self.display_order = vcd.signal_order if isinstance(vcd.signals, SignalCatalog) else list(vcd.signal_order)
+        self._sync_display_set()
         self._undo_stack = []         # (description, inverse-closure) — see undo()
 
         # Collapsible display groups (overlay on display_order; see view_rows).
@@ -791,8 +809,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         # Without group headers, the read-only row view can share the order.
         # Rebuilding a million-entry copy on every split-panel redraw stalls
         # scrolling even when only a few waveform rows are visible.
-        rows = [] if mg else self.display_order
-        for sid in self.display_order if mg else ():
+        compact = isinstance(self.display_order, DisplayOrder)
+        rows = grouped_rows(self.display_order, mg, gbn, self._group_chain) if mg and compact else ([] if mg else self.display_order)
+        for sid in self.display_order if mg and not compact else ():
             g = mg.get(sid)
             if g is None:
                 rows.append(sid)
@@ -855,7 +874,14 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         # gather them at the first member's slot, keeping their order. A V
         # selection is contiguous already; named members ('group x a c') and
         # a selection with gaps are not.
-        first = next((i for i, s in enumerate(self.display_order) if s in mset), None)
+        if isinstance(self.display_order, DisplayOrder):
+            positions = member_positions(self.display_order, mset)
+            if positions:
+                self.display_order.remove_ids(mset)
+                self.display_order[positions[0][0]:positions[0][0]] = [s for _, s in positions]
+            first = None
+        else:
+            first = next((i for i, s in enumerate(self.display_order) if s in mset), None)
         if first is not None:
             picked = [s for s in self.display_order if s in mset]
             rest = [s for s in self.display_order if s not in mset]
@@ -1018,7 +1044,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
         def _undo(sids=list(added)):
             gone = set(sids)
-            self.display_order[:] = [s for s in self.display_order if s not in gone]
+            remove_display_ids(self.display_order, gone)
             self._display_order_set.difference_update(gone)
         self.push_undo("add %d signal%s" % (len(added), "s" * (len(added) != 1)), _undo)
         self._rebuild_view_rows()
@@ -1048,7 +1074,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         if not removed:
             return "remove: nothing displayed matched %s" % ", ".join(pats)
         gone = {s for _, s in removed}
-        self.display_order[:] = [s for s in self.display_order if s not in gone]
+        remove_display_ids(self.display_order, gone)
         self._display_order_set.difference_update(gone)
         self._scope_check_cache = {}
 
@@ -1186,11 +1212,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                      'collapsed': g['collapsed'], 'parent': g.get('parent')}
                     for g in gs]
         snap = _copy(self.groups)
-        order = list(self.display_order)     # ;group gathers/adds rows too
+        order = copy_order(self.display_order)     # ;group gathers/adds rows too
 
         def _undo():
             self.groups = _copy(snap)
-            self.display_order = list(order)
+            self.display_order = copy_order(order)
             self._sync_display_set()
             self._reindex_groups()
             self._rebuild_view_rows()
@@ -1236,6 +1262,17 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         hidden by a collapsed scope look already-displayed, so the '/' finder
         and ';add' both silently refused to add those signals.
         """
+        catalog = self.vcd.signals
+        if getattr(catalog, 'order', None) is self.vcd.signal_order:
+            order = DisplayOrder.from_order(catalog, catalog.order)
+            from .hierarchy import walk_scopes
+            for node in walk_scopes(self.vcd.scopes):
+                path = node.full_path
+                if any(path == scope or path.startswith(scope + '.') for scope in self.collapsed_scopes):
+                    order.remove_ranges(catalog.scope_ranges(path))
+            self.display_order = order
+            self._sync_display_set()
+            return
         if not self.collapsed_scopes:
             self.display_order = list(self.vcd.signal_order)
             self._sync_display_set()
@@ -1446,9 +1483,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         if not fname.endswith('.json'):
             fname += '.json'
         data = {
-            'version': 2,
-            'signal_identities': signal_identities(self.vcd, view_reference_ids(self)),
-            'display_order': self.display_order,
+            **view_order_state(self),
             'analog_signals': list(self.analog_signals),
             'collapsed_scopes': list(self.collapsed_scopes),
             'groups': [{'name': g['name'], 'members': list(g['members']),
@@ -1472,8 +1507,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 data = json.load(f)
             data, missing = remap_view_state(self.vcd, data)
             # Validate signal IDs exist
-            valid_ids = set(self.vcd.signal_order)
-            self.display_order = [s for s in data.get('display_order', []) if s in valid_ids]
+            valid_ids = self.vcd.signals
+            saved_order = data.get('display_order', [])
+            self.display_order = saved_order if isinstance(saved_order, DisplayOrder) else [s for s in saved_order if s in valid_ids]
             self.analog_signals = set(s for s in data.get('analog_signals', []) if s in valid_ids)
             self.collapsed_scopes = set(data.get('collapsed_scopes', []))
             self.groups = []
@@ -1518,9 +1554,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         layout (order/groups/analog/heights/colors), radixes, markers, and
         the view (zoom window, cursors, display knobs)."""
         return {
-            'version': 2,
-            'signal_identities': signal_identities(self.vcd, view_reference_ids(self)),
-            'display_order': self.display_order,
+            **view_order_state(self),
             'groups': [{'name': g['name'], 'members': sorted(g['members']),
                         'collapsed': g['collapsed'], 'parent': g.get('parent')}
                        for g in self.groups],
@@ -1583,9 +1617,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             return False
         try:
             data, missing = remap_view_state(self.vcd, data)
-            valid = set(self.vcd.signal_order)
-            order = [s for s in data.get('display_order', []) if s in valid]
-            if order or data.get('version') == 2:
+            valid = self.vcd.signals
+            saved_order = data.get('display_order', [])
+            order = saved_order if isinstance(saved_order, DisplayOrder) else [s for s in saved_order if s in valid]
+            if order or data.get('version') in (2, 3):
                 self.display_order = order
             self.analog_signals = {s for s in data.get('analog_signals', []) if s in valid}
             self.collapsed_scopes = set(data.get('collapsed_scopes', []))
@@ -1631,7 +1666,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self._show_message("Session restored  (;session clear to forget it)" +
                                (f" — {missing} unresolved signal(s)" if missing else ""))
             return True
-        except Exception:
+        except Exception as exc:
+            if isinstance(data, dict) and data.get('version') == 3:
+                self._show_message('Session not restored: ' + str(exc))
             return False    # stale/corrupt sidecar: open normally
 
     def _show_message(self, msg):
@@ -1712,7 +1749,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def _sync_display_set(self):
         """Sync the display_order_set with display_order list."""
-        self._display_order_set = set(self.display_order)
+        self._display_order_set = (DisplayMembership(self.display_order) if isinstance(self.display_order, DisplayOrder)
+                                   else set(self.display_order))
         self._scope_check_cache = {}
 
     def _invalidate_scope_cache(self):

@@ -53,8 +53,11 @@ class FinderCandidates(Sequence):
     def names(self):
         """Stream names directly from the catalog, without filling its object cache."""
         from .catalog import SignalCatalog
+        from .display_order import DisplayOrder
         catalog = self.vcd.signals
-        if isinstance(catalog, SignalCatalog) and self.order is catalog.order:
+        if isinstance(self.order, DisplayOrder):
+            yield from self.order.names(self.extras)
+        elif isinstance(catalog, SignalCatalog) and self.order is catalog.order:
             yield from (row[0].lower() for row in catalog.rows('full_name'))
         elif isinstance(catalog, SignalCatalog):
             for start in range(0, len(self.order), 256):

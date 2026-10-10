@@ -4,6 +4,8 @@ import json
 import os
 import re
 
+from .display_order import DisplayOrder
+
 
 def _write_json_atomic(path, data):
     """Serialise first, write a temp file beside `path`, then rename it over.
@@ -29,12 +31,42 @@ def signal_identities(vcd, ids=None):
 
 
 def view_reference_ids(viewer):
-    ids = set(viewer.display_order)
+    order = viewer.display_order
+    ids = ({sid for part in order.parts if isinstance(part, tuple) for sid in part}
+           if isinstance(order, DisplayOrder) else set(order))
     for field in ('analog_signals', 'selected_signals', 'sig_radix', 'sig_color', 'sig_height'):
         ids.update(getattr(viewer, field, ()))
     for group in viewer.groups:
         ids.update(group['members'])
     return ids
+
+
+def view_order_state(viewer):
+    """Compact sessions refer to an exact declaration layout, not raw handles."""
+    ids = view_reference_ids(viewer)
+    state = {'version': 2, 'signal_identities': signal_identities(viewer.vcd, ids)}
+    order = viewer.display_order
+    if isinstance(order, DisplayOrder):
+        state.update(version=3, display_ranges={
+            'layout': order.catalog.layout_signature, 'count': len(order.catalog),
+            'parts': [[p.start, p.stop] if isinstance(p, range) else {'ids': list(p)} for p in order.parts]},
+            signal_ordinals={sid: order.catalog.ordinal(sid) for sid in state['signal_identities']})
+    else:
+        state['display_order'] = list(order)
+    return state
+
+
+def _layout_signature(vcd):
+    from .catalog import SignalCatalog
+    if isinstance(vcd.signals, SignalCatalog):
+        return vcd.signals.layout_signature
+    import hashlib
+    digest = hashlib.sha256()
+    for sid in vcd.signals:
+        sig = vcd.signals[sid]
+        digest.update(json.dumps([sig.reference, sig.size, sig.signal_type, sig.scope,
+                                 sig.declared_range]).encode() + b'\n')
+    return digest.hexdigest()
 
 
 def remap_view_state(vcd, data):
@@ -47,17 +79,34 @@ def remap_view_state(vcd, data):
         raise ValueError('view state must be an object')
     if data.get('version', 1) == 1:
         return data, 0
-    if data.get('version') != 2 or not isinstance(data.get('signal_identities'), dict):
+    if data.get('version') not in (2, 3) or not isinstance(data.get('signal_identities'), dict):
         raise ValueError('unsupported view state version')
-    by_identity = {}
-    for sid, identity in signal_identities(vcd).items():
-        key = json.dumps(identity, sort_keys=True)
-        by_identity.setdefault(key, []).append(sid)
     mapping = {}
-    for old, identity in data['signal_identities'].items():
-        matches = by_identity.get(json.dumps(identity, sort_keys=True), [])
-        if len(matches) == 1:
-            mapping[old] = matches[0]
+    compact = data.get('version') == 3
+    if compact:
+        spec = data.get('display_ranges', {})
+        if spec.get('count') != len(vcd.signals) or spec.get('layout') != _layout_signature(vcd):
+            raise ValueError('saved display ranges belong to a different declaration layout')
+        from .catalog import SignalCatalog
+        order = vcd.signals.order if isinstance(vcd.signals, SignalCatalog) else list(vcd.signals)
+        for old, identity in data['signal_identities'].items():
+            ordinal = data.get('signal_ordinals', {}).get(old)
+            if type(ordinal) is int and 0 <= ordinal < len(order):
+                sid = order[ordinal]
+                if vcd.signals[sid].identity() == identity:
+                    mapping[old] = sid
+    else:
+        wanted = {json.dumps(identity, sort_keys=True): [] for identity in data['signal_identities'].values()}
+        # Keep only referenced matches; a small legacy arrangement should not
+        # materialize the whole catalog merely to resolve its names.
+        for sid in vcd.signals if wanted else ():
+            key = json.dumps(vcd.signals[sid].identity(), sort_keys=True)
+            if key in wanted and len(wanted[key]) < 2:
+                wanted[key].append(sid)
+        for old, identity in data['signal_identities'].items():
+            matches = wanted[json.dumps(identity, sort_keys=True)]
+            if len(matches) == 1:
+                mapping[old] = matches[0]
     out = dict(data)
     referenced = set()
 
@@ -73,6 +122,18 @@ def remap_view_state(vcd, data):
             referenced.update(data[field])
             out[field] = {mapping[sid]: value for sid, value in data[field].items() if sid in mapping}
     out['groups'] = [dict(g, members=remap(g.get('members', []))) for g in data.get('groups', [])]
+    if compact:
+        parts = []
+        for part in spec.get('parts', []):
+            if (isinstance(part, list) and len(part) == 2 and all(type(n) is int for n in part)
+                    and 0 <= part[0] <= part[1] <= len(order)):
+                parts.append(range(*part))
+            elif isinstance(part, dict) and isinstance(part.get('ids'), list) and all(isinstance(s, str) for s in part['ids']):
+                parts.append(tuple(remap(part['ids'])))
+            else:
+                raise ValueError('invalid saved display range')
+        out['display_order'] = (DisplayOrder(vcd.signals, parts) if isinstance(vcd.signals, SignalCatalog)
+                                else [order[i] if isinstance(part, range) else i for part in parts for i in part])
     return out, len(referenced - mapping.keys())
 
 

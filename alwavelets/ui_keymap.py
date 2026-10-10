@@ -239,8 +239,10 @@ class KeymapMixin:
 
     def _kb_backspace_remove(self):
         if self.selected_signals:
-            removed = [(i, sid) for i, sid in enumerate(self.display_order)
-                       if sid in self.selected_signals]
+            from .display_order import DisplayOrder, member_positions
+            removed = (member_positions(self.display_order, self.selected_signals)
+                       if isinstance(self.display_order, DisplayOrder) else
+                       [(i, sid) for i, sid in enumerate(self.display_order) if sid in self.selected_signals])
             for i, _ in reversed(removed):
                 self.display_order.pop(i)
             # Keep the finder's membership set in sync, or `/` will refuse to
