@@ -454,9 +454,8 @@ class FSTReader:
                 # the bounded handle geometry, without inserting declarations.
                 self._handles = _HandleTable(self._records('<QB'))
                 self._stage('Restoring signal widths')
-                for width, kind in self._catalog.rows('size,kind', 'master=sid'):
-                    self._check()
-                    self._handles.records.append((width, kind in ('real', 'realtime', 'shortreal')))
+                self._handles.records.extend((width, kind in ('real', 'realtime', 'shortreal'))
+                                             for width, kind in self._catalog.rows('size,kind', 'master=sid'))
             else:
                 btype, bpos, bslen = hierarchy
                 f.seek(bpos + 9)
@@ -613,6 +612,7 @@ class FSTReader:
         scope_stack = []
         next_handle = 0
         self._handles = _HandleTable(self._records('<QB')) if self._catalog is not None else [None]
+        handle_rows = []
         while pos < n:
             self._check()
             if pos - reported >= 65536:
@@ -668,7 +668,10 @@ class FSTReader:
                     vcd.signal_order.append(key)
                 if isinstance(self._handles, _HandleTable):
                     if alias == 0:
-                        self._handles.records.append((length, is_real))
+                        handle_rows.append((length, is_real))
+                        if len(handle_rows) >= 1024:
+                            self._handles.records.extend(handle_rows)
+                            handle_rows.clear()
                 else:
                     while len(self._handles) <= handle:
                         self._handles.append(None)
@@ -676,6 +679,8 @@ class FSTReader:
                         self._handles[handle] = {'hid': hid, 'size': length, 'real': is_real}
             else:
                 pos += 1
+        if handle_rows:
+            self._handles.records.extend(handle_rows)
         self._max_handle = max(self._max_handle, next_handle)
 
     def _parse_geom(self, f, data_len):
@@ -859,11 +864,12 @@ class FSTReader:
                         lengths.append(0)
         if len(offsets) > 1 and pidx:
             lengths[pidx] = end_offset - offsets[pidx]
-        # Resolve aliases: a negative length -L names handle index L-1.
+        # Alias magnitudes are one-based handles. Unlike libfst's zero-based
+        # arrays, our tables already reserve slot zero, so no subtraction here.
         for i in range(1, len(offsets)):
             self._check()
             if lengths[i] < 0 and offsets[i] == 0:
-                src = -lengths[i] - 1
+                src = -lengths[i]
                 if 0 < src < i:
                     offsets[i] = offsets[src]
                     lengths[i] = lengths[src]

@@ -17,6 +17,121 @@ from tools.stress_fst import create_fst
 FIXTURES = Path(__file__).parent / 'fixtures'
 
 
+@pytest.mark.parametrize('spill', [False, True])
+def test_buffer_search_matches_bytes_across_pages_and_after_writes(spill):
+    raw = b'a' * (CHUNK - 2) + b'boundary\0' + b'b' * CHUNK + b'\0tail'
+    with Buffer(limit=0 if spill else len(raw) * 2) as block:
+        block.write(raw)
+        for needle in (b'\0', b'boundary', b'absent', b'', raw[:CHUNK + 4]):
+            for start in (0, 1, CHUNK - 3, CHUNK, len(raw), len(raw) + 1, -1, -len(raw) - 5):
+                assert block.find(needle, start) == raw.find(needle, start)
+        block.replace(CHUNK, b'NEW')
+        raw = raw[:CHUNK] + b'NEW' + raw[CHUNK + 3:]
+        block.write(b'\0NEW')
+        raw += b'\0NEW'
+        for start in (0, CHUNK + 1, len(raw) - 3):
+            assert block.find(b'NEW', start) == raw.find(b'NEW', start)
+
+
+def test_sequential_hierarchy_strings_do_not_reread_each_page():
+    raw = b'signal\0' * 30000
+    with Buffer(limit=0) as block:
+        block.write(raw)
+        file = block.file
+
+        class Counted:
+            read_bytes = 0
+
+            def read(self, size):
+                data = file.read(size)
+                self.read_bytes += len(data)
+                assert self.read_bytes <= len(raw) * 3
+                return data
+
+            def __getattr__(self, name):
+                return getattr(file, name)
+
+        block.file = Counted()
+        pos = 0
+        while pos < len(block):
+            name, pos = FSTReader._read_cstring(block, pos)
+            assert name == 'signal'
+        assert block.file.read_bytes >= len(raw)
+
+
+@pytest.mark.parametrize('spill', [False, True])
+def test_hierarchy_strings_cross_pages_with_utf8_and_long_names(spill):
+    names = ['a' * (CHUNK - 2) + 'λ', 'long' * CHUNK, '', '信号']
+    raw = b'\0'.join(name.encode() for name in names) + b'\0'
+    with Buffer(limit=0 if spill else len(raw)) as block:
+        block.write(raw)
+        pos = 0
+        for expected in names:
+            name, pos = FSTReader._read_cstring(block, pos)
+            assert name == expected
+        assert pos == len(raw)
+
+
+def test_cancelled_spilled_search_stops_between_pages():
+    cancel = threading.Event()
+    with Buffer(limit=0, cancel=cancel) as block:
+        block.write(b'a' * (CHUNK * 3))
+        file = block.file
+
+        class Interrupted:
+            def read(self, size):
+                data = file.read(size)
+                cancel.set()
+                return data
+
+            def __getattr__(self, name):
+                return getattr(file, name)
+
+        block.file = Interrupted()
+        with pytest.raises(OperationCancelled):
+            block.find(b'\0')
+    assert file.closed
+
+
+@pytest.mark.parametrize('fmt', ['<QB', '<q'])
+def test_batched_record_iterables_spill_and_support_random_access(monkeypatch, fmt):
+    expected = [(i * 257, i % 2) if fmt == '<QB' else -i for i in range(25000)]
+    writes = []
+    with Records(fmt, limit=0) as records:
+        original = records.buffer.write
+
+        def write(data):
+            assert len(data) < CHUNK + records.record.size
+            writes.append(len(data))
+            original(data)
+
+        monkeypatch.setattr(records.buffer, 'write', write)
+        records.extend(iter(expected))
+        assert len(writes) < 10
+        assert len(records) == len(expected) and list(records) == expected
+        replacement = ((1 << 64) - 1, 1) if fmt == '<QB' else -(1 << 63)
+        records[10000] = replacement
+        assert records[10000] == replacement and records[-1] == expected[-1]
+        assert records.buffer.file is not None
+    assert records.buffer.file.closed
+
+
+def test_batched_record_iteration_observes_cancellation(monkeypatch):
+    cancel = threading.Event()
+    with Records('<QB', limit=0, cancel=cancel) as records:
+        original = records.buffer.write
+
+        def write(data):
+            original(data)
+            cancel.set()
+
+        monkeypatch.setattr(records.buffer, 'write', write)
+        with pytest.raises(OperationCancelled):
+            records.extend((i, 0) for i in range(20000))
+        assert 0 < len(records) < 20000
+    assert records.buffer.file.closed
+
+
 def lz4_repeat(size):
     # One literal, a long overlapping match, then five final literals.
     extra = size - 6 - 4 - 15

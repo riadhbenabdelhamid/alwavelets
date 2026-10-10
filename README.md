@@ -192,6 +192,11 @@ An interrupted blackout block or final sort is replayed from its preceding
 checkpoint. This reduces repeated work after interruption; it does not remove
 the first-load scan or guarantee a checkpoint during a long decompression step.
 
+FST shared-chain decoding now uses the correct one-based handle targets. This
+fixes missing or incorrect histories when distinct signals share compressed
+chains. FST parse caches, disk indexes, and incomplete checkpoints from the
+older decoder rebuild on their next open; VCD caches retain their version.
+
 Caches default to `${XDG_CACHE_HOME:-~/.cache}/alwavelets`. Set `--cache-dir`
 or `ALWAVELETS_CACHE_DIR` to put waveform and instruction caches on another
 drive. Explicitly choosing a directory also places temporary waveform indexes
@@ -848,7 +853,56 @@ Scope preparation includes node construction, subtree counts/order, and indexes.
 These are individual local runs with wide hierarchies and short histories;
 other layouts and storage devices will differ. The million-scope cached browser
 still opened in 10–12 ms. FST declaration decoding took about 21 seconds in both
-versions and remains the largest part of its metadata preparation.
+versions.
+
+FST hierarchy searches now reuse their buffered pages, and handle records are
+written in bounded batches during both preparation and resume. A 100k-scope
+profile of the 2.68 MB decompressed hierarchy reduced temporary-file reads from
+19.18 GB across 292,723 calls to 5.09 MB across 78 calls. These are bytes returned
+by file reads, including repeated reads served by the OS cache, not physical
+disk traffic.
+
+A local million-scope FST comparison against `6b37c6e`, using the startup tool
+and the same settings, measured:
+
+| Measurement | Previous | Buffered hierarchy / batched handles |
+| --- | ---: | ---: |
+| Declaration parsing | 21.24 s | 10.98 s |
+| Metadata ready | 28.50 s | 18.17 s |
+| First readable value | 31.18 s | 20.92 s |
+| Full indexing | 39.37 s | 28.70 s |
+| Peak RSS | 31.5 MiB | 31.6 MiB |
+
+To compare equivalent long histories, a separate tool generates a VCD and
+converts that exact input using GTKWave's `vcd2fst`. It opens every signal in
+fresh processes, checks every event against the generator, and compares waveform
+digests across formats and cached opens. Conversion and verification are outside
+the timings. The converter is only a benchmark-generation dependency.
+
+```sh
+python3 tools/stress_formats.py --signals 128 --ticks 10000 --mixed --output formats.json
+python3 tools/stress_formats.py --signals 128 --ticks 10000 --mixed --codec Z --output formats-zlib.json
+```
+
+With 1.28M events across 128 scalar, 16/128-bit bus and real signals, plus an
+alias, LZ4 FST and VCD produced identical waveform digests:
+
+| Measurement | VCD | FST |
+| --- | ---: | ---: |
+| Source size | 55.61 MB | 3.47 MB |
+| Metadata ready | 77 ms | 79 ms |
+| First readable value | 358 ms | 344 ms |
+| Full indexing | 2.64 s | 3.51 s |
+| Process CPU | 2.30 s | 3.22 s |
+| Peak RSS | 30.3 MiB | 27.5 MiB |
+| Cached reopen | 2.8 ms | 3.0 ms |
+
+These single local runs use an 8 MiB page budget and exclude terminal rendering.
+FST's smaller input does not yet make this full-indexing workload faster in our
+Python decoder. The older decoder fails shared-chain waveform verification on
+this workload, so its long-history timings are not compared. Regression fixtures
+generated with LZ4, FastLZ and zlib cover that shared-chain correction, including
+memory/disk loading, cache invalidation and checkpoint resume.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

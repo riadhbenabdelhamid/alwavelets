@@ -1,5 +1,6 @@
 """Exact batched FST ingestion and the lifetime of prepared input resources."""
 import array
+from contextlib import ExitStack
 import gzip
 from pathlib import Path
 import struct
@@ -9,13 +10,54 @@ import zlib
 import pytest
 
 from alwavelets.core import VCDSignal
+from alwavelets.catalog import SignalCatalog
 from alwavelets.fst import FSTReader
 from alwavelets.fst_stream import Buffer, CHUNK, Cursor, Records
-from alwavelets.storage import PAGE_BYTES, PAGE_EVENTS, PageWriter, index_path, open_trace
+from alwavelets.parsers import VCDFile
+from alwavelets.storage import PAGE_BYTES, PAGE_EVENTS, PageWriter, TraceStore, index_path, open_trace
 from tools.stress_fst import create_fst, varint
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 U64 = struct.Struct('>Q')
+
+
+def test_handle_batches_keep_alias_targets_widths_and_final_partial_batch(tmp_path):
+    hierarchy = bytearray(b'\xfe\x00top\0\0')
+    expected, aliases = [], []
+    for i in range(2051):
+        width = (1, 7, 257, 0)[i % 4]
+        real = i % 4 == 3
+        tag = bytes([3 if real else 16, 0])
+        hierarchy.extend(tag + f'signal{i}\0'.encode() + varint(width) + b'\0')
+        expected.append((width, real))
+        if i in (0, 1022, 1023, 1024, 2050):
+            # Alias both a pending handle and an earlier batch's handle.
+            for target in (1, i + 1):
+                alias_width, alias_real = expected[target - 1]
+                name = f'alias_{i}_{target}_{len(aliases)}'
+                hierarchy.extend(bytes([3 if alias_real else 16, 0]) + name.encode() + b'\0' +
+                                 varint(alias_width) + varint(target))
+                aliases.append((name, target))
+    hierarchy.extend(b'\xff')
+    reader = FSTReader('unused')
+    reader._limit, reader._cancel = 0, None
+    with ExitStack() as resources, Buffer(limit=0) as source:
+        store = TraceStore(tmp_path / 'metadata.sqlite')
+        resources.callback(store.close)
+        reader._resources = resources
+        reader._catalog = catalog = SignalCatalog(store, create=True)
+        source.write(hierarchy)
+        reader._parse_hierarchy(source, VCDFile(), metadata_only=True)
+        assert list(reader._handles.records) == expected
+        assert reader._handles.records.buffer.file is not None
+        assert len(catalog) == len(expected) + len(aliases)
+        by_name = {sig.name: sig for sig in catalog.values()}
+        for i, (width, real) in enumerate(expected):
+            sig = by_name[f'signal{i}']
+            assert sig.size == (64 if real else width)
+            assert sig.signal_type == ('real' if real else 'wire')
+        for name, target in aliases:
+            assert by_name[name].master is by_name[f'signal{target - 1}']
 
 
 def write_trace(path, width, events, real=False):

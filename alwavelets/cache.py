@@ -23,11 +23,17 @@ from .streaming import OperationCancelled, check_cancel
 
 _MAGIC = b'WLT1'
 _VERSION = 6      # declared signal ranges; invalidate old parser semantics
+_FST_VERSION = 7  # correct one-based dynamic chain alias targets
 _BO = 0 if sys.byteorder == 'little' else 1
 
 # Module-level switch so `--no-cache` can disable load + save in one place.
 ENABLED = True
 DIRECTORY = None
+
+
+def _source_version(source):
+    from .fst import FSTReader
+    return _FST_VERSION if FSTReader.is_fst(source) else _VERSION
 
 
 def configured_directory():
@@ -135,7 +141,7 @@ def save_cache(vcd, source, *, cancel=None):
             chunks.append(compressor.flush())
             comp = b''.join(chunks)
             check_cancel(cancel)
-        header = _MAGIC + struct.pack('<IBQQ', _VERSION, _BO, st.st_size, st.st_mtime_ns)
+        header = _MAGIC + struct.pack('<IBQQ', _source_version(source), _BO, st.st_size, st.st_mtime_ns)
         path = cache_path(source)
         if manager.quota is not None and len(header) + len(comp) > manager.quota:
             return False
@@ -200,7 +206,7 @@ def _load_cache(source, *, cancel=None):
             if len(head) < _HDR or head[:4] != _MAGIC:
                 return None
             ver, bo, size, mtime_ns = struct.unpack_from('<IBQQ', head, 4)
-            if (ver != _VERSION or bo != _BO
+            if (ver != _source_version(source) or bo != _BO
                     or size != st.st_size or mtime_ns != st.st_mtime_ns):
                 return None
             if cancel is None:

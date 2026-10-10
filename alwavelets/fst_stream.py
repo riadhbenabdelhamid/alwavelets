@@ -100,12 +100,28 @@ class Buffer:
     def find(self, needle, start=0):
         if self.file is None:
             return self.data.find(needle, start)
-        while start < self.size:
-            chunk = self.read(start, min(CHUNK, self.size - start))
-            found = chunk.find(needle)
-            if found >= 0:
-                return start + found
-            start += max(1, len(chunk) - len(needle) + 1)
+        start = max(0, self.size + start) if start < 0 else start
+        length = len(needle)
+        if not length:
+            return start if start <= self.size else -1
+        while start + length <= self.size:
+            check_cancel(self.cancel)
+            end = self.page_start + len(self.page)
+            if self.page_start <= start and start + length <= end:
+                found = self.page.find(needle, start - self.page_start)
+                if found >= 0:
+                    return self.page_start + found
+                if end == self.size:
+                    return -1
+                # Keep possible matches across the page boundary. In particular,
+                # NUL searches consume each cached page before reading another.
+                start = end - length + 1
+            self.page_start = start
+            self._seek(start)
+            # Large needles also need lookahead, so an unsuccessful search
+            # advances by more than one byte before refilling the page.
+            self.page = self.file.read(max(CHUNK, length * 2))
+            self.position += len(self.page)
         return -1
 
     def close(self):
@@ -133,13 +149,22 @@ class Records(Sequence):
         self.buffer.write(self.record.pack(*value if isinstance(value, tuple) else (value,)))
 
     def extend(self, values):
-        """Append a bounded batch of unsigned 64-bit entries without per-item I/O."""
-        if self.record.format != '<Q' or not isinstance(values, array.array) or values.typecode != 'Q':
-            raise TypeError('Records.extend requires a uint64 array and <Q records')
-        if sys.byteorder != 'little':
-            values = array.array('Q', values)
-            values.byteswap()
-        self.buffer.write(values.tobytes())
+        """Pack an iterable in bounded batches, with a fast path for uint64 arrays."""
+        if self.record.format == '<Q' and isinstance(values, array.array) and values.typecode == 'Q':
+            if sys.byteorder != 'little':
+                values = array.array('Q', values)
+                values.byteswap()
+            self.buffer.write(values.tobytes())
+            return
+        data = bytearray()
+        for value in values:
+            check_cancel(self.buffer.cancel)
+            data.extend(self.record.pack(*value if isinstance(value, tuple) else (value,)))
+            if len(data) >= CHUNK:
+                self.buffer.write(data)
+                data.clear()
+        if data:
+            self.buffer.write(data)
 
     def __getitem__(self, index):
         if index < 0:

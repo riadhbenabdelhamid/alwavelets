@@ -25,6 +25,7 @@ from .core import VCDSignal, numeric_value, clear_pack_memos
 from .value_stream import ValueState
 
 VERSION = 6  # inline short histories and batched declarations/initial values
+FST_VERSION = 7  # correct one-based dynamic chain alias targets
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 SHORT_EVENTS = 8
@@ -177,6 +178,11 @@ class StoredSignal(VCDSignal):
 def _signature(path):
     st = os.stat(path)
     return [st.st_size, st.st_mtime_ns, sys.byteorder]
+
+
+def _source_version(source):
+    from .fst import FSTReader
+    return FST_VERSION if FSTReader.is_fst(source) else VERSION
 
 
 def index_path(path):
@@ -969,8 +975,8 @@ class PageWriter:
         self.publish(True)
         db.execute('DROP TABLE reordered')
 
-    def _metadata(self, signature, complete):
-        return {'version': VERSION, 'signature': signature, 'complete': complete,
+    def _metadata(self, source, signature, complete):
+        return {'version': _source_version(source), 'signature': signature, 'complete': complete,
                 'timescale': self.vcd.timescale, 'timescale_number': self.vcd.timescale_number,
                 'timescale_unit': self.vcd.timescale_unit, 'date': self.vcd.date,
                 'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
@@ -996,7 +1002,7 @@ class PageWriter:
         self.publish(True)
         if source_signature(source) != source_state:
             raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
-        meta = self._metadata(signature, False)
+        meta = self._metadata(source, signature, False)
         meta['checkpoint'] = checkpoint
         with self.store.lock:
             self.store.db.executemany('INSERT OR REPLACE INTO pending_summaries VALUES(?,?,?)',
@@ -1020,7 +1026,7 @@ class PageWriter:
         if (_signature(source) != signature or
                 (source_state is not None and source_signature(source) != source_state)):
             raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
-        meta = self._metadata(signature, True)
+        meta = self._metadata(source, signature, True)
         with self.store.lock:
             self.store.db.execute('DROP TABLE pending_summaries')
             self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
@@ -1055,7 +1061,7 @@ def _restore(store, source, *, allow_partial=False):
     if row is None:
         return None
     meta = json.loads(row[0])
-    if meta['version'] != VERSION or meta['signature'] != _signature(source):
+    if meta['version'] != _source_version(source) or meta['signature'] != _signature(source):
         return None
     if not meta['complete']:
         if not allow_partial:
