@@ -171,6 +171,19 @@ _VAR_TYPE_NAMES = {
 _REAL_TYPES = {3, 4, 20, 29}
 
 
+def checkpoint_state(phase='values', block=0, handle=1, position=0, time_index=0):
+    """Next unread work; position is a byte offset in the decompressed chain."""
+    return dict(phase=phase, block=block, handle=handle, position=position, time_index=time_index)
+
+
+def valid_checkpoint(state):
+    return (isinstance(state, dict) and state.keys() == checkpoint_state().keys() and
+            state['phase'] in ('values', 'frame', 'blackouts', 'done') and
+            all(type(state[k]) is int and state[k] >= 0 for k in ('block', 'position', 'time_index')) and
+            type(state['handle']) is int and state['handle'] >= 1 and
+            (state['phase'] == 'values' or state['position'] == state['time_index'] == 0))
+
+
 class FSTReader:
     """Pure-Python FST reader producing a VCDFile. See the module docstring."""
 
@@ -210,6 +223,7 @@ class FSTReader:
         self._geom = []              # handle -> bit length (0 = real)
         self._real_fmt = '<d'
         self._frame0 = None          # (beg_time, {handle: value}) of the first VC block
+        self._resume_vcd = self._resume = self._checkpoint = self._chain_state = None
 
     # ── primitive readers ────────────────────────────────────────────
 
@@ -339,7 +353,7 @@ class FSTReader:
             return vcd
 
     @contextmanager
-    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True, catalog=None):
+    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True, catalog=None, resume=None):
         """Keep metadata and input open until value loading finishes or is cancelled.
 
         The context may be handed to a background worker after preparation;
@@ -348,6 +362,7 @@ class FSTReader:
         if memory_mib <= 0:
             raise ValueError('FST memory budget must be positive')
         self._catalog = catalog
+        self._resume_vcd = resume
         self._cancel = cancel
         self._limit = max(CHUNK, min(1024 * 1024, int(memory_mib * 1024 * 1024) // 16))
         self._frame0, self._geom = None, []
@@ -361,6 +376,7 @@ class FSTReader:
                 self._times = self._vals = None
                 self._handles, self._writer, self._file = [], None, None
                 self._catalog = None
+                self._resume_vcd = self._resume = self._checkpoint = self._chain_state = None
 
     def _check(self):
         check_cancel(self._cancel)
@@ -375,8 +391,8 @@ class FSTReader:
     def _prepare(self, progress_cb, compact):
         from .parsers import VCDFile, build_scope_tree
         self._check()
-        vcd = VCDFile()
-        if self._catalog is not None:
+        vcd = self._resume_vcd if self._resume_vcd is not None else VCDFile()
+        if self._catalog is not None and self._resume_vcd is None:
             from .catalog import attach_catalog
             attach_catalog(self._catalog.store, vcd, self._catalog)
         vcd._filename = self.filename
@@ -423,12 +439,20 @@ class FSTReader:
                     hierarchy = block
             if hierarchy is None:
                 raise ValueError("FST file has no hierarchy block")
-            btype, bpos, bslen = hierarchy
-            f.seek(bpos + 9)
-            if compact and self._catalog is None:
-                vcd.signals = {}
-            with self._read_hier_block(f, btype, bslen - 8) as hierarchy:
-                self._parse_hierarchy(hierarchy, vcd, compact)
+            if self._resume_vcd is not None:
+                # The durable declaration catalog is authoritative. Rebuild only
+                # the bounded handle geometry, without inserting declarations.
+                self._handles = _HandleTable(self._records('<QB'))
+                for width, kind in self._catalog.rows('size,kind', 'master=sid'):
+                    self._check()
+                    self._handles.records.append((width, kind in ('real', 'realtime', 'shortreal')))
+            else:
+                btype, bpos, bslen = hierarchy
+                f.seek(bpos + 9)
+                if compact and self._catalog is None:
+                    vcd.signals = {}
+                with self._read_hier_block(f, btype, bslen - 8) as hierarchy:
+                    self._parse_hierarchy(hierarchy, vcd, compact)
             if progress_cb:
                 progress_cb(f.tell(), file_size)
 
@@ -440,41 +464,78 @@ class FSTReader:
                     break
 
             self._file, self._file_size = f, file_size
-            vcd.scopes = build_scope_tree(vcd)
+            if self._resume_vcd is None:
+                vcd.scopes = build_scope_tree(vcd)
             return vcd
 
-    def read_values(self, vcd, writer=None, progress_cb=None):
+    def read_values(self, vcd, writer=None, progress_cb=None, *, checkpoint=None, resume=None):
         """Consume a prepared reader without rebuilding declarations or hierarchy."""
         from .parsers import _compact_times
         self._check()
         self._writer = writer
+        self._checkpoint = checkpoint
+        self._resume = resume or checkpoint_state()
+        state = self._resume
+        if (not valid_checkpoint(state) or state['block'] > len(self._blocks) or
+                state['handle'] > len(self._handles)):
+            raise ValueError('Invalid FST checkpoint position')
         if self._cancel is None and writer is not None:
             self._cancel = getattr(getattr(writer, 'store', None), 'cancel', None)
         f, file_size = self._file, self._file_size
         self._times, self._vals = {}, {}
+        value_types = (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS, self.BL_VCDATA_DYN_ALIAS2)
+        if (state['phase'] == 'values' and (state['handle'] != 1 or state['position'] or state['time_index']) and
+                (state['block'] == len(self._blocks) or self._blocks[state['block']][0] not in value_types)):
+            raise ValueError('Invalid FST checkpoint block')
+        # The first frame is still needed when resuming in a later block.
         for btype, bpos, bslen in self._blocks:
+            if btype in value_types and state['phase'] in ('values', 'frame'):
+                f.seek(bpos + 9)
+                self._vc_header(f, bpos, bslen, vcd)
+                break
+        for ordinal, (btype, bpos, bslen) in enumerate(self._blocks):
             self._check()
-            if btype not in (self.BL_VCDATA, self.BL_VCDATA_DYN_ALIAS, self.BL_VCDATA_DYN_ALIAS2):
+            if state['phase'] != 'values' or ordinal < state['block'] or btype not in value_types:
                 continue
+            self._block_ordinal, self._block_range = ordinal, (bpos, bslen)
             f.seek(bpos + 9)
             self._parse_vc_block(f, btype, bpos, bslen, vcd)
+            self._save(checkpoint_state(block=ordinal + 1), bpos + bslen + 1)
             if progress_cb:
                 progress_cb(min(file_size, bpos + bslen), file_size)
-        if self._writer is not None:
+        if self._writer is not None and state['phase'] in ('values', 'frame'):
             beg0, fvals = self._frame0 if self._frame0 else (0, {})
-            self._writer.add_initial_values(beg0, ((str(h), value) for h, value in fvals.items()))
+            if checkpoint is None:
+                self._writer.add_initial_values(beg0, ((str(h), value) for h, value in fvals.items()))
+            else:
+                start = state['handle'] if state['phase'] == 'frame' else 1
+                stop = fvals.count + 1 if self._frame0 else 1
+                self._save(checkpoint_state('frame', handle=start), file_size, force=True)
+                for first in range(start, stop, 512):
+                    end = min(stop, first + 512)
+                    values = ((str(h), fvals.get(h)) for h in range(first, end))
+                    self._writer.add_initial_values(beg0, ((h, value) for h, value in values if value is not None))
+                    self._save(checkpoint_state('frame', handle=end), file_size)
+                self._save(checkpoint_state('blackouts'), file_size, force=True)
 
         # Insert blackout changes after initial values, preserving same-tick
         # changes already present in the waveform.
-        for btype, bpos, bslen in self._blocks:
-            if btype == self.BL_BLACKOUT:
+        for ordinal, (btype, bpos, bslen) in enumerate(self._blocks):
+            if (btype == self.BL_BLACKOUT and state['phase'] != 'done' and
+                    (state['phase'] != 'blackouts' or ordinal >= state['block'])):
                 f.seek(bpos + 9)
                 with self._decompress(FileSlice(f, bpos + 9, bslen - 8), 'raw', bslen - 8) as blackouts:
                     self._apply_blackouts(blackouts)
+                self._save(checkpoint_state('blackouts', block=ordinal + 1), file_size)
+        self._save(checkpoint_state('done'), file_size, force=True)
         if self._writer is None:
             self._store(vcd)
             _compact_times(vcd)
         return vcd
+
+    def _save(self, state, done, *, work=0, force=False):
+        if self._checkpoint is not None:
+            self._checkpoint(state, min(done, self._file_size), self._file_size, work, force)
 
     def _unwrap(self, f):
         """A '-c' file: gzip of a whole FST after a 17-byte wrapper."""
@@ -509,7 +570,7 @@ class FSTReader:
         f.read(1)                              # file type (verilog/vhdl/…)
         f.read(8)                              # timezero (display offset)
         vcd.min_time = start_time
-        vcd.max_time = end_time
+        vcd.max_time = max(vcd.max_time, end_time) if self._resume_vcd is not None else end_time
 
     # ── hierarchy ────────────────────────────────────────────────────
 
@@ -629,7 +690,7 @@ class FSTReader:
         with ExitStack() as resources:
             self._read_vc_block(f, btype, bpos, bslen, vcd, resources)
 
-    def _read_vc_block(self, f, btype, bpos, bslen, vcd, resources):
+    def _vc_header(self, f, bpos, bslen, vcd):
         block_end = bpos + 1 + bslen
         beg_time = self._read_u64(f)
         end_time = self._read_u64(f)
@@ -647,6 +708,11 @@ class FSTReader:
             values = _FrameValues(self, frame, min(frame_maxhandle, len(self._handles) - 1))
             self._frame0 = (beg_time, values)
         f.seek(frame_start + frame_clen)
+        return beg_time
+
+    def _read_vc_block(self, f, btype, bpos, bslen, vcd, resources):
+        block_end = bpos + 1 + bslen
+        beg_time = self._vc_header(f, bpos, bslen, vcd)
         vc_maxhandle = self._fst_varint_file(f)
         vc_start = f.tell()
         packtype = f.read(1)[0]
@@ -677,10 +743,22 @@ class FSTReader:
         with self._decompress(FileSlice(f, chain_pos, chain_clen), 'raw', chain_clen) as table:
             offsets, lengths = self._decode_chain_table(btype, table, chain_pos - vc_start, resources)
         codec = {0x34: 'lz4', 0x46: 'fastlz', 0x5a: 'zlib'}[packtype]
-        for h in range(1, min(vc_maxhandle, len(offsets) - 1) + 1):
+        last_handle = min(vc_maxhandle, len(offsets) - 1)
+        state = self._resume
+        resuming = state['phase'] == 'values' and self._block_ordinal == state['block']
+        first_handle = state['handle'] if resuming else 1
+        if first_handle > last_handle + 1:
+            raise ValueError('Invalid FST checkpoint handle')
+        self._block_handles = max(1, last_handle)
+        for h in range(first_handle, last_handle + 1):
             self._check()
             off, size = offsets[h], lengths[h]
             if not off or not size:
+                if resuming and h == first_handle and state['position']:
+                    raise ValueError('Invalid FST checkpoint chain')
+                if h % 512 == 0:
+                    self._save(checkpoint_state(block=self._block_ordinal, handle=h + 1),
+                               bpos + bslen * h // self._block_handles)
                 continue
             if size < 0 or off < 1 or vc_start + off + size > chain_pos:
                 raise ValueError('Invalid FST chain range')
@@ -690,7 +768,15 @@ class FSTReader:
             size -= start - (vc_start + off)
             data = FileSlice(f, start, size)
             with self._decompress(data, codec if unpacked_size else 'raw', unpacked_size or size) as chain:
+                cursor, tidx = Cursor(chain, self._cancel), 0
+                if resuming and h == first_handle:
+                    cursor.pos, tidx = state['position'], state['time_index']
+                self._chain_state = [cursor, tidx]
+                if cursor.pos > len(chain) or (cursor.pos and tidx >= len(times)):
+                    raise ValueError('Invalid FST checkpoint chain position')
                 self._decode_chain(h, chain, times, beg_time)
+            self._save(checkpoint_state(block=self._block_ordinal, handle=h + 1),
+                       bpos + bslen * h // self._block_handles)
 
     def _decode_chain_table(self, btype, chainbuf, end_offset, resources=None):
         """Return (offsets, lengths) indexed by handle (index 0 unused)."""
@@ -772,6 +858,7 @@ class FSTReader:
             if info is None:
                 return
             key = info['hid']
+            previous = self._chain_state[0].pos
             for timestamps, values in self._chain_batches(h, mu, times):
                 self._check()
                 if self._frame0 and not writer.has_values(key):
@@ -781,6 +868,14 @@ class FSTReader:
                         writer.add(key, beg0, initial)
                 writer.add_batch(key, timestamps, values)
                 writer.publish()
+                if self._checkpoint is not None:
+                    cursor, tidx = self._chain_state
+                    position = cursor.pos
+                    bpos, bslen = self._block_range
+                    done = bpos + bslen * ((h - 1) * len(mu) + position) // (self._block_handles * max(1, len(mu)))
+                    self._save(checkpoint_state(block=self._block_ordinal, handle=h, position=position, time_index=tidx),
+                               done, work=position - previous)
+                    previous = position
             writer.publish()
         else:
             tl = self._times.setdefault(h, [])
@@ -798,7 +893,8 @@ class FSTReader:
         count = min(PAGE_EVENTS, max(1, PAGE_BYTES // (17 if scalar else (96 if is_real else width + 64))))
         timestamps = array.array('q')
         values = bytearray() if scalar else []
-        for t, value in self._chain_events(h, mu, times, scalar_bytes=scalar):
+        state = self._chain_state if self._checkpoint is not None else None
+        for t, value in self._chain_events(h, mu, times, scalar_bytes=scalar, state=state):
             timestamps.append(t)
             values.append(value)
             if len(timestamps) == count:
@@ -810,10 +906,11 @@ class FSTReader:
             self._check()
             yield timestamps, values
 
-    def _chain_events(self, h, mu, times, scalar_bytes=False):
-        cursor = Cursor(mu, self._cancel)
+    def _chain_events(self, h, mu, times, scalar_bytes=False, state=None):
+        # The optional shared cursor/time index advances before each yield, so
+        # a completed batch can save the exact next event, including zero deltas.
+        cursor, tidx = state if state is not None else (Cursor(mu, self._cancel), 0)
         width, is_real = self._width(h)
-        tidx = 0
         ntimes = len(times)
         rv = cursor.varint
         if width == 1 and not is_real:
@@ -830,6 +927,8 @@ class FSTReader:
                     val = (48 + ((vli >> 1) & 1)) if scalar_bytes else ('1' if (vli >> 1) & 1 else '0')
                 if tidx >= ntimes:
                     break
+                if state is not None:
+                    state[1] = tidx
                 yield times[tidx], val
             return
         nbytes = (width + 7) >> 3
@@ -849,6 +948,8 @@ class FSTReader:
                 val = format(int.from_bytes(raw, 'big'), '0%db' % (nbytes * 8))[:width]
             if tidx >= ntimes:
                 break
+            if state is not None:
+                state[1] = tidx
             yield times[tidx], val
 
     # ── blackouts ────────────────────────────────────────────────────

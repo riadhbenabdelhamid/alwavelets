@@ -97,7 +97,7 @@ Flags:
 | `--list-waveform-cache` | Print cache entries, sizes, busy status, usage, and free disk space as JSON, then exit |
 | `--remove-waveform-cache NAME` | Remove one idle entry by its exact listed name; repeat for multiple entries |
 | `--purge-waveform-cache` | Remove all idle waveform caches and checkpoints, then exit |
-| `--purge-partial-indexes` | Remove only idle incomplete VCD indexes, then exit |
+| `--purge-partial-indexes` | Remove only idle incomplete VCD/FST indexes, then exit |
 | `--analysis-cache-mib N` | Saved instruction-index quota, default 8192 MiB; 0 disables reuse and saving |
 | `--purge-analysis-cache` | Remove saved instruction indexes and exit |
 | `--no-config` | Ignore `~/.config/alwavelets/config.json` |
@@ -166,8 +166,20 @@ the status bar shows `Resuming` and progress includes the saved work. Checkpoint
 atomically save all preceding events, parser state, and unfinished summary
 groups. Work since the last checkpoint is replayed. Source identity, size, and
 modification/change times must still match; otherwise indexing starts over.
-FST indexing currently restarts after interruption. Selective signal loading
-remains optional, and all VCD declarations are retained across checkpoints.
+Selective signal loading remains optional, and all declarations are retained
+across checkpoints.
+
+FST disk indexing also saves resumable checkpoints with caching enabled. It
+records the next block, signal chain, and position within a chain alongside the
+waveform pages, counts, and unfinished summaries. Checkpoints follow roughly
+five seconds of indexing or 64 MiB of decoded chain data, checked at completed
+batches; declaration, initial-frame, and final-sort boundaries are saved too.
+Reopening skips completed chains and reuses the declaration catalog. The current
+chain and its timestamp/offset tables are decompressed again, but saved events
+are not decoded or written again. Gzip-wrapped FSTs must also be unwrapped again.
+An interrupted blackout block or final sort is replayed from its preceding
+checkpoint. This reduces repeated work after interruption; it does not remove
+the first-load scan or guarantee a checkpoint during a long decompression step.
 
 Caches default to `${XDG_CACHE_HOME:-~/.cache}/alwavelets`. Set `--cache-dir`
 or `ALWAVELETS_CACHE_DIR` to put waveform and instruction caches on another
@@ -178,7 +190,7 @@ directory (`TMPDIR`). Existing caches are not moved automatically.
 Waveform cache retention is unlimited by default. Set `--waveform-cache-mib N`
 to evict the least recently used inactive entries on opens, VCD checkpoints,
 completion, and close. This covers eager parse caches, completed disk indexes,
-incomplete VCD checkpoints, and their SQLite sidecars. It excludes small lock
+incomplete VCD/FST checkpoints, and their SQLite sidecars. It excludes small lock
 files, temporary work files, and instruction caches (which have a separate
 `--analysis-cache-mib` quota). Open viewers and builders are protected and can
 exceed the retention quota; it is not a hard disk-usage limit. A completed index
@@ -201,12 +213,12 @@ uses temporary storage. Small lock files remain in the cache directory so
 concurrent opens and cleanup can coordinate safely.
 
 If disk space or a filesystem quota runs out, indexing reports the affected
-directory. When a VCD checkpoint has already been committed, that prefix stays
+directory. When a VCD or FST checkpoint has already been committed, the saved data stays
 readable and survives closing the viewer, even if it exceeds the retention
 quota. Free space and reopen the unchanged source to resume; choosing another
 cache directory starts a new index. Later cache maintenance may evict the idle
-checkpoint under the normal retention policy. FST indexing restarts after a
-disk-space failure.
+checkpoint under the normal retention policy. For FST, saved histories can cover
+different time ranges per signal while indexing is incomplete.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, display edits, SQLite,
@@ -819,6 +831,27 @@ remaining work after the checkpoint was replayed. Timings exclude generation
 and validation, include disk writes, and depend on storage and system load;
 the OS page cache is not flushed. This measures saved work after interruption,
 not faster initial parsing. Short traces may finish before an event checkpoint.
+
+For the equivalent FST check, including a single chain large enough to require
+checkpoints within it:
+
+```bash
+python3 tools/stress_fst_resume.py --events 20000000 --output fst-resume.json
+python3 tools/stress_fst_resume.py --events 20000000 --wrapped --output fst-wrapped-resume.json
+```
+
+The tool validates event counts and sampled values in fresh processes, with
+isolated caches and the production checkpoint cadence. It reports saved events,
+resume position, index size, elapsed/CPU time, and peak RSS. As with the VCD
+benchmark, source generation and validation are outside the timed region, disk
+writes are included, and the OS page cache is not flushed.
+
+A local 20M-event scalar FST run with an 8 MiB page cache took 16.0 seconds
+from scratch. Interrupting around 60% preserved 11.1M events; reopening finished
+in 8.6 seconds, with about 25 MiB peak RSS in each phase. In a separate paired
+10M-event cold-load check, `93a1ae1` took 8.02 seconds and the resumable reader
+took 7.94 seconds (CPU: 7.66 and 7.67 seconds). These are local measurements,
+not speed guarantees; the benefit depends on how much work was checkpointed.
 
 ## License
 

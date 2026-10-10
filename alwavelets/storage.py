@@ -38,6 +38,7 @@ PARTIAL_INTERVAL = 1.0
 CHECKPOINT_INTERVAL = 5.0
 CHECKPOINT_BYTES = 64 * 1024 * 1024
 CHECKPOINT_VERSION = 1
+FST_CHECKPOINT_VERSION = 1
 _SCALAR_BYTES = {'0': 48, '1': 49, 'x': 120, 'X': 120, 'z': 122, 'Z': 122}
 AUTO_THRESHOLD = 50 * 1024 * 1024
 
@@ -423,6 +424,7 @@ def _storage_error(exc, store=None):
     if not disk_full(exc):
         return str(exc)
     saved = False
+    format_name = 'waveform'
     if store is not None and not store.closed:
         store.preserve_checkpoint = store.cache_manager is not None and str(store.path).endswith('.partial')
         with store.lock:
@@ -432,6 +434,7 @@ def _storage_error(exc, store=None):
                 meta = json.loads(row[0]) if row else {}
                 saved = bool(meta.get('checkpoint')) and store.temporary is None
                 if saved:
+                    format_name = meta['checkpoint'].get('format', 'vcd').upper()
                     store.preserve_checkpoint = True
                     store.pages.clear()
                     store.cache_bytes = 0
@@ -446,7 +449,7 @@ def _storage_error(exc, store=None):
     location = os.path.dirname(store.path) if store is not None else 'the index directory'
     message = f'Not enough disk space for waveform indexing in {location}. '
     if saved:
-        return message + 'The last VCD checkpoint is saved; free space and reopen to resume, or choose another --cache-dir.'
+        return message + f'The last {format_name} checkpoint is saved; free space and reopen to resume, or choose another --cache-dir.'
     return message + 'Free space or choose another --cache-dir and reopen.'
 
 
@@ -919,8 +922,8 @@ class PageWriter:
                 self.store.total_changes += delta
                 self.store.db.execute('UPDATE signals SET n=written WHERE written IS NOT NULL AND n!=written')
                 self.store.counts.cache.clear()
-            # Progressive readers share this connection. Durable VCD commits
-            # happen only at line boundaries with matching parser state.
+            # Progressive readers share this connection. Durable commits happen
+            # only at decoder boundaries with matching VCD/FST parser state.
             if not self.checkpointed:
                 self.store.db.commit()
             self.store.generation += 1
@@ -928,7 +931,7 @@ class PageWriter:
         self.last_publish = time.monotonic()
 
     def reorder(self):
-        """Malformed out-of-order VCD: external sort with SQLite's disk temp store."""
+        """Externally sort out-of-order VCD events and appended FST blackouts."""
         self.publish(True)
         db = self.store.db
         if self.checkpointed and not db.in_transaction:
@@ -972,6 +975,17 @@ class PageWriter:
 
     def checkpoint(self, source, signature, source_state, offset, state):
         """Commit a fully drained prefix and its exact next-line decoder state."""
+        checkpoint = {'version': CHECKPOINT_VERSION, 'source': source_state, 'offset': offset,
+                      'state': state.snapshot(), 'monotonic': state.monotonic, 'disordered': self.disordered}
+        self._commit_checkpoint(source, signature, source_state, checkpoint)
+
+    def checkpoint_fst(self, source, signature, source_state, offset, state):
+        """Commit pages and an FST decoder position in the same transaction."""
+        checkpoint = {'version': FST_CHECKPOINT_VERSION, 'format': 'fst', 'source': source_state,
+                      'offset': offset, 'state': state, 'disordered': self.disordered}
+        self._commit_checkpoint(source, signature, source_state, checkpoint)
+
+    def _commit_checkpoint(self, source, signature, source_state, checkpoint):
         from .analysis_cache import source_signature
         if self.store.cancel.is_set():
             raise Cancelled('Indexing cancelled')
@@ -979,9 +993,7 @@ class PageWriter:
         if source_signature(source) != source_state:
             raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
         meta = self._metadata(signature, False)
-        meta['checkpoint'] = {'version': CHECKPOINT_VERSION, 'source': source_state, 'offset': offset,
-                              'state': state.snapshot(), 'monotonic': state.monotonic,
-                              'disordered': self.disordered}
+        meta['checkpoint'] = checkpoint
         with self.store.lock:
             self.store.db.executemany('INSERT OR REPLACE INTO pending_summaries VALUES(?,?,?)',
                                      ((sid, level, json.dumps([g[0], g[1], _encode_number(g[2]),
@@ -1046,12 +1058,21 @@ def _restore(store, source, *, allow_partial=False):
             return None
         checkpoint = meta['checkpoint']
         state = checkpoint['state']
-        if (checkpoint['version'] != CHECKPOINT_VERSION or checkpoint['source'] != source_state
+        if (checkpoint['source'] != source_state
                 or type(checkpoint['offset']) is not int or not 0 <= checkpoint['offset'] <= source_state[3]
-                or not isinstance(state, list) or len(state) != 4
-                or type(state[0]) is not int or type(state[3]) is not int
-                or type(state[1]) is not bool or type(state[2]) is not bool
-                or type(checkpoint['monotonic']) is not bool or type(checkpoint['disordered']) is not bool):
+                or type(checkpoint['disordered']) is not bool):
+            return None
+        from .fst import FSTReader, valid_checkpoint
+        if checkpoint.get('format', 'vcd') == 'fst':
+            if checkpoint['version'] != FST_CHECKPOINT_VERSION or not valid_checkpoint(state) or not FSTReader.is_fst(source):
+                return None
+        elif checkpoint.get('format', 'vcd') == 'vcd':
+            if (checkpoint['version'] != CHECKPOINT_VERSION or not isinstance(state, list) or len(state) != 4
+                    or type(state[0]) is not int or type(state[3]) is not int
+                    or type(state[1]) is not bool or type(state[2]) is not bool
+                    or type(checkpoint['monotonic']) is not bool or FSTReader.is_fst(source)):
+                return None
+        else:
             return None
         store.db.execute('SELECT sid,level,data FROM pending_summaries LIMIT 0')
     vcd = VCDFile()
@@ -1149,20 +1170,10 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     state = ValueState()
     try:
         if use_cache:
-            if not is_fst:
-                store, vcd = _open_partial(source, memory, manager)
-                use_cache = store is not None
-                if store is not None:
-                    lease, path = store.index_lease, store.path
-            else:
-                try:
-                    lease = manager.acquire(target)
-                    temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
-                except (OSError, sqlite3.Error):
-                    if lease is not None:
-                        lease.close()
-                        lease = None
-                    use_cache = False
+            store, vcd = _open_partial(source, memory, manager)
+            use_cache = store is not None
+            if store is not None:
+                lease, path = store.index_lease, store.path
         if vcd is not None and not hasattr(vcd, '_checkpoint'):
             # A crash can occur after the final commit but before rename.
             try:
@@ -1193,8 +1204,13 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         if vcd is not None:
             resume = vcd._checkpoint
             offset = resume['checkpoint']['offset']
-            state = ValueState(*resume['checkpoint']['state'])
-            state.monotonic = resume['checkpoint']['monotonic']
+            if is_fst:
+                reader = FSTReader(source)
+                preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib,
+                                                         catalog=vcd.signals, resume=vcd))
+            else:
+                state = ValueState(*resume['checkpoint']['state'])
+                state.monotonic = resume['checkpoint']['monotonic']
         else:
             from .catalog import SignalCatalog
             catalog = SignalCatalog(store, create=True)
@@ -1206,9 +1222,13 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                 vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
         if not vcd.signal_order:
             raise ValueError('Trace has no signal declarations')
-        writer = PageWriter(store, vcd, checkpointed=lease is not None and not is_fst, resume=resume)
+        writer = PageWriter(store, vcd, checkpointed=lease is not None, resume=resume)
         if writer.checkpointed and resume is None:
-            writer.checkpoint(source, signature, source_state, offset, state)
+            if is_fst:
+                from .fst import checkpoint_state
+                writer.checkpoint_fst(source, signature, source_state, 0, checkpoint_state())
+            else:
+                writer.checkpoint(source, signature, source_state, offset, state)
         vcd._loading = True
         vcd._extent_known = False
     except BaseException as exc:
@@ -1228,11 +1248,27 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         try:
             with preparation:
                 if is_fst:
+                    checkpoint_time, checkpoint_work = time.monotonic(), 0
+
                     def progress(done, total):
-                        vcd._load_progress = min(99, done * 100 // max(1, total))
+                        vcd._load_progress = max(vcd._load_progress, min(99, done * 100 // max(1, total)))
                         if progress_cb:
-                            progress_cb(done, total)
-                    reader.read_values(vcd, writer, progress)
+                            progress_cb(min(signature[0], done * signature[0] // max(1, total)), signature[0])
+
+                    def checkpoint_fst(state, done, total, work, force):
+                        nonlocal checkpoint_time, checkpoint_work
+                        checkpoint_work += work
+                        progress(done, total)
+                        if force or checkpoint_work >= CHECKPOINT_BYTES or time.monotonic() - checkpoint_time >= CHECKPOINT_INTERVAL:
+                            position = min(signature[0], done * signature[0] // max(1, total))
+                            writer.checkpoint_fst(source, signature, source_state, position, state)
+                            checkpoint_time, checkpoint_work = time.monotonic(), 0
+
+                    if resume is not None and progress_cb:
+                        progress_cb(offset, signature[0])
+                    reader.read_values(vcd, writer, progress,
+                                       checkpoint=checkpoint_fst if writer.checkpointed else None,
+                                       resume=resume['checkpoint']['state'] if resume else None)
                 else:
                     ingest_vcd()
             writer.finish(source, signature, source_state=source_state if writer.checkpointed else None)

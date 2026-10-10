@@ -127,12 +127,12 @@ def test_background_batches_publish_before_completion_and_cancel_cleanly(tmp_pat
     entered, release = threading.Event(), threading.Event()
     readers = []
     original_values, original_publish = FSTReader.read_values, PageWriter.publish
-    def read(self, *args):
+    def read(self, *args, **kwargs):
         readers.append(self)
-        return original_values(self, *args)
+        return original_values(self, *args, **kwargs)
     def publish(self, force=False):
         original_publish(self, True)
-        if not entered.is_set():
+        if self.changes and not entered.is_set():
             entered.set()
             assert release.wait(5)
     monkeypatch.setattr(FSTReader, 'read_values', read)
