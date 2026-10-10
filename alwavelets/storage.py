@@ -420,7 +420,10 @@ class PageWriter:
         self.builders = OrderedDict()
         self.offsets = {}
         self.pending_pages = []
+        self.pending_positions = {}
         self.pending_bytes = 0
+        self.positions = OrderedDict()
+        self.position_limit = 1024
         self.summary_groups = OrderedDict()
         self.summary_group_limit = 4096
         self.sizes = {}
@@ -436,9 +439,34 @@ class PageWriter:
             self.changes = resume['changes']
             self.disordered = resume['checkpoint']['disordered']
             self.last_partial = self.last_publish if self.changes else None
-        from .catalog import CatalogField
-        self.totals = CatalogField(vcd.signals, 'written', writable=True)
-        self.last_time = CatalogField(vcd.signals, 'last_time', writable=True)
+
+    def _position(self, key):
+        """End ordinal and last timestamp of stored or queued pages.
+
+        Active builders carry their own offsets and timestamps. This bounded
+        cache is read-through only; page drains persist both fields together.
+        """
+        pending = self.pending_positions.get(key)
+        if pending is not None:
+            return pending
+        cached = self.positions.get(key)
+        if cached is not None:
+            self.positions.move_to_end(key)
+            return cached
+        with self.store.lock:
+            row = self.store.db.execute('SELECT written,last_time FROM signals WHERE sid=?', (key,)).fetchone()
+        position = (row[0] or 0, row[1]) if row else (0, None)
+        self._remember_position(key, position)
+        return position
+
+    def _remember_position(self, key, position):
+        self.positions[key] = position
+        self.positions.move_to_end(key)
+        while len(self.positions) > self.position_limit:
+            self.positions.popitem(last=False)
+
+    def has_values(self, key):
+        return key in self.builders or bool(self._position(key)[0])
 
     def _initialize(self, vcd):
         from .parsers import build_scope_tree
@@ -477,19 +505,21 @@ class PageWriter:
     def add(self, key, timestamp, value):
         if self.store.cancel.is_set():
             raise Cancelled('Indexing cancelled')
-        metadata = self.vcd.signals.get(key)
-        if metadata is None or not metadata.owns_storage:
-            return
-        if timestamp < self.last_time.get(key, timestamp):
-            self.disordered = True
-        self.last_time[key] = timestamp
         sig = self.builders.get(key)
         if sig is None:
+            metadata = self.vcd.signals.get(key)
+            if metadata is None or not metadata.owns_storage:
+                return
+            written, previous = self._position(key)
             sig = self.builders[key] = _signal(_definition(metadata))
             sig._memo = None
-            self.offsets[key] = self.totals.get(key, 0)
+            self.offsets[key] = written
             self.sizes[key] = 256
             self.buffer_bytes += 256
+        else:
+            previous = sig._times[-1]
+        if previous is not None and timestamp < previous:
+            self.disordered = True
         before = len(sig._values)
         if sig._scalar:
             value = value[-1:].lower()
@@ -526,10 +556,18 @@ class PageWriter:
             rows = dict((row[0], row[1:]) for row in store.db.execute(
                 'SELECT sid,definition,written,last_time,short_n,short_data,size,kind FROM signals '
                 'WHERE master=sid AND sid IN (' + ','.join('?' for _ in missing) + ')', tuple(missing))) if missing else {}
+        # Snapshot queued positions along with the query. Processing an earlier
+        # handle can drain the queue and evict its read-through cache entry.
+        for key, row in rows.items():
+            pending = self.pending_positions.get(key)
+            if pending is not None:
+                rows[key] = row[:1] + pending + row[3:]
         updates = []
         for key, events in batch.items():
             if store.cancel.is_set():
                 raise Cancelled('Indexing cancelled')
+            if not events:
+                continue
             sig = self.builders.get(key)
             if sig is None:
                 row = rows.get(key)
@@ -538,11 +576,13 @@ class PageWriter:
                     with store.lock:
                         row = store.db.execute('SELECT definition,written,last_time,short_n,short_data,size,kind '
                                                'FROM signals WHERE sid=?', (key,)).fetchone()
+                    pending = self.pending_positions.get(key)
+                    if row is not None and pending is not None:
+                        row = row[:1] + pending + row[3:]
                 if row is None:
                     continue
                 definition, written, previous, short_n, short_data, width, kind = row
-                written = self.totals.cache.get(key, written) or 0
-                previous = self.last_time.cache.get(key, previous)
+                written = written or 0
             else:
                 previous = sig._times[-1]
             for timestamp, _ in events:
@@ -560,10 +600,6 @@ class PageWriter:
             if sig is None:
                 sig = _signal(json.loads(definition))
                 sig._memo = None
-                with store.lock:
-                    if key not in self.totals.cache:
-                        self.totals._cache(key, written)
-            self.last_time[key] = previous
             if key not in self.builders:
                 self.builders[key] = sig
                 self.offsets[key] = written
@@ -577,7 +613,7 @@ class PageWriter:
                 if sig is None:
                     sig = self.builders[key] = _signal(definition)
                     sig._memo = None
-                    self.offsets[key] = self.totals.get(key, 0)
+                    self.offsets[key] = written
                     self.sizes[key] = size = 256
                     self.buffer_bytes += 256
                 before = len(sig._values)
@@ -592,6 +628,7 @@ class PageWriter:
                 if len(sig._times) >= PAGE_EVENTS or size >= PAGE_BYTES:
                     self.sizes[key] = size
                     self.buffer_bytes += added
+                    written = self.offsets[key] + len(sig._times)
                     self.flush(key)
                     sig, added = None, 0
                     while self.builders and self.buffer_bytes > self.buffer_limit:
@@ -605,10 +642,7 @@ class PageWriter:
         with store.lock:
             store.db.executemany('UPDATE signals SET short_n=?,short_data=?,written=?,last_time=? WHERE sid=?', updates)
             for _, _, _, _, key in updates:
-                self.totals.cache.pop(key, None)
-                self.totals.dirty.discard(key)
-                self.last_time.cache.pop(key, None)
-                self.last_time.dirty.discard(key)
+                self.positions.pop(key, None)
                 store.forget_short(key)
 
     def add_batch(self, key, timestamps, values):
@@ -627,9 +661,9 @@ class PageWriter:
             return
         if key in self.builders:
             self.flush(key)
-        if timestamps[0] < self.last_time.get(key, timestamps[0]):
+        written, previous = self._position(key)
+        if previous is not None and timestamps[0] < previous:
             self.disordered = True
-        self.last_time[key] = timestamps[-1]
         sig = _signal(_definition(metadata))
         sig._memo = None
         sig._times = timestamps
@@ -639,7 +673,7 @@ class PageWriter:
             packed = sig._encode_values(values) if sig._packed else None
             sig._packed = packed is not None
             sig._values = packed if sig._packed else values
-        self._write_page(key, sig)
+        self._write_page(key, sig, written)
         self.changes += len(timestamps)
 
     def add_initial_values(self, timestamp, values):
@@ -675,7 +709,7 @@ class PageWriter:
             if store.cancel.is_set():
                 raise Cancelled('Indexing cancelled')
             # A repeated wide initial may still be buffered from a prior batch.
-            if self.last_time.cache.get(key) is not None:
+            if key in self.builders or key in self.pending_positions:
                 continue
             value = batch[key]
             if width == 1 and kind not in ('real', 'realtime'):
@@ -694,9 +728,7 @@ class PageWriter:
         with store.lock:
             store.db.executemany('UPDATE signals SET short_n=1,short_data=?,written=1,last_time=? WHERE sid=?', updates)
             for _, _, key in updates:
-                # The bulk write bypasses the per-signal write-back caches.
-                self.totals.cache.pop(key, None)
-                self.last_time.cache.pop(key, None)
+                self.positions.pop(key, None)
                 store.forget_short(key)
         self.changes += len(updates)
         for key, value in large:
@@ -705,15 +737,17 @@ class PageWriter:
     def _write_page(self, key, sig, lo=None):
         """Queue immutable pages with bounded memory; ordinals include the queue."""
         if lo is None:
-            lo = self.totals.get(key, 0)
+            lo = self._position(key)[0]
         raw = _encode_page(sig)
         self.pending_pages.append((key, sig, lo, raw))
         # Include both the encoded payload and the retained signal arrays.
         size = len(raw) + sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
         if type(sig._values) is list:
             size += sum(sys.getsizeof(value) for value in sig._values)
+        if key not in self.pending_positions:
+            size += 192  # dictionary entry, position tuple and its integers
         self.pending_bytes += size
-        self.totals[key] = lo + len(sig._times)
+        self.pending_positions[key] = (lo + len(sig._times), sig._times[-1])
         if self.pending_bytes >= WRITE_BATCH_BYTES or len(self.pending_pages) >= WRITE_BATCH_PAGES:
             self._drain_pages()
 
@@ -768,8 +802,8 @@ class PageWriter:
                           _encode_number(minimum), _encode_number(maximum), zlib.compress(page_data, 1)))
             summaries.append((key, lo, n, 0, minimum, maximum))
         with store.lock:
-            store.db.executemany('UPDATE signals SET short_n=?,short_data=? WHERE sid=?',
-                                 ((n, raw, key) for key, (n, raw) in updates.items()))
+            store.db.executemany('UPDATE signals SET short_n=?,short_data=?,written=?,last_time=? WHERE sid=?',
+                                 ((n, raw, *self.pending_positions[key], key) for key, (n, raw) in updates.items()))
             for key in updates:
                 store.forget_short(key)
             store.db.executemany('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)', pages)
@@ -784,7 +818,13 @@ class PageWriter:
             for summary in summaries:
                 self.add_summary(*summary, rows=rows, pending=pending)
             store.db.executemany('INSERT INTO summaries VALUES(?,?,?,?,?,?)', rows)
+            store.db.executemany('UPDATE signals SET written=?,last_time=? WHERE sid=?',
+                                 ((n, timestamp, key) for key, (n, timestamp) in self.pending_positions.items()
+                                  if key not in updates))
+        for key, position in self.pending_positions.items():
+            self._remember_position(key, position)
         self.pending_pages.clear()
+        self.pending_positions.clear()
         self.pending_bytes = 0
 
     def add_summary(self, key, lo, n, level, minimum, maximum, *, rows, pending):
@@ -836,8 +876,6 @@ class PageWriter:
                 self.last_partial = now
         self._drain_pages()
         with self.store.lock:
-            self.totals.flush()
-            self.last_time.flush()
             if not self.disordered:
                 delta = self.store.db.execute('SELECT COALESCE(SUM((written-n)*aliases),0) FROM signals '
                                               'WHERE written IS NOT NULL AND n!=written').fetchone()[0]
@@ -856,8 +894,12 @@ class PageWriter:
         """Malformed out-of-order VCD: external sort with SQLite's disk temp store."""
         self.publish(True)
         db = self.store.db
+        if self.checkpointed and not db.in_transaction:
+            # A disordered prefix need not update any readable counts. Keep
+            # the sort's DDL in the transaction even when publish did no DML.
+            db.execute('BEGIN')
         db.execute('CREATE TABLE reordered(sid TEXT,t INTEGER,ordinal INTEGER,value TEXT)')
-        for key, n in self.totals.items():
+        for key, n in self.vcd.signals.rows('sid,written', 'written IS NOT NULL'):
             index = 0
             while index < n:
                 page, lo = self.store.page_at(key, index)
@@ -873,8 +915,8 @@ class PageWriter:
         db.execute('DELETE FROM pending_summaries')
         self.store.pages.clear()
         self.store.cache_bytes = 0
-        self.totals.clear()
-        self.last_time.clear()
+        self.positions.clear()
+        db.execute('UPDATE signals SET written=NULL,last_time=NULL')
         self.disordered = False
         self.changes = 0
         cursor = db.execute('SELECT sid,t,value FROM reordered ORDER BY sid,t,ordinal')

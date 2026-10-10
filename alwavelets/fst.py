@@ -774,7 +774,7 @@ class FSTReader:
             key = info['hid']
             for timestamps, values in self._chain_batches(h, mu, times):
                 self._check()
-                if key not in writer.last_time and self._frame0:
+                if self._frame0 and not writer.has_values(key):
                     beg0, fvals = self._frame0
                     initial = fvals.get(h)
                     if timestamps[0] > beg0 and initial is not None:

@@ -134,6 +134,12 @@ VCD batches preserve same-timestamp event order, and longer histories retain
 their page buffers across input batches. Declaration serialization reuses common
 type/scope fields while preserving existing saved-session fingerprints.
 Pages, summaries, and timestamp/count updates also use bounded write batches.
+Buffered histories keep their own event offsets and last timestamps. Completed
+pages carry that state in the bounded write queue, and each drain updates both
+metadata fields together. A read-through cache holds at most 1,024 stored
+positions; it does not write metadata on eviction. Checkpoints still flush all
+buffered state before committing, and existing complete and partial indexes
+remain compatible.
 The first available histories publish promptly. Completed pages and progress
 normally publish every quarter second; later partial pages can accumulate for
 about a second, or until page/memory limits require a flush. Finishing a load
@@ -736,6 +742,29 @@ benefit there. The benchmark now reports page counts, events per page, and summa
 row counts. These local results exclude generation and rendering; wall times
 depend on system load and storage. A separate paired ten-million-event FST check
 measured 11.1 seconds before and 11.3 seconds after, with the same index size.
+
+Paired metadata writes were compared with `0e474d8` using the same fresh-process
+VCD benchmark and an 8 MiB page cache:
+
+| VCD workload | Load before → after | CPU before → after | Peak RSS MiB before → after |
+| --- | ---: | ---: | ---: |
+| 4,096 signals, 1M mixed events | 21.5 s → 17.7 s | 14.3 s → 11.5 s | 42.0 → 41.1 |
+| 128 signals, 10M mixed events | 39.5 s → 31.6 s | 24.3 s → 24.3 s | 29.9 → 30.0 |
+| 1M signals, one initial value each | 22.2 s → 23.2 s | 13.5 s → 13.3 s | 26.4 → 26.7 |
+
+The interleaved workload reduced CPU time by about 20%; its index shrank from
+44.5 to 43.7 MB. First values remained readable within 0.6 seconds in both
+mixed cases. The narrow and initial-value-only cases showed little CPU benefit;
+their wall-time differences should not be treated as a reliable speedup.
+These measurements disable persistent caching, exclude generation/rendering,
+and vary with system load and storage. A separate 10M-event FST comparison
+measured 11.5 seconds before and 11.1 seconds after, with an unchanged index size.
+
+With persistent caching and checkpoints enabled, a separate synchronous cold
+load of 4,096 signals and 1M mixed events took 13.8 → 9.9 seconds, with CPU time
+12.5 → 8.9 seconds and peak RSS 40.9 → 41.1 MiB. Both runs built fresh indexes;
+neither reused saved data. A checkpoint produced by `0e474d8` was also resumed
+and its complete histories compared against the eager parser.
 
 To measure interruption and resume with the default checkpoint cadence:
 

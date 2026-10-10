@@ -72,7 +72,7 @@ def test_queued_pages_keep_delta_order_inline_prefix_and_spilled_summary_levels(
     store = storage.TraceStore(str(tmp_path / 'pages.sqlite'), 65536)
     writer = storage.PageWriter(store, trace)
     writer.summary_group_limit = 1
-    writer.totals.limit = writer.last_time.limit = 2
+    writer.position_limit = 2
     try:
         for event in range(610):
             timestamp = event // 3
