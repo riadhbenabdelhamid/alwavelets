@@ -133,6 +133,11 @@ use bounded batches with bulk metadata lookups and periodic publication.
 VCD batches preserve same-timestamp event order, and longer histories retain
 their page buffers across input batches. Declaration serialization reuses common
 type/scope fields while preserving existing saved-session fingerprints.
+Pages, summaries, and timestamp/count updates also use bounded write batches.
+The first available histories publish promptly. Completed pages and progress
+normally publish every quarter second; later partial pages can accumulate for
+about a second, or until page/memory limits require a flush. Finishing a load
+always publishes all remaining values. Existing prepared indexes remain usable.
 The viewer opens after metadata parsing and displays available data as
 indexing progresses. Rows and cursor values load on a background worker; panning
 discards obsolete requests. Complete analyses wait until indexing finishes.
@@ -696,6 +701,24 @@ more RSS but its index shrank from 76.9 to 57.1 MB. Doubling that case to 2M eve
 in a separate run used 41.8 MiB peak RSS. The memory option limits the decoded-page
 cache, not total process RSS. All declarations remain available; signal selection
 is optional.
+
+Page-writing improvements were separately compared with `e595a14` using the same
+VCD generator, paired fresh processes, and an 8 MiB page cache:
+
+| VCD workload | Load before → after | Regular pages before → after | Index MB before → after | Peak RSS MiB before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 4,096 signals, 1M mixed events | 31.8 s → 24.1 s | 255,112 → 191,994 | 57.6 → 45.4 | 42.2 → 41.8 |
+| 128 signals, 10M mixed events | 33.1 s → 28.5 s | 31,404 → 26,349 | 55.5 → 53.1 | 30.0 → 30.0 |
+| 1M signals, one initial value each | 16.3 s → 16.8 s | 0 → 0 | 187.8 → 187.9 | 26.8 → 26.7 |
+
+The interleaved case reduced process CPU time from 19.9 to 14.6 seconds; CPU time
+in the other two cases was essentially unchanged. First values in both mixed
+traces were readable within 0.5 seconds, including metadata parsing. The initial
+value-only case already uses inline storage, so page batching offers little
+benefit there. The benchmark now reports page counts, events per page, and summary
+row counts. These local results exclude generation and rendering; wall times
+depend on system load and storage. A separate paired ten-million-event FST check
+measured 11.1 seconds before and 11.3 seconds after, with the same index size.
 
 ## License
 

@@ -90,10 +90,13 @@ def worker(path, signals, events, mixed, memory_mib, repo, profile=None):
             for tick in sorted({0, count // 2, count - 1}) if count else ():
                 assert signal.value_at(tick) == value_at(ordinal, tick, mixed), (ordinal, tick)
         index = Path(trace._store.path)
+        pages, page_events = trace._store.db.execute('SELECT COUNT(*),COALESCE(SUM(n),0) FROM pages').fetchone()
         result = {'signals': signals, 'events': events, 'input_bytes': Path(path).stat().st_size,
                   'metadata_s': metadata_s, 'first_waveform_s': first_s or elapsed,
                   'metadata_cpu_s': metadata_cpu_s, 'cpu_s': cpu_s,
-                  'load_s': elapsed, 'peak_rss_mib': peak_rss(), 'index_bytes': index.stat().st_size}
+                  'load_s': elapsed, 'peak_rss_mib': peak_rss(), 'index_bytes': index.stat().st_size,
+                  'regular_pages': pages, 'events_per_page': page_events / pages if pages else 0,
+                  'summary_rows': trace._store.db.execute('SELECT COUNT(*) FROM summaries').fetchone()[0]}
     finally:
         trace.close()
     assert not index.exists()

@@ -31,6 +31,10 @@ SHORT_EVENTS = 8
 SHORT_BYTES = 512
 VCD_BATCH_KEYS = 512
 VCD_BATCH_BYTES = 256 * 1024
+WRITE_BATCH_BYTES = 256 * 1024
+WRITE_BATCH_PAGES = 512
+PUBLISH_INTERVAL = 0.25
+PARTIAL_INTERVAL = 1.0
 _SCALAR_BYTES = {'0': 48, '1': 49, 'x': 120, 'X': 120, 'z': 122, 'Z': 122}
 AUTO_THRESHOLD = 50 * 1024 * 1024
 
@@ -402,6 +406,9 @@ class PageWriter:
     def __init__(self, store, vcd):
         self.store, self.vcd = store, vcd
         self.builders = OrderedDict()
+        self.offsets = {}
+        self.pending_pages = []
+        self.pending_bytes = 0
         self.summary_groups = OrderedDict()
         self.summary_group_limit = 4096
         self.sizes = {}
@@ -410,6 +417,7 @@ class PageWriter:
         self.disordered = False
         self.changes = 0
         self.last_publish = time.monotonic()
+        self.last_partial = None
         self._initialize(vcd)
         from .catalog import CatalogField
         self.totals = CatalogField(vcd.signals, 'written', writable=True)
@@ -462,6 +470,7 @@ class PageWriter:
         if sig is None:
             sig = self.builders[key] = _signal(_definition(metadata))
             sig._memo = None
+            self.offsets[key] = self.totals.get(key, 0)
             self.sizes[key] = 256
             self.buffer_bytes += 256
         before = len(sig._values)
@@ -483,7 +492,7 @@ class PageWriter:
     def flush(self, key):
         sig = self.builders.pop(key)
         self.buffer_bytes -= self.sizes.pop(key)
-        self._write_page(key, sig)
+        self._write_page(key, sig, self.offsets.pop(key))
 
     def add_vcd_batch(self, batch):
         """Append bounded, per-handle event lists in original delta order.
@@ -540,6 +549,7 @@ class PageWriter:
             self.last_time[key] = previous
             if key not in self.builders:
                 self.builders[key] = sig
+                self.offsets[key] = written
                 self.sizes[key] = 256
                 self.buffer_bytes += 256
             size, added = self.sizes[key], 0
@@ -550,6 +560,7 @@ class PageWriter:
                 if sig is None:
                     sig = self.builders[key] = _signal(definition)
                     sig._memo = None
+                    self.offsets[key] = self.totals.get(key, 0)
                     self.sizes[key] = size = 256
                     self.buffer_bytes += 256
                 before = len(sig._values)
@@ -674,16 +685,40 @@ class PageWriter:
         for key, value in large:
             self.add(key, timestamp, value)
 
-    def _write_page(self, key, sig):
-        page_data = raw = _encode_page(sig)
-        lo = self.totals.get(key, 0)
-        n = len(sig._times)
-        if lo + n <= SHORT_EVENTS and len(raw) <= SHORT_BYTES:
-            with self.store.lock:
+    def _write_page(self, key, sig, lo=None):
+        """Queue immutable pages with bounded memory; ordinals include the queue."""
+        if lo is None:
+            lo = self.totals.get(key, 0)
+        raw = _encode_page(sig)
+        self.pending_pages.append((key, sig, lo, raw))
+        # Include both the encoded payload and the retained signal arrays.
+        size = len(raw) + sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
+        if type(sig._values) is list:
+            size += sum(sys.getsizeof(value) for value in sig._values)
+        self.pending_bytes += size
+        self.totals[key] = lo + len(sig._times)
+        if self.pending_bytes >= WRITE_BATCH_BYTES or len(self.pending_pages) >= WRITE_BATCH_PAGES:
+            self._drain_pages()
+
+    def _drain_pages(self):
+        if not self.pending_pages:
+            return
+        store = self.store
+        pages, summaries, updates = [], [], {}
+        keys = list(dict.fromkeys(key for key, sig, lo, raw in self.pending_pages
+                                 if lo and lo + len(sig._times) <= SHORT_EVENTS and len(raw) <= SHORT_BYTES))
+        with store.lock:
+            shorts = {key: (n, raw) for key, n, raw in store.db.execute(
+                'SELECT sid,short_n,short_data FROM signals WHERE sid IN (' + ','.join('?' for _ in keys) + ')', keys)} if keys else {}
+        for key, sig, lo, page_data in self.pending_pages:
+            if store.cancel.is_set():
+                raise Cancelled('Indexing cancelled')
+            raw, n = page_data, len(sig._times)
+            if lo + n <= SHORT_EVENTS and len(raw) <= SHORT_BYTES:
                 if lo:
-                    row = self.store.db.execute('SELECT short_n,short_data FROM signals WHERE sid=?', (key,)).fetchone()
-                    if row[0] == lo:
-                        old = _decode_page(_definition(sig), row[1], lo)
+                    old_n, old_raw = shorts[key]
+                    if old_n == lo:
+                        old = _decode_page(_definition(sig), old_raw, lo)
                         merged = _signal(_definition(sig))
                         merged._memo = None
                         merged._times = old._times + sig._times
@@ -697,43 +732,60 @@ class PageWriter:
                     else:
                         raw = None
                 if raw is not None and len(raw) <= SHORT_BYTES:
-                    self.store.db.execute('UPDATE signals SET short_n=?,short_data=? WHERE sid=?', (lo + n, raw, key))
-                    self.store.forget_short(key)
-                    self.totals[key] = lo + n
-                    return
-        # An inline prefix remains in place when a signal grows; later pages
-        # begin at its event count, retaining exact same-tick ordinal order.
-        data = zlib.compress(page_data, 1)
-        minimum = maximum = None
-        if sig._scalar:
-            zero, one = 48 in sig._values, 49 in sig._values
-            minimum = 0 if zero else (1 if one else None)
-            maximum = 1 if one else (0 if zero else None)
-        else:
-            for i in range(len(sig._times)):
-                value = numeric_value(sig.value_str(i), sig.signal_type)
-                if value is not None:
-                    minimum = value if minimum is None else min(minimum, value)
-                    maximum = value if maximum is None else max(maximum, value)
-        with self.store.lock:
-            self.store.db.execute('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)',
-                                  (key, lo, n, min(sig._times), max(sig._times),
-                                   _encode_number(minimum), _encode_number(maximum), data))
-            self.add_summary(key, lo, n, 0, minimum, maximum)
-        self.totals[key] = lo + n
+                    shorts[key] = updates[key] = (lo + n, raw)
+                    continue
+            # An inline prefix stays in place when a signal grows. Every later
+            # page starts at its reserved ordinal, including same-tick events.
+            minimum = maximum = None
+            if sig._scalar:
+                zero, one = 48 in sig._values, 49 in sig._values
+                minimum = 0 if zero else (1 if one else None)
+                maximum = 1 if one else (0 if zero else None)
+            else:
+                for i in range(n):
+                    value = numeric_value(sig.value_str(i), sig.signal_type)
+                    if value is not None:
+                        minimum = value if minimum is None else min(minimum, value)
+                        maximum = value if maximum is None else max(maximum, value)
+            pages.append((key, lo, n, min(sig._times), max(sig._times),
+                          _encode_number(minimum), _encode_number(maximum), zlib.compress(page_data, 1)))
+            summaries.append((key, lo, n, 0, minimum, maximum))
+        with store.lock:
+            store.db.executemany('UPDATE signals SET short_n=?,short_data=? WHERE sid=?',
+                                 ((n, raw, key) for key, (n, raw) in updates.items()))
+            for key in updates:
+                store.forget_short(key)
+            store.db.executemany('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)', pages)
+            # Fetch spilled leaf groups together. Removing them now means a
+            # later group spill/reload in this batch sees the new state.
+            keys = list(dict.fromkeys(row[0] for row in summaries if (row[0], 0) not in self.summary_groups))
+            pending = dict(store.db.execute('SELECT sid,data FROM pending_summaries WHERE level=0 AND sid IN (' +
+                                           ','.join('?' for _ in keys) + ')', keys)) if keys else {}
+            store.db.executemany('DELETE FROM pending_summaries WHERE sid=? AND level=0', ((key,) for key in pending))
+            pending = {key: pending.get(key) for key in keys}
+            rows = []
+            for summary in summaries:
+                self.add_summary(*summary, rows=rows, pending=pending)
+            store.db.executemany('INSERT INTO summaries VALUES(?,?,?,?,?,?)', rows)
+        self.pending_pages.clear()
+        self.pending_bytes = 0
 
-    def add_summary(self, key, lo, n, level, minimum, maximum):
-        self.store.db.execute('INSERT INTO summaries VALUES(?,?,?,?,?,?)',
-                              (key, lo, n, level, _encode_number(minimum), _encode_number(maximum)))
+    def add_summary(self, key, lo, n, level, minimum, maximum, *, rows, pending):
+        rows.append((key, lo, n, level, _encode_number(minimum), _encode_number(maximum)))
         group_key = key, level
         group = self.summary_groups.get(group_key)
         if group is None:
-            row = self.store.db.execute('SELECT data FROM pending_summaries WHERE sid=? AND level=?',
-                                        group_key).fetchone()
-            if row is not None:
-                group = json.loads(row[0])
+            if level == 0 and key in pending:
+                data = pending.pop(key)
+            else:
+                row = self.store.db.execute('SELECT data FROM pending_summaries WHERE sid=? AND level=?',
+                                            group_key).fetchone()
+                data = row[0] if row else None
+                if row is not None:
+                    self.store.db.execute('DELETE FROM pending_summaries WHERE sid=? AND level=?', group_key)
+            if data is not None:
+                group = json.loads(data)
                 group[2], group[3] = _decode_number(group[2]), _decode_number(group[3])
-                self.store.db.execute('DELETE FROM pending_summaries WHERE sid=? AND level=?', group_key)
             else:
                 group = [lo, 0, None, None, 0]
             self.summary_groups[group_key] = group
@@ -745,7 +797,7 @@ class PageWriter:
         group[4] += 1
         if group[4] == 16:
             del self.summary_groups[group_key]
-            self.add_summary(key, group[0], group[1], level + 1, group[2], group[3])
+            self.add_summary(key, group[0], group[1], level + 1, group[2], group[3], rows=rows, pending=pending)
         while len(self.summary_groups) > self.summary_group_limit:
             (sid, level), group = self.summary_groups.popitem(last=False)
             data = [group[0], group[1], _encode_number(group[2]), _encode_number(group[3]), group[4]]
@@ -753,10 +805,19 @@ class PageWriter:
                                   (sid, level, json.dumps(data)))
 
     def publish(self, force=False):
-        if not force and time.monotonic() - self.last_publish < 0.25:
+        now = time.monotonic()
+        if not force and now - self.last_publish < PUBLISH_INTERVAL:
             return
-        for key in list(self.builders):
-            self.flush(key)
+        # Publish the first partial histories promptly. Later updates expose
+        # completed/evicted pages every quarter second; partial pages get up to
+        # a second to accumulate events. A forced publish always drains all.
+        if force or self.last_partial is None or now - self.last_partial >= PARTIAL_INTERVAL:
+            for key in list(self.builders):
+                self.flush(key)
+            # Empty frame boundaries must not delay the first actual values.
+            if self.changes:
+                self.last_partial = now
+        self._drain_pages()
         with self.store.lock:
             self.totals.flush()
             self.last_time.flush()

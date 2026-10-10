@@ -356,17 +356,15 @@ class CatalogField(MutableMapping):
                 raise KeyError(key)
             return value
 
-    def _write(self, key, value):
-        self.catalog.store.db.execute('UPDATE signals SET ' + self.column + '=? WHERE sid=?', (value, key))
-
     def _cache(self, key, value):
         self.cache[key] = value
         self.cache.move_to_end(key)
         while len(self.cache) > self.limit:
-            old, value = self.cache.popitem(last=False)
-            if old in self.dirty:
-                self._write(old, value)
-                self.dirty.remove(old)
+            # Drain dirty entries together before evicting one. Wide traces
+            # otherwise issue a separate UPDATE for almost every event.
+            if next(iter(self.cache)) in self.dirty:
+                self.flush()
+            self.cache.popitem(last=False)
 
     def __setitem__(self, key, value):
         if not self.writable:
@@ -380,8 +378,8 @@ class CatalogField(MutableMapping):
 
     def flush(self):
         with self.catalog.store.lock:
-            for key in self.dirty:
-                self._write(key, self.cache[key])
+            self.catalog.store.db.executemany('UPDATE signals SET ' + self.column + '=? WHERE sid=?',
+                                              ((self.cache[key], key) for key in self.dirty))
             self.dirty.clear()
 
     def __iter__(self):
