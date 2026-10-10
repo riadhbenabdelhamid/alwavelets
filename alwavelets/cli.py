@@ -217,6 +217,8 @@ def main():
                         help="Persistent instruction cache quota in MiB (default: 8192; 0 disables)")
     parser.add_argument('--purge-analysis-cache', action='store_true',
                         help="Remove cached instruction indexes and exit")
+    parser.add_argument('--purge-partial-indexes', action='store_true',
+                        help="Remove idle incomplete waveform indexes and exit")
     parser.add_argument('--no-config', action='store_true', help="Ignore ~/.config/alwavelets/config.json")
     parser.add_argument('--no-session', action='store_true',
                         help="Ignore a saved session sidecar (open the trace fresh)")
@@ -241,6 +243,11 @@ def main():
     if args.purge_analysis_cache:
         count, size = analysis_cache.InstructionCache().purge()
         print(f'Removed {count} instruction indexes ({size / 1024 ** 2:.1f} MiB)')
+        return
+    if args.purge_partial_indexes:
+        from .index_cache import purge_partial_indexes
+        count, size, skipped = purge_partial_indexes()
+        print(f'Removed {count} incomplete waveform indexes ({size / 1024 ** 2:.1f} MiB); skipped {skipped} busy or unavailable')
         return
     if getattr(args, 'no_config', False):
         from . import config as _config

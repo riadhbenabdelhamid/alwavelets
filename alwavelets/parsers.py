@@ -284,6 +284,7 @@ class VCDFile:
         self._load_lock = threading.Lock()
         self._load_error = None
         self._load_changes = 0
+        self._resume_offset = 0
 
         # ── Lazy chunk loading state ──
         self._time_index = None

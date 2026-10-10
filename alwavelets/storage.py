@@ -35,6 +35,9 @@ WRITE_BATCH_BYTES = 256 * 1024
 WRITE_BATCH_PAGES = 512
 PUBLISH_INTERVAL = 0.25
 PARTIAL_INTERVAL = 1.0
+CHECKPOINT_INTERVAL = 5.0
+CHECKPOINT_BYTES = 64 * 1024 * 1024
+CHECKPOINT_VERSION = 1
 _SCALAR_BYTES = {'0': 48, '1': 49, 'x': 120, 'X': 120, 'z': 122, 'Z': 122}
 AUTO_THRESHOLD = 50 * 1024 * 1024
 
@@ -180,6 +183,10 @@ def index_path(path):
     return cache_path(path) + '.sqlite'
 
 
+def partial_index_path(path):
+    return index_path(path) + '.partial'
+
+
 def use_disk_storage(source, mode='auto'):
     if mode not in ('auto', 'memory', 'disk'):
         raise ValueError('storage must be auto, memory, or disk')
@@ -260,6 +267,7 @@ class TraceStore:
         self.cancel = threading.Event()
         self.thread = None
         self.temporary = None
+        self.index_lease = None
         self.closed = False
 
     def bisect(self, key, timestamp, right=False):
@@ -400,11 +408,15 @@ class TraceStore:
             self.cache_bytes = 0
             if self.temporary:
                 self.temporary.cleanup()
+            if self.index_lease:
+                self.index_lease.close()
+                self.index_lease = None
 
 
 class PageWriter:
-    def __init__(self, store, vcd):
+    def __init__(self, store, vcd, *, checkpointed=False, resume=None):
         self.store, self.vcd = store, vcd
+        self.checkpointed = checkpointed
         self.builders = OrderedDict()
         self.offsets = {}
         self.pending_pages = []
@@ -418,7 +430,12 @@ class PageWriter:
         self.changes = 0
         self.last_publish = time.monotonic()
         self.last_partial = None
-        self._initialize(vcd)
+        if resume is None:
+            self._initialize(vcd)
+        else:
+            self.changes = resume['changes']
+            self.disordered = resume['checkpoint']['disordered']
+            self.last_partial = self.last_publish if self.changes else None
         from .catalog import CatalogField
         self.totals = CatalogField(vcd.signals, 'written', writable=True)
         self.last_time = CatalogField(vcd.signals, 'last_time', writable=True)
@@ -438,9 +455,9 @@ class PageWriter:
             CREATE INDEX page_lookup ON pages(sid,lo);
             CREATE INDEX page_time ON pages(sid,t0,t1);
             CREATE INDEX page_end ON pages(sid,t1,lo);
-            CREATE TEMP TABLE pending_summaries(sid TEXT,level INTEGER,data TEXT,
-                                                PRIMARY KEY(sid,level));
         ''')
+        db.execute('CREATE ' + ('' if self.checkpointed else 'TEMP ') +
+                   'TABLE pending_summaries(sid TEXT,level INTEGER,data TEXT, PRIMARY KEY(sid,level))')
         if not isinstance(vcd.signals, SignalCatalog):
             catalog = SignalCatalog(store, create=True)
             for sid in vcd.signal_order:
@@ -827,7 +844,10 @@ class PageWriter:
                 self.store.total_changes += delta
                 self.store.db.execute('UPDATE signals SET n=written WHERE written IS NOT NULL AND n!=written')
                 self.store.counts.cache.clear()
-            self.store.db.commit()
+            # Progressive readers share this connection. Durable VCD commits
+            # happen only at line boundaries with matching parser state.
+            if not self.checkpointed:
+                self.store.db.commit()
             self.store.generation += 1
         self.vcd._load_changes = self.changes
         self.last_publish = time.monotonic()
@@ -844,7 +864,8 @@ class PageWriter:
                 db.executemany('INSERT INTO reordered VALUES(?,?,?,?)',
                                ((key, t, lo + i, page.value_str(i)) for i, t in enumerate(page._times)))
                 index = lo + len(page._times)
-        db.commit()
+        if not self.checkpointed:
+            db.commit()
         db.execute('DELETE FROM pages')
         db.execute('UPDATE signals SET short_n=0,short_data=NULL WHERE short_n!=0')
         db.execute('DELETE FROM summaries')
@@ -862,21 +883,47 @@ class PageWriter:
         self.publish(True)
         db.execute('DROP TABLE reordered')
 
-    def finish(self, source, signature):
+    def _metadata(self, signature, complete):
+        return {'version': VERSION, 'signature': signature, 'complete': complete,
+                'timescale': self.vcd.timescale, 'timescale_number': self.vcd.timescale_number,
+                'timescale_unit': self.vcd.timescale_unit, 'date': self.vcd.date,
+                'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
+                'min_time': self.vcd.min_time, 'total_changes': self.store.total_changes,
+                'changes': self.changes}
+
+    def checkpoint(self, source, signature, source_state, offset, state):
+        """Commit a fully drained prefix and its exact next-line decoder state."""
+        from .analysis_cache import source_signature
+        if self.store.cancel.is_set():
+            raise Cancelled('Indexing cancelled')
+        self.publish(True)
+        if source_signature(source) != source_state:
+            raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
+        meta = self._metadata(signature, False)
+        meta['checkpoint'] = {'version': CHECKPOINT_VERSION, 'source': source_state, 'offset': offset,
+                              'state': state.snapshot(), 'monotonic': state.monotonic,
+                              'disordered': self.disordered}
+        with self.store.lock:
+            self.store.db.executemany('INSERT OR REPLACE INTO pending_summaries VALUES(?,?,?)',
+                                     ((sid, level, json.dumps([g[0], g[1], _encode_number(g[2]),
+                                                              _encode_number(g[3]), g[4]]))
+                                      for (sid, level), g in self.summary_groups.items()))
+            self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
+            self.store.db.commit()
+            self.summary_groups.clear()
+
+    def finish(self, source, signature, *, source_state=None):
         if self.store.cancel.is_set():
             raise Cancelled('Indexing cancelled')
         self.publish(True)
         if self.disordered:
             with self.store.lock:
                 self.reorder()
-        if _signature(source) != signature:
+        from .analysis_cache import source_signature
+        if (_signature(source) != signature or
+                (source_state is not None and source_signature(source) != source_state)):
             raise ValueError('Trace changed during indexing; reopen it after the writer finishes')
-        meta = {'version': VERSION, 'signature': signature, 'complete': True,
-                'timescale': self.vcd.timescale, 'timescale_number': self.vcd.timescale_number,
-                'timescale_unit': self.vcd.timescale_unit, 'date': self.vcd.date,
-                'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
-                'min_time': self.vcd.min_time, 'total_changes': self.store.total_changes,
-                'changes': self.changes}
+        meta = self._metadata(signature, True)
         with self.store.lock:
             self.store.db.execute('DROP TABLE pending_summaries')
             self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
@@ -903,7 +950,7 @@ def create_derived_store(parent, signal):
     return trace.signals[signal.identifier], writer
 
 
-def _restore(store, source):
+def _restore(store, source, *, allow_partial=False):
     from .parsers import VCDFile, build_scope_tree
     from .analysis_cache import source_signature
     source_state = source_signature(source)
@@ -911,8 +958,21 @@ def _restore(store, source):
     if row is None:
         return None
     meta = json.loads(row[0])
-    if meta['version'] != VERSION or meta['signature'] != _signature(source) or not meta['complete']:
+    if meta['version'] != VERSION or meta['signature'] != _signature(source):
         return None
+    if not meta['complete']:
+        if not allow_partial:
+            return None
+        checkpoint = meta['checkpoint']
+        state = checkpoint['state']
+        if (checkpoint['version'] != CHECKPOINT_VERSION or checkpoint['source'] != source_state
+                or type(checkpoint['offset']) is not int or not 0 <= checkpoint['offset'] <= source_state[3]
+                or not isinstance(state, list) or len(state) != 4
+                or type(state[0]) is not int or type(state[3]) is not int
+                or type(state[1]) is not bool or type(state[2]) is not bool
+                or type(checkpoint['monotonic']) is not bool or type(checkpoint['disordered']) is not bool):
+            return None
+        store.db.execute('SELECT sid,level,data FROM pending_summaries LIMIT 0')
     vcd = VCDFile()
     from .catalog import SignalCatalog, attach_catalog
     attach_catalog(store, vcd, SignalCatalog(store))
@@ -924,7 +984,43 @@ def _restore(store, source):
     store.total_changes = meta['total_changes']
     vcd._load_changes = meta['changes']
     vcd.scopes = build_scope_tree(vcd)
+    if not meta['complete']:
+        vcd._checkpoint = meta
+        vcd._resume_offset = checkpoint['offset']
+        vcd._load_progress = min(99, checkpoint['offset'] * 100 // max(1, source_state[3]))
+        vcd._extent_known = False
     return vcd
+
+
+def _open_partial(source, memory):
+    """Acquire or create a checkpoint, falling back if its cache is unavailable."""
+    from .index_cache import IndexLease, discard_partial
+    path = partial_index_path(source)
+    store = lease = vcd = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        lease = IndexLease(path)
+        if os.path.exists(path):
+            try:
+                store = TraceStore(path, memory)
+                vcd = _restore(store, source, allow_partial=True)
+            except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
+                vcd = None
+            if vcd is None:
+                if store is not None:
+                    store.close()
+                    store = None
+                discard_partial(path)
+        if store is None:
+            store = TraceStore(path, memory)
+        store.index_lease = lease
+        return store, vcd
+    except (OSError, sqlite3.Error):
+        if store is not None:
+            store.close()
+        if lease is not None:
+            lease.close()
+        return None, None
 
 
 def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None, cancel=None):
@@ -952,34 +1048,64 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         if store is not None:
             store.close()
     signature = _signature(source)
+    from .analysis_cache import source_signature
+    source_state = source_signature(source)
     from .fst import FSTReader
     is_fst = FSTReader.is_fst(source)
     preparation = ExitStack()
-    store = temporary = None
+    store = temporary = lease = vcd = None
+    resume = None
+    state = ValueState()
     try:
         if use_cache:
+            if not is_fst:
+                store, vcd = _open_partial(source, memory)
+                use_cache = store is not None
+                if store is not None:
+                    lease, path = store.index_lease, store.path
+            else:
+                try:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
+                except OSError:
+                    use_cache = False
+        if vcd is not None and not hasattr(vcd, '_checkpoint'):
+            # A crash can occur after the final commit but before rename.
             try:
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-', dir=os.path.dirname(target))
+                os.replace(path, target)
+                store.path = target
             except OSError:
-                use_cache = False
+                pass
+            store.cancel = cancel
+            return vcd
         if not use_cache:
             temporary = tempfile.TemporaryDirectory(prefix='alwavelets-index-')
-        path = os.path.join(temporary.name, 'trace.sqlite')
-        store = TraceStore(path, memory)
+        if temporary is not None:
+            path = os.path.join(temporary.name, 'trace.sqlite')
+        if store is None:
+            store = TraceStore(path, memory)
+        store.index_lease = lease
         store.cancel = cancel
         store.temporary = temporary
-        from .catalog import SignalCatalog
-        catalog = SignalCatalog(store, create=True)
-        if is_fst:
-            reader = FSTReader(source)
-            vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib, catalog=catalog))
-            offset = 0
+        if vcd is not None:
+            resume = vcd._checkpoint
+            offset = resume['checkpoint']['offset']
+            state = ValueState(*resume['checkpoint']['state'])
+            state.monotonic = resume['checkpoint']['monotonic']
         else:
-            vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
+            from .catalog import SignalCatalog
+            catalog = SignalCatalog(store, create=True)
+            if is_fst:
+                reader = FSTReader(source)
+                vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib, catalog=catalog))
+                offset = 0
+            else:
+                vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
         if not vcd.signal_order:
             raise ValueError('Trace has no signal declarations')
-        writer = PageWriter(store, vcd)
+        writer = PageWriter(store, vcd, checkpointed=lease is not None, resume=resume)
+        if writer.checkpointed and resume is None:
+            writer.checkpoint(source, signature, source_state, offset, state)
         vcd._loading = True
         vcd._extent_known = False
     except BaseException:
@@ -988,6 +1114,8 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             store.close()
         elif temporary is not None:
             temporary.cleanup()
+        if lease is not None:
+            lease.close()
         raise
 
     def build():
@@ -1001,7 +1129,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                     reader.read_values(vcd, writer, progress)
                 else:
                     ingest_vcd()
-            writer.finish(source, signature)
+            writer.finish(source, signature, source_state=source_state if writer.checkpointed else None)
             if use_cache:
                 try:
                     os.replace(path, target)
@@ -1014,8 +1142,8 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             vcd._loading = False
 
     def ingest_vcd():
-        state = ValueState()
         pos = offset
+        checkpoint_pos, checkpoint_time = pos, time.monotonic()
         batch, batch_bytes, batch_events = {}, 0, 0
 
         def append(key, timestamp, value):
@@ -1035,6 +1163,8 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
 
         with open(source, 'rb', buffering=1 << 20) as f:
             f.seek(offset)
+            if resume is not None and progress_cb:
+                progress_cb(offset, signature[0])
             for raw in f:
                 if store.cancel.is_set():
                     raise Cancelled('Indexing cancelled')
@@ -1056,11 +1186,19 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                         writer.add_vcd_batch(batch)
                         batch, batch_bytes, batch_events = {}, 0, 0
                     writer.publish()
+                    if writer.checkpointed and (pos - checkpoint_pos >= CHECKPOINT_BYTES or
+                                               time.monotonic() - checkpoint_time >= CHECKPOINT_INTERVAL):
+                        writer.checkpoint(source, signature, source_state, pos, state)
+                        checkpoint_pos, checkpoint_time = pos, time.monotonic()
                     if progress_cb:
                         progress_cb(pos, signature[0])
         if batch:
             writer.add_vcd_batch(batch)
         vcd.max_time = state.max_time
+        if writer.checkpointed:
+            # Sorting an out-of-order trace may itself take time. Its input
+            # remains recoverable if cancellation interrupts the final sort.
+            writer.checkpoint(source, signature, source_state, pos, state)
     if background:
         store.thread = threading.Thread(target=build, daemon=True, name='wavelet-index')
         try:

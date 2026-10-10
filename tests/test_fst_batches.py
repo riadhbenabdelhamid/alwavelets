@@ -179,7 +179,7 @@ def test_prepared_wrapper_closes_on_startup_failure(tmp_path, monkeypatch, failu
     def track_index(self, *args):
         initialize(self, *args)
         indexes.append(self)
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError('injected startup failure')
     monkeypatch.setattr(stream.tempfile, 'TemporaryFile', track_file)
     monkeypatch.setattr(FSTReader, '_prepare', track_reader)

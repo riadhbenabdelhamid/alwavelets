@@ -244,8 +244,8 @@ def test_disk_png_preserves_external_rendering_fixes(tmp_path):
 def test_summary_groups_spill_without_losing_extrema(tmp_path, monkeypatch, disordered):
     from alwavelets import storage
     original = storage.PageWriter.__init__
-    def small_groups(writer, *args):
-        original(writer, *args)
+    def small_groups(writer, *args, **kwargs):
+        original(writer, *args, **kwargs)
         writer.summary_group_limit = 2
     monkeypatch.setattr(storage.PageWriter, '__init__', small_groups)
     monkeypatch.setattr(storage, 'PAGE_EVENTS', 2)

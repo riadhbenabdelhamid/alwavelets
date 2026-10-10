@@ -1090,7 +1090,9 @@ class DrawingMixin:
             _sep()
             pct = self.vcd.load_progress
             chg = self.vcd.load_changes
-            if self.vcd._lazy_mode or pct < 1:
+            if getattr(self.vcd, '_resume_offset', 0):
+                _put(f"⟳ Resuming {pct}% ({chg:,})", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
+            elif self.vcd._lazy_mode or pct < 1:
                 _put(f"⟳ Indexing {pct}%", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
             else:
                 _put(f"⟳ Loading {pct}% ({chg:,})", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)

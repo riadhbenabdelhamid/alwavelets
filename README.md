@@ -145,8 +145,24 @@ The index includes signal/time lookups and a hierarchy of exact min/max
 summaries, so overview scaling need not decode the whole history. Reopening an
 unchanged source opens the signal catalog and fetches declarations and values
 on demand, without reconstructing every signal object.
-Changed sources and older index formats rebuild the index;
-incomplete/cancelled indexes are never reused.
+Changed sources and older index formats rebuild the index.
+
+VCD disk indexing with caching enabled saves a resumable checkpoint after the
+header, then roughly every five seconds or 64 MiB of input. Reopening after a
+close, cancellation, or process interruption continues at the last checkpoint;
+the status bar shows `Resuming` and progress includes the saved work. Checkpoints
+atomically save all preceding events, parser state, and unfinished summary
+groups. Work since the last checkpoint is replayed. Source identity, size, and
+modification/change times must still match; otherwise indexing starts over.
+FST indexing currently restarts after interruption. Selective signal loading
+remains optional, and all VCD declarations are retained across checkpoints.
+
+Incomplete VCD indexes consume cache disk space until completed or removed.
+Run `alwavelets --purge-partial-indexes` to remove idle incomplete indexes;
+indexes owned by open viewers are skipped. `--no-cache` disables both saving
+and resuming. If another viewer owns the partial index or its cache directory
+is unavailable, opening uses temporary storage. Small lock files remain in the
+cache directory so concurrent opens and cleanup can coordinate safely.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, display edits, SQLite,
@@ -185,7 +201,8 @@ names, so completing a broad search can take time while the interface remains
 responsive. Small in-memory traces continue to filter immediately.
 
 During background disk indexing, `;cancel` stops the load; closing the viewer
-also cancels it. Partial indexes are never published, and spill files close on
+also cancels it. Partial indexes are never treated as complete; cached VCD
+checkpoints remain available for resuming. Temporary spill files close on
 completion, cancellation, or failure. Library callers can pass a cancellation
 event to `FSTReader.parse(cancel=event)` or `storage.open_trace(cancel=event)`.
 FST metadata is parsed before the viewer opens; library cancellation also covers
@@ -719,6 +736,22 @@ benefit there. The benchmark now reports page counts, events per page, and summa
 row counts. These local results exclude generation and rendering; wall times
 depend on system load and storage. A separate paired ten-million-event FST check
 measured 11.1 seconds before and 11.3 seconds after, with the same index size.
+
+To measure interruption and resume with the default checkpoint cadence:
+
+```bash
+python3 tools/stress_resume.py --events 4000000 --output resume.json
+```
+
+This runs a cold load, an interrupted load, and a resumed load in separate
+processes with isolated caches. A local 128-signal, 4M-event mixed VCD run
+(174 MB, 8 MiB page cache) took 10.5 seconds for a full load. Interrupting at
+60% left a checkpoint at 39%, preserving 1.55M events. Reopening finished in
+6.6 seconds, with 29.6 MiB peak RSS versus 30.0 MiB for the full load. The
+remaining work after the checkpoint was replayed. Timings exclude generation
+and validation, include disk writes, and depend on storage and system load;
+the OS page cache is not flushed. This measures saved work after interruption,
+not faster initial parsing. Short traces may finish before an event checkpoint.
 
 ## License
 
