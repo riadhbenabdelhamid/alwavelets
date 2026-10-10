@@ -174,6 +174,7 @@ def main_curses(stdscr, vcd, start_collapsed=True, load_unchecked=False,
             viewer._show_message("Control channel unavailable (socket failed)")
     if load_unchecked:
         viewer.display_order = []
+        viewer._sync_display_set()
         viewer.indent_mode = True
     elif start_collapsed:
         viewer.collapse_all_modules()

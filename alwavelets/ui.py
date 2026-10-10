@@ -21,6 +21,7 @@ from .persistence import _write_json_atomic
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .finder import FinderMixin
+from .hierarchy import ScopeIndex, TreeRows
 from .ui_livereload import LiveReloadMixin
 from .ui_tree import TreePanelMixin
 from .ui_export import ExportMixin
@@ -789,8 +790,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         mg = self._member_group
         gbn = self._group_by_name
         headed = set()
-        rows = []
-        for sid in self.display_order:
+        # Without group headers, the read-only row view can share the order.
+        # Rebuilding a million-entry copy on every split-panel redraw stalls
+        # scrolling even when only a few waveform rows are visible.
+        rows = [] if mg else self.display_order
+        for sid in self.display_order if mg else ():
             g = mg.get(sid)
             if g is None:
                 rows.append(sid)
@@ -1048,6 +1052,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         gone = {s for _, s in removed}
         self.display_order[:] = [s for s in self.display_order if s not in gone]
         self._display_order_set.difference_update(gone)
+        self._scope_check_cache = {}
 
         def _undo(items=list(removed)):
             for i, sid in items:                      # ascending: indices hold
@@ -1137,6 +1142,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             return
         self.display_order.pop(idx)
         self._display_order_set.discard(sid)   # keep the finder's view in sync
+        self._scope_check_cache = {}
         sig = self.get_signal(sid)
         name = sig.name if sig else sid
         # Anchor on the following signal so undo restores the original slot
@@ -1706,31 +1712,26 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     def _sync_display_set(self):
         """Sync the display_order_set with display_order list."""
         self._display_order_set = set(self.display_order)
+        self._scope_check_cache = {}
 
     def _invalidate_scope_cache(self):
         self._scope_check_cache = {}
 
     def _rebuild_tree(self):
-        """Flatten scope tree for display."""
-        self._tree_flat = []
-        self._scope_check_cache = {}
-        self._sync_display_set()   # full_path -> bool (cached)
-        self._flatten_node(self.scope_tree, 0)
-
-    def _flatten_node(self, node, depth):
-        """Recursively flatten tree, respecting expanded state."""
-        for name, child in node.children.items():
-            n_sigs = child.total_signals()
-            is_expanded = child.full_path in self.tree_expanded
-            self._tree_flat.append(('scope', child, depth, is_expanded, n_sigs))
-            if is_expanded:
-                # Show signals in this scope
-                for sid in child.signal_ids:
-                    sig = self.get_signal(sid)
-                    in_view = sid in self._display_order_set
-                    self._tree_flat.append(('signal', sig, depth + 1, in_view, sid))
-                # Recurse into children
-                self._flatten_node(child, depth + 1)
+        """Rebuild scope runs; resolve individual signals only for visible rows."""
+        index = getattr(self, '_scope_index', None)
+        if index is None or index.root is not self.scope_tree:
+            self._scope_index = ScopeIndex(self.scope_tree)
+            self._scope_check_cache = {}
+        self._tree_flat = TreeRows(self._scope_index, self.tree_expanded, self.get_signal,
+                                   lambda sid: sid in self._display_order_set)
+        last = max(0, len(self._tree_flat) - 1)
+        self.tree_cursor = min(getattr(self, 'tree_cursor', 0), last)
+        self.tree_scroll = min(getattr(self, 'tree_scroll', 0), self.tree_cursor)
+        selected = getattr(self, 'panel_selected_scope', None)
+        if selected is not None and selected not in self._scope_index.nodes:
+            self.panel_selected_scope = None
+            self._panel_update_selected_scope()
 
     def expand_bus(self, sig_id=None):
         """Expand focused bus signal into individual bit lanes."""

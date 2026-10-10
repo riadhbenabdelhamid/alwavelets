@@ -148,6 +148,13 @@ created only when a signal is accessed. Pending index-summary groups spill to
 disk when their bounded builder cache fills. Metadata still grows with the
 number of declared signals; all signals remain available.
 
+The signal browser indexes scope runs and creates signal rows only when they
+are visible. Expanding a large scope does not create one UI entry per signal.
+The split panel reads the selected scope directly; subtree counts and
+checkmarks are cached. Home/End and Page Up/Down navigate both tree views.
+Selecting an entire scope still visits its signals, and declaration metadata
+continues to grow with signal count.
+
 During background disk indexing, `;cancel` stops the load; closing the viewer
 also cancels it. Partial indexes are never published, and spill files close on
 completion, cancellation, or failure. Library callers can pass a cancellation
@@ -416,6 +423,7 @@ whenever an agent is connected and acting.
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `fst_stream` | Bounded FST decompression and temporary storage for blocks and numeric tables |
+| `hierarchy` | Cached scope counts and virtual rows for large signal browsers |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
 | `background` | Bounded UI read queue and cancellable analysis jobs |
@@ -546,6 +554,22 @@ are removed after each run; disk space must accommodate the expanded blocks.
 `--background` also measures when metadata is ready and when the first signal
 has readable waveform data (not terminal rendering time). `--wrapped` repeats
 the trace checks with outer gzip compression.
+
+Hierarchy UI stress checks cover flat and nested layouts with 100,000 and one
+million signals, including expansion, arbitrary scrolling, selection, and
+split-panel drawing:
+
+```sh
+python3 tools/stress_tree.py --output tree.json
+python3 tools/stress_tree.py --repo /path/to/baseline --output tree-baseline.json
+```
+
+Each sample runs in a fresh process using real declaration objects and UI
+methods with a recording terminal surface. Results exclude file parsing,
+waveform rendering, and terminal I/O. The allocation metric covers rebuilding
+the expanded tree; process RSS also includes declarations and selection state.
+Slow baseline operations stop at `--timeout` seconds and are reported as
+timeouts rather than completed measurements.
 
 ## License
 

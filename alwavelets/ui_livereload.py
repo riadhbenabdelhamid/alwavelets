@@ -156,6 +156,7 @@ class LiveReloadMixin:
             self._clear_decode_results(all_results=True)
         self.vcd.close()
         self.vcd = new_vcd
+        self.scope_tree = new_vcd.scopes
         # These signals are new objects with new values. The row cache keys on
         # (kind, sig_id, num_changes) within a window, and we restore the same
         # window below — a re-run with the same signal names and change counts

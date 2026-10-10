@@ -246,6 +246,7 @@ class KeymapMixin:
             # Keep the finder's membership set in sync, or `/` will refuse to
             # re-add these signals (it treats them as already displayed).
             self._display_order_set.difference_update(s for _, s in removed)
+            self._scope_check_cache = {}
 
             def _undo(removed=removed):
                 for i, sid in removed:     # ascending: indices stay valid
