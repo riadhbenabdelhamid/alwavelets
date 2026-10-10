@@ -3,12 +3,16 @@ from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Mapping, MutableSet, Sequence
 import operator
+import sqlite3
 import weakref
 
 from .streaming import check_cancel
 
 VERSION = 1
 _FIELDS = 'id,parent,child_seq,name,path,depth,n,children,total,pre,stop,lo,hi,ordered'
+_BATCH_ROWS = 256
+_BATCH_BYTES = 256 * 1024
+_CHILD_PAGES = 8
 
 
 class ScopeHierarchy(Mapping):
@@ -37,7 +41,17 @@ class ScopeHierarchy(Mapping):
             try:
                 db.execute('CREATE TABLE IF NOT EXISTS scope_meta(version INTEGER,signals INTEGER)')
                 if db.execute('SELECT version,signals FROM scope_meta').fetchone() != expected:
-                    self._build()
+                    # Index sorts and bulk SQL must also remain cancellable.
+                    cancel = self.store.cancel
+                    db.set_progress_handler(lambda: int(cancel is not None and cancel.is_set()), 4096)
+                    try:
+                        self._build()
+                    except sqlite3.OperationalError:
+                        check_cancel(cancel)
+                        raise
+                    finally:
+                        db.set_progress_handler(None, 0)
+                    check_cancel(cancel)
                 if owned:
                     db.commit()
                 else:
@@ -60,67 +74,145 @@ class ScopeHierarchy(Mapping):
         db.execute('''CREATE TABLE scope_nodes(id INTEGER PRIMARY KEY,parent INTEGER,child_seq INTEGER,
                    name TEXT,path TEXT UNIQUE,depth INTEGER,n INTEGER DEFAULT 0,children INTEGER DEFAULT 0,
                    total INTEGER DEFAULT 0,pre INTEGER,stop INTEGER,lo INTEGER,hi INTEGER,ordered INTEGER)''')
-        db.execute('CREATE UNIQUE INDEX scope_children ON scope_nodes(parent,child_seq)')
         db.execute('INSERT INTO scope_nodes(id,parent,child_seq,name,path,depth) VALUES(0,NULL,0,"","",0)')
-        known = OrderedDict({'': (0, 0)})
+        created_count = self._build_nodes(progress)
+        db.execute('CREATE UNIQUE INDEX scope_children ON scope_nodes(parent,child_seq)')
+        self._count_nodes(progress, created_count)
+        db.execute('CREATE UNIQUE INDEX scope_preorder ON scope_nodes(pre)')
+        db.execute('CREATE INDEX scope_depth ON scope_nodes(depth)')
+        db.execute('DELETE FROM scope_meta')
+        db.execute('INSERT INTO scope_meta VALUES(?,?)', (VERSION, len(self.catalog)))
+
+    def _build_nodes(self, progress):
+        """Resolve ancestors together and write each batch in declaration order."""
+        from .loading import report_stage
+        db = self.store.db
+        # Cached records hold only id, depth and the next child ordinal. Every
+        # flush persists those ordinals before any records can be evicted.
+        known = OrderedDict({'': [0, 0, 0]})
+        pending, pending_bytes, created_count = {}, 0, 1
+
+        def flush():
+            nonlocal pending_bytes, created_count
+            if not pending:
+                return
+            check_cancel(self.store.cancel)
+            needed = dict.fromkeys(pending)
+            needed.update((row[0], None) for row in pending.values() if row[0] is not None)
+            nodes = {path: known[path] for path in needed if path in known}
+            missing = [path for path in needed if path not in nodes]
+            if missing:
+                nodes.update((path, [node_id, depth, children]) for node_id, path, depth, children in
+                    db.execute('SELECT id,path,depth,children FROM scope_nodes WHERE path IN (' +
+                               ','.join('?' for _ in missing) + ')', missing))
+            first_new = created_count
+            inserts, direct, parents = [], [], {}
+            for path, (parent_path, name, count, lo, hi) in pending.items():
+                node = nodes.get(path)
+                if node is None:
+                    parent = nodes[parent_path]
+                    node = nodes[path] = [created_count, parent[1] + 1, 0]
+                    created_count += 1
+                    inserts.append((node[0], parent[0], parent[2], name, path, node[1], count or 0, lo, hi))
+                    parent[2] += 1
+                    parents[parent[0]] = parent
+                elif count is not None:
+                    direct.append((count, lo, hi, node[0]))
+            db.executemany('INSERT INTO scope_nodes(id,parent,child_seq,name,path,depth,n,lo,hi,children) '
+                           'VALUES(?,?,?,?,?,?,?,?,?,?)', (row + (nodes[row[4]][2],) for row in inserts))
+            db.executemany('UPDATE scope_nodes SET children=? WHERE id=?',
+                           ((node[2], node_id) for node_id, node in parents.items() if node_id < first_new))
+            db.executemany('UPDATE scope_nodes SET n=?,lo=?,hi=? WHERE id=?', direct)
+            for path, node in nodes.items():
+                known[path] = node
+                known.move_to_end(path)
+                if len(known) > self.cache_limit:
+                    known.popitem(last=False)
+            pending.clear()
+            pending_bytes = 0
+            report_stage(progress, 'Preparing scopes', created_count, unit='scopes')
+
+        def stage(path, parent, name, count=None, lo=None, hi=None):
+            nonlocal pending_bytes
+            if path not in pending:
+                pending_bytes += 256 + 4 * (len(path) + len(parent or '') + len(name))
+            pending[path] = parent, name, count, lo, hi
+            if len(pending) >= _BATCH_ROWS or pending_bytes >= _BATCH_BYTES:
+                flush()
+
         cursor = db.execute('''SELECT path,n,
             (SELECT seq FROM signals WHERE scope=scopes.path AND local_seq=0),
             (SELECT seq FROM signals WHERE scope=scopes.path AND local_seq=scopes.n-1)
             FROM scopes ORDER BY rowid''')
-        created_count = 1
-        for number, (path, count, lo, hi) in enumerate(cursor):
+        for path, count, lo, hi in cursor:
             check_cancel(self.store.cancel)
-            if number % 256 == 0:
-                report_stage(progress, 'Preparing scopes', created_count, unit='scopes')
-            found = (0, 0) if not path else known.get(path)
-            if found is None:
-                parent, depth, prefix = 0, 0, ''
-                for part in path.split('.') if path else ():
-                    prefix = prefix + '.' + part if prefix else part
-                    found = known.get(prefix)
-                    if found is None:
-                        found = db.execute('SELECT id,depth FROM scope_nodes WHERE path=?', (prefix,)).fetchone()
-                    if found is None:
-                        created = db.execute('''INSERT INTO scope_nodes(parent,child_seq,name,path,depth)
-                            SELECT ?,children,?,?,? FROM scope_nodes WHERE id=?''',
-                                             (parent, part, prefix, depth + 1, parent))
-                        db.execute('UPDATE scope_nodes SET children=children+1 WHERE id=?', (parent,))
-                        found = (created.lastrowid, depth + 1)
-                        created_count += 1
-                    known[prefix] = found
-                    known.move_to_end(prefix)
-                    if len(known) > self.cache_limit:
-                        known.popitem(last=False)
-                    parent, depth = found
-            db.execute('UPDATE scope_nodes SET n=?,lo=?,hi=? WHERE id=?', (count, lo, hi, found[0]))
+            parent, parts = path, []
+            while parent and parent not in known and parent not in pending:
+                if len(parts) % _BATCH_ROWS == 0:
+                    check_cancel(self.store.cancel)
+                parent, _, name = parent.rpartition('.')
+                parts.append(name)
+            if not parts:
+                parent, _, name = path.rpartition('.')
+                stage(path, parent if path else None, name, count, lo, hi)
+            for name in reversed(parts):
+                prefix = parent + '.' + name if parent else name
+                if prefix == path:
+                    stage(prefix, parent, name, count, lo, hi)
+                else:
+                    stage(prefix, parent, name)
+                parent = prefix
+        flush()
+        return created_count
 
+    def _count_nodes(self, progress, created_count):
+        from .loading import report_stage
+        db = self.store.db
         # Iterative postorder computes counts and ordinal bounds with storage
-        # proportional to depth, never the number of sibling scopes.
+        # proportional to depth. A fixed cache of child pages avoids retaining
+        # a page per ancestor in deep trees, or querying each sibling separately.
+        pages, updates = OrderedDict(), []
         serial = 0
         report_stage(progress, 'Counting scope signals', 0, created_count, 'scopes')
 
-        def frame(node_id):
+        def frame(row):
             nonlocal serial
-            n, children, lo, hi = db.execute('SELECT n,children,lo,hi FROM scope_nodes WHERE id=?', (node_id,)).fetchone()
+            node_id, n, children, lo, hi = row
             pre = serial
             serial += 1
             return [node_id, 0, children, n, lo, hi, not n or hi - lo + 1 == n, pre]
 
-        stack = [frame(0)]
+        def flush():
+            db.executemany('UPDATE scope_nodes SET total=?,pre=?,stop=?,lo=?,hi=?,ordered=? WHERE id=?', updates)
+            updates.clear()
+            report_stage(progress, 'Counting scope signals', serial, created_count, 'scopes')
+
+        stack = [frame(db.execute('SELECT id,n,children,lo,hi FROM scope_nodes WHERE id=0').fetchone())]
         while stack:
             check_cancel(self.store.cancel)
             item = stack[-1]
             node_id, child, children, total, lo, hi, ordered, pre = item
             if child < children:
                 item[1] += 1
-                child_id = db.execute('SELECT id FROM scope_nodes WHERE parent=? AND child_seq=?', (node_id, child)).fetchone()[0]
-                stack.append(frame(child_id))
+                start = child // _BATCH_ROWS * _BATCH_ROWS
+                key = node_id, start
+                page = pages.get(key)
+                if page is None:
+                    # Start at the unvisited child: previously completed nodes
+                    # now contain subtree lo/hi, rather than direct-signal bounds.
+                    page = pages[key] = (child, db.execute(
+                        'SELECT id,n,children,lo,hi FROM scope_nodes WHERE parent=? '
+                        'AND child_seq>=? AND child_seq<? ORDER BY child_seq',
+                        (node_id, child, start + _BATCH_ROWS)).fetchall())
+                    if len(pages) > _CHILD_PAGES:
+                        pages.popitem(last=False)
+                pages.move_to_end(key)
+                stack.append(frame(page[1][child - page[0]]))
                 continue
-            db.execute('UPDATE scope_nodes SET total=?,pre=?,stop=?,lo=?,hi=?,ordered=? WHERE id=?',
-                       (total, pre, serial, lo, hi, ordered, node_id))
+            updates.append((total, pre, serial, lo, hi, ordered, node_id))
             stack.pop()
-            if pre % 256 == 0:
-                report_stage(progress, 'Counting scope signals', serial, created_count, 'scopes')
+            if len(updates) >= _BATCH_ROWS:
+                flush()
             if stack:
                 parent = stack[-1]
                 if total:
@@ -128,10 +220,8 @@ class ScopeHierarchy(Mapping):
                     parent[4] = min(parent[4], lo) if parent[3] else lo
                     parent[5] = max(parent[5], hi) if parent[3] else hi
                     parent[3] += total
-        db.execute('CREATE UNIQUE INDEX scope_preorder ON scope_nodes(pre)')
-        db.execute('CREATE INDEX scope_depth ON scope_nodes(depth)')
-        db.execute('DELETE FROM scope_meta')
-        db.execute('INSERT INTO scope_meta VALUES(?,?)', (VERSION, len(self.catalog)))
+        if updates:
+            flush()
 
     def _node(self, row):
         node_id = row[0]

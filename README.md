@@ -817,7 +817,7 @@ gzip-wrapped FST, measured:
 | Full indexing | 2.8–4.2 s | 2.9–4.3 s |
 | Cached browser ready | 3.5–4.8 ms | 4.8–6.0 ms |
 
-At one million scopes, the new loading screen still painted below 1 ms,
+At `8d71c5a`, a one-million-scope run painted the loading screen below 1 ms,
 metadata took 25.5 s (VCD) / 37.0 s (FST), and full indexing took 33.2 / 45.7 s
 with about 32 MiB peak RSS. Cached browser startup took 10–13 ms. Preparation
 is now visible and cancellable throughout that wait; its parsing and indexing
@@ -826,6 +826,29 @@ cache, real files, and a recording screen. Generation, imports, curses setup,
 and terminal I/O are excluded. First-value timing is the first successful value
 query after browser setup. Stage start times are included in the JSON for
 profiling declaration parsing, scope construction, and decompression separately.
+
+Scope construction now resolves ancestors and writes nodes in batches of up to
+256 pending paths, flushing earlier at an estimated 256 KiB of queued metadata.
+Subtree counting retains up to eight pages of 256 child records plus an iterative
+ancestor stack. Index sorts also observe cancellation. The on-disk schema,
+declaration order, optional signal selection, and saved checkpoints are preserved.
+
+A paired local startup comparison against `8d71c5a`, using the same generated
+workloads and settings above, measured:
+
+| Measurement | Previous VCD / FST | Batched VCD / FST |
+| --- | ---: | ---: |
+| Metadata ready, 100k scopes | 2.36 / 3.51 s | 1.62 / 2.82 s |
+| Scope preparation, 1M scopes | 16.63 / 16.21 s | 7.25 / 7.29 s |
+| Metadata ready, 1M scopes | 25.41 / 37.42 s | 16.25 / 28.52 s |
+| Full indexing, 1M scopes | 32.06 / 46.47 s | 22.69 / 37.46 s |
+| Peak RSS, 1M scopes | 31.8 / 31.3 MiB | 33.0 / 31.6 MiB |
+
+Scope preparation includes node construction, subtree counts/order, and indexes.
+These are individual local runs with wide hierarchies and short histories;
+other layouts and storage devices will differ. The million-scope cached browser
+still opened in 10–12 ms. FST declaration decoding took about 21 seconds in both
+versions and remains the largest part of its metadata preparation.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

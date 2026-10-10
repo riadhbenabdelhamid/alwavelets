@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from alwavelets import cache, storage
+from alwavelets import cache, scope_store, storage
 from alwavelets.hierarchy import ScopeIndex, TreeRows, scope_signal_ids, walk_scopes
 from alwavelets.parsers import VCDFile
 from alwavelets.fst import FSTReader
@@ -67,6 +67,62 @@ def test_random_expansions_and_subtree_counts_match_eager_tree(tmp_path, monkeyp
             assert normalized(actual[-3:]) == normalized(reference[-3:])
             with pytest.raises(IndexError):
                 actual[len(actual)]
+
+
+@pytest.mark.parametrize('rows,byte_limit', [(2, 256 * 1024), (256, 1024), (256, 256 * 1024)])
+def test_batched_metadata_matches_eager_tree_across_eviction(tmp_path, monkeypatch, rows, byte_limit):
+    rng = random.Random(783)
+    # A descendant can precede its parent's direct signals; revisiting branches
+    # after cache eviction must retain first-seen sibling and depth-first order.
+    scopes = ['top.z.deep.last', 'top.a', 'top.z', '', 'top', 'other']
+    scopes += [f'top.u{rng.randrange(40)}.child{rng.randrange(8)}.leaf' for _ in range(700)]
+    scopes += [f'top.u{i}' for i in reversed(range(40))] + ['top.z', '', 'top.a']
+    path = trace_file(tmp_path / 'batched.vcd', scopes)
+    eager = VCDFile.parse(path)
+    monkeypatch.setattr(ScopeHierarchy, 'cache_limit', 3)
+    monkeypatch.setattr(scope_store, '_BATCH_ROWS', rows)
+    monkeypatch.setattr(scope_store, '_BATCH_BYTES', byte_limit)
+    monkeypatch.setattr(scope_store, '_CHILD_PAGES', 1)
+    ordinals = {sid: i for i, sid in enumerate(eager.signal_order)}
+    for cached in (False, True):
+        with storage.open_trace(path, memory_mib=0.1) as trace:
+            actual = list(walk_scopes(trace.scopes))
+            expected = list(walk_scopes(eager.scopes))
+            assert [node.full_path for node in actual] == [node.full_path for node in expected]
+            for pre, (node, reference) in enumerate(zip(actual, expected)):
+                ids = list(scope_signal_ids(reference))
+                seq = [ordinals[sid] for sid in ids]
+                assert list(node.signal_ids) == reference.signal_ids
+                assert list(node.children) == list(reference.children)
+                assert (node.pre, node.stop, node.total) == (pre, pre + len(list(walk_scopes(reference))), len(ids))
+                assert (node.lo, node.hi, bool(node.ordered)) == (min(seq), max(seq), seq == list(range(min(seq), max(seq) + 1)))
+                assert list(scope_signal_ids(node)) == ids
+                hierarchy = trace.scopes.hierarchy
+                assert [i for part in hierarchy.ranges(node) for i in part] == seq
+                assert sorted(i for part in hierarchy.ranges(node, ordered=False) for i in part) == sorted(seq)
+
+
+def test_scope_build_reads_pages_instead_of_each_sibling(tmp_path, monkeypatch):
+    count = 3000
+    source = trace_file(tmp_path / 'paged-build.vcd', (f'top.u{i}' for i in range(count)))
+    selects = []
+    build = ScopeHierarchy._build
+
+    def counted(self):
+        def record(sql):
+            if sql.startswith('SELECT') and 'scope_nodes' in sql:
+                selects.append(sql)
+        self.store.db.set_trace_callback(record)
+        try:
+            build(self)
+        finally:
+            self.store.db.set_trace_callback(None)
+
+    monkeypatch.setattr(ScopeHierarchy, '_build', counted)
+    with storage.open_trace(source) as trace:
+        assert trace.scopes.total == count
+        assert trace.scopes.hierarchy[f'top.u{count - 1}'].lo == count - 1
+    assert 0 < len(selects) < count // 10
 
 
 @pytest.mark.parametrize('kind', ['vcd', 'fst'])
@@ -254,7 +310,6 @@ def test_cancelled_upgrade_rolls_back_and_can_retry(tmp_path, monkeypatch, parti
             pass
         target = storage.index_path(source)
     original = drop_scope_metadata(target)
-    import alwavelets.scope_store as scope_store
     cancel = threading.Event()
     check = scope_store.check_cancel
     calls = []
@@ -275,6 +330,49 @@ def test_cancelled_upgrade_rolls_back_and_can_retry(tmp_path, monkeypatch, parti
         assert not db.execute('SELECT 1 FROM sqlite_master WHERE name="scope_nodes"').fetchone()
     with storage.open_trace(source) as trace:
         assert trace.scopes.total_signals() == 600
+        if partial:
+            assert trace._resume_offset == saved['checkpoint']['offset']
+
+
+@pytest.mark.parametrize('index', ['scope_children', 'scope_preorder', 'scope_depth'])
+@pytest.mark.parametrize('partial', [False, True])
+def test_cancelled_scope_index_sort_preserves_upgrade_and_checkpoint(tmp_path, monkeypatch, index, partial):
+    source = trace_file(tmp_path / 'sort.vcd', (f'top.u{i}' for i in range(600)))
+    if partial:
+        with source.open('a') as output:
+            output.write(''.join(f'#{t}\n{t % 2}s0\n' for t in range(3, 10000)))
+        saved = interrupt_after_checkpoint(source, monkeypatch)
+        target = storage.partial_index_path(source)
+    else:
+        with storage.open_trace(source):
+            pass
+        target = storage.index_path(source)
+    original = drop_scope_metadata(target)
+    cancel, statements = threading.Event(), []
+    build = ScopeHierarchy._build
+
+    def interrupted(self):
+        def stop(sql):
+            if sql.startswith('CREATE') and index in sql:
+                statements.append(sql)
+                cancel.set()
+        self.store.db.set_trace_callback(stop)
+        try:
+            build(self)
+        finally:
+            self.store.db.set_trace_callback(None)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ScopeHierarchy, '_build', interrupted)
+        with pytest.raises(ValueError, match='cancelled'):
+            storage.open_trace(source, cancel=cancel)
+    assert len(statements) == 1
+    with sqlite3.connect(target) as db:
+        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert db.execute('SELECT value FROM meta WHERE key="trace"').fetchone()[0] == original
+        assert not db.execute('SELECT 1 FROM sqlite_master WHERE name="scope_nodes"').fetchone()
+    with storage.open_trace(source) as trace:
+        assert trace.scopes.total == 600
         if partial:
             assert trace._resume_offset == saved['checkpoint']['offset']
 
