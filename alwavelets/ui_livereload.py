@@ -142,7 +142,8 @@ class LiveReloadMixin:
         ca, cb = self.cursor_a, self.cursor_b
         ac, con, cbon = self.active_cursor, self.cursor_on, self.cursor_b_on
         soff, fidx = self.sig_offset, self.focus_idx
-        collapsed = set(self.collapsed_scopes)
+        from .scope_store import fold_state, restore_folds
+        collapsed = fold_state(self.collapsed_scopes)
 
         if hasattr(self, 'close_finder'):
             self.close_finder()
@@ -160,6 +161,7 @@ class LiveReloadMixin:
         self.vcd.close()
         self.vcd = new_vcd
         self.scope_tree = new_vcd.scopes
+        self.collapsed_scopes = restore_folds(self.scope_tree, collapsed)
         # These signals are new objects with new values. The row cache keys on
         # (kind, sig_id, num_changes) within a window, and we restore the same
         # window below — a re-run with the same signal names and change counts
@@ -177,7 +179,6 @@ class LiveReloadMixin:
         self.cursor_a = min(ca, mx)
         self.cursor_b = min(cb, mx)
         self.active_cursor, self.cursor_on, self.cursor_b_on = ac, con, cbon
-        self.collapsed_scopes = collapsed
 
         n = len(self.display_order)
         self.sig_offset = min(soff, max(0, n - 1))

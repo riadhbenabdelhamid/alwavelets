@@ -5,6 +5,9 @@ from collections.abc import Sequence
 
 def walk_scopes(root):
     """Visit scopes in declaration order without Python recursion."""
+    if hasattr(root, 'hierarchy'):
+        yield from root.hierarchy.walk(root)
+        return
     yield root
     stack = [iter(root.children.values())]
     while stack:
@@ -22,13 +25,17 @@ def scope_signal_ids(root):
 
 
 class ScopeIndex:
-    """Counts and direct scope lookup; storage grows with scopes, not signals.
+    """Counts and scope lookup, paged when the trace uses a disk catalog.
 
     The declaration tree is immutable for a loaded trace. A reload supplies a
     new root and creates a new index; selection and expansion reuse this one.
     """
     def __init__(self, root):
         self.root = root
+        if hasattr(root, 'hierarchy'):
+            from .scope_store import ScopeCounts
+            self.nodes, self.counts = root.hierarchy, ScopeCounts(root.hierarchy)
+            return
         self.nodes = {node.full_path: node for node in walk_scopes(root)}
         self.counts = {}
         for node in reversed(list(self.nodes.values())):
@@ -37,6 +44,12 @@ class ScopeIndex:
 
 class TreeRows(Sequence):
     """Random-access rows backed by scope runs and existing signal-id lists."""
+    def __new__(cls, scopes, expanded, get_signal, is_selected):
+        if hasattr(scopes.root, 'hierarchy'):
+            from .scope_store import PagedTreeRows
+            return PagedTreeRows(scopes, expanded, get_signal, is_selected)
+        return super().__new__(cls)
+
     def __init__(self, scopes, expanded, get_signal, is_selected):
         self.scopes = scopes
         self.get_signal, self.is_selected = get_signal, is_selected
@@ -104,3 +117,11 @@ def scope_all_selected(root, selected, cache):
         else:
             stack.append((child, None))
     return cache[root.full_path]
+
+
+def scope_ranges(root, catalog, *, ordered=True):
+    if hasattr(root, 'hierarchy'):
+        yield from root.hierarchy.ranges(root, ordered=ordered)
+    else:
+        for node in walk_scopes(root):
+            yield from catalog.scope_ranges(node.full_path)

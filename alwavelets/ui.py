@@ -22,6 +22,7 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .finder import FinderMixin
 from .hierarchy import ScopeIndex, TreeRows
+from .scope_store import ScopeFolds, fold_state, restore_folds
 from .display_order import (DisplayOrder, DisplayMembership, copy_order,
                             remove_display_ids, member_positions, grouped_rows)
 from .ui_livereload import LiveReloadMixin
@@ -1242,10 +1243,15 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         signals. (Collapsing at parts[:1] used to fold the ROOT scope itself,
         which hid every signal — a trace with top/top.alu started EMPTY until
         the user expanded scopes by hand.)"""
-        from .hierarchy import walk_scopes
-        for node in walk_scopes(self.vcd.scopes):
-            if '.' in node.full_path:
-                self.collapsed_scopes.add('.'.join(node.full_path.split('.')[:2]))
+        root = self.vcd.scopes
+        if hasattr(root, 'hierarchy'):
+            # Preserve explicit folds while resetting the default level.
+            extra = self.collapsed_scopes.extra if isinstance(self.collapsed_scopes, ScopeFolds) else self.collapsed_scopes
+            self.collapsed_scopes = ScopeFolds(root.hierarchy, extra=extra)
+        else:
+            for parent in root.children.values():
+                for child in parent.children.values():
+                    self.collapsed_scopes.add(child.full_path)
         self._rebuild_display_order()
         self.sig_offset = 0
         self.focus_idx = 0
@@ -1264,12 +1270,17 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         """
         catalog = self.vcd.signals
         if getattr(catalog, 'order', None) is self.vcd.signal_order:
+            if isinstance(self.collapsed_scopes, ScopeFolds):
+                self.display_order = self.collapsed_scopes.order()
+                self._sync_display_set()
+                return
             order = DisplayOrder.from_order(catalog, catalog.order)
-            from .hierarchy import walk_scopes
-            for node in walk_scopes(self.vcd.scopes):
-                path = node.full_path
-                if any(path == scope or path.startswith(scope + '.') for scope in self.collapsed_scopes):
-                    order.remove_ranges(catalog.scope_ranges(path))
+            from .hierarchy import ScopeIndex, scope_ranges
+            nodes = ScopeIndex(self.vcd.scopes).nodes if self.collapsed_scopes else {}
+            for path in self.collapsed_scopes:
+                node = nodes.get(path)
+                if node is not None:
+                    order.remove_ranges(scope_ranges(node, catalog, ordered=False))
             self.display_order = order
             self._sync_display_set()
             return
@@ -1485,7 +1496,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         data = {
             **view_order_state(self),
             'analog_signals': list(self.analog_signals),
-            'collapsed_scopes': list(self.collapsed_scopes),
+            **fold_state(self.collapsed_scopes),
             'groups': [{'name': g['name'], 'members': list(g['members']),
                         'collapsed': g['collapsed'], 'parent': g.get('parent')}
                        for g in self.groups],
@@ -1511,7 +1522,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             saved_order = data.get('display_order', [])
             self.display_order = saved_order if isinstance(saved_order, DisplayOrder) else [s for s in saved_order if s in valid_ids]
             self.analog_signals = set(s for s in data.get('analog_signals', []) if s in valid_ids)
-            self.collapsed_scopes = set(data.get('collapsed_scopes', []))
+            self.collapsed_scopes = restore_folds(getattr(self.vcd, 'scopes', None), data)
             self.groups = []
             for g in data.get('groups', []):
                 mem = set(s for s in g.get('members', []) if s in valid_ids)
@@ -1559,7 +1570,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                         'collapsed': g['collapsed'], 'parent': g.get('parent')}
                        for g in self.groups],
             'analog_signals': sorted(self.analog_signals),
-            'collapsed_scopes': sorted(self.collapsed_scopes),
+            **fold_state(self.collapsed_scopes),
             'radix': self.radix.value,
             'sig_radix': {k: r.value for k, r in self.sig_radix.items()},
             'sig_color': self.sig_color,
@@ -1623,7 +1634,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             if order or data.get('version') in (2, 3):
                 self.display_order = order
             self.analog_signals = {s for s in data.get('analog_signals', []) if s in valid}
-            self.collapsed_scopes = set(data.get('collapsed_scopes', []))
+            self.collapsed_scopes = restore_folds(getattr(self.vcd, 'scopes', None), data)
             # Keep every saved group, members or not: an intermediate node in
             # a nesting chain legitimately has none, and dropping it orphans
             # its children (_reindex_groups prunes the genuinely dead ones).
@@ -2280,10 +2291,13 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         cur_scope = sig.scope or ''
         # Expand direct child scopes
         expanded_any = False
-        for scope in list(self.collapsed_scopes):
-            if scope == cur_scope or scope.startswith(cur_scope + '.'):
-                self.collapsed_scopes.discard(scope)
-                expanded_any = True
+        if isinstance(self.collapsed_scopes, ScopeFolds):
+            expanded_any = self.collapsed_scopes.expand(cur_scope)
+        else:
+            for scope in list(self.collapsed_scopes):
+                if scope == cur_scope or scope.startswith(cur_scope + '.'):
+                    self.collapsed_scopes.discard(scope)
+                    expanded_any = True
         if expanded_any:
             self._rebuild_display_order()
             self._show_message(f"Expanded: {cur_scope}")

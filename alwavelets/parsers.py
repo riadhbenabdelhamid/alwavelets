@@ -232,10 +232,8 @@ class ScopeNode:
         self.collapsed = False
 
     def total_signals(self):
-        n = len(self.signal_ids)
-        for child in self.children.values():
-            n += child.total_signals()
-        return n
+        from .hierarchy import walk_scopes
+        return sum(len(node.signal_ids) for node in walk_scopes(self))
 
 
 def build_scope_tree(vcd):

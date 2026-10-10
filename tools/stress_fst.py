@@ -44,14 +44,18 @@ def compressed(chunks, output):
     return total, size
 
 
-def create_fst(path, events=10000000, signals=1, width=1):
+def create_fst(path, events=10000000, signals=1, width=1, *, scope_per_signal=False):
     """One scalar chain or a broad initial frame. No external converter needed."""
     if signals > 1 or width > 1:
         events = 1
     def hierarchy():
         yield b'\xfe\x00top\0\0'
         for i in range(signals):
+            if scope_per_signal:
+                yield b'\xfe\x00u%d\0\0' % i
             yield b'\x10\x00signal%d\0' % i + varint(width) + b'\0'
+            if scope_per_signal:
+                yield b'\xff'
         yield b'\xff'
     with open(path, 'wb') as output, tempfile.TemporaryFile() as chain, tempfile.TemporaryFile() as times, tempfile.TemporaryFile() as hier, tempfile.TemporaryFile() as frame:
         def chain_data():
@@ -68,7 +72,7 @@ def create_fst(path, events=10000000, signals=1, width=1):
         hier_u, hier_c = compressed(hierarchy(), hier)
         frame_u, frame_c = compressed(repeated(b'0', signals * width), frame)
         payload = (U64.pack(0) + U64.pack(events - 1) + struct.pack('<d', 2.7182818284590452354) +
-                   U64.pack(134217728) + U64.pack(1) + U64.pack(signals) + U64.pack(signals) + U64.pack(1) +
+                   U64.pack(134217728) + U64.pack(1 + signals if scope_per_signal else 1) + U64.pack(signals) + U64.pack(signals) + U64.pack(1) +
                    struct.pack('b', -9) + b'Alwavelets stress'.ljust(128, b'\0') + bytes(119) + b'\0' + U64.pack(0))
         output.write(b'\0' + U64.pack(len(payload) + 8) + payload)
         vc_start = output.tell()

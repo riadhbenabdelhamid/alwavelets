@@ -233,16 +233,25 @@ Declarations, declaration order, and direct scope membership live in SQLite
 during both the first parse and cached reopening. Signal objects use a bounded
 cache; held objects and alias masters retain their identity across eviction.
 Event counts, ingestion timestamps, and pending summary groups also use bounded
-caches. Display order uses compact catalog ranges, with space proportional to
-the number of runs and explicit edits. The scope tree still grows with the
-number of scopes. Highly fragmented selections, explicit group memberships,
-or collecting every signal ID can still require memory proportional to the
-selection. All declarations remain available without selecting a shortlist.
+caches. Scope parents, child order, subtree counts, and ordinal bounds also
+live in SQLite, with a bounded node cache. Cached opens do not rebuild the
+hierarchy. Older complete and resumable indexes get a transactional scope
+metadata upgrade without rescanning waveform histories; cancelling that upgrade
+leaves the existing index usable. Building and traversing deeply nested scopes
+does not depend on Python's recursion limit.
+Display order uses compact catalog ranges, with space proportional to the number
+of runs and explicit edits. Default module folding and saved views store a fold
+level plus exceptions, rather than every folded scope name. Existing sessions
+with explicit fold lists remain readable. Highly fragmented selections, explicit
+browser expansions, group memberships, or collecting every signal/scope can
+still require memory proportional to those edits. Long hierarchical names also
+increase index size. All declarations remain available without selecting a shortlist.
 
-The signal browser indexes scope runs and creates signal rows only when they
-are visible. Expanding a large scope does not create one UI entry per signal.
-The split panel reads the selected scope directly; subtree counts and
-checkmarks are cached. Home/End and Page Up/Down navigate both tree views.
+The signal browser resolves both scope headers and signal rows on demand.
+Expanding a scope does not create one UI entry per child scope or signal; the
+row index grows with explicit expansions. The split panel reads the selected
+scope directly; subtree counts are persisted and checkmarks are cached.
+Home/End and Page Up/Down navigate both tree views.
 Scope selection and checkmarks use catalog ranges. Contiguous scopes can be
 toggled without visiting each signal; interleaved declarations may require a
 scan to find their runs. Reordering, undo, and small display groups preserve
@@ -529,7 +538,7 @@ whenever an agent is connected and acting.
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `fst_stream` | Bounded FST decompression and temporary storage for blocks and numeric tables |
-| `hierarchy` | Cached scope counts and virtual rows for large signal browsers |
+| `hierarchy`, `scope_store` | Paged scope metadata, compact folds, and virtual browser rows |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
 | `catalog`, `finder_search` | Disk-backed declarations and scope membership; cancellable, paged fuzzy ranking |
@@ -741,10 +750,41 @@ A local run comparing `ae4ed59` to compact display ranges measured:
 These are flat, all-selected catalogs with one value per signal. Preparation,
 terminal I/O, and waveform painting are excluded. The JSON metric uses compact
 formatting; the application's indented default session also stays below 1 KiB.
-Fragmented orders, many scopes, or large explicit groups need more memory/work.
+Fragmented orders, explicit scope expansions, or large groups need more memory/work.
 The separate million-signal FST browsing/finder workflow used 29 MiB with compact
 display ranges, versus about 128 MiB at `ae4ed59`. Cached reopening stayed near
 6 ms. At `a79ca5e`, cold FST indexing measured 24.7 seconds in this run.
+
+Scope scaling checks use real VCD and FST files with one scalar per child scope,
+fresh processes, an 8 MiB page cache, and the real viewer with a recording screen:
+
+```sh
+python3 tools/stress_scopes.py --scopes 100000 --output scopes-100k.json
+python3 tools/stress_scopes.py --scopes 1000000 --output scopes-1m.json
+python3 tools/stress_scopes.py --scopes 100000 --repo /path/to/baseline --output scopes-before.json
+```
+
+A local comparison against `473389c` measured these VCD/FST ranges:
+
+| Measurement | Before, 100k scopes | Paged, 100k scopes | Paged, 1M scopes |
+| --- | ---: | ---: | ---: |
+| Cold indexing | 1.8–3.0 s | 2.8–4.2 s | 30.2–45.9 s |
+| Cold peak RSS | 86 MiB | 30 MiB | 30 MiB |
+| Cached reopen | 263–291 ms | 4 ms | 8 ms |
+| Viewer construction | 78–111 ms | below 1 ms | below 1 ms |
+| Expand top / jump to last scope / paint | 99–107 ms | below 1 ms | below 1 ms |
+| Default module folding | exceeded 10 s | 2–3 ms | 18 ms |
+| Browser peak RSS | 107 MiB | 27 MiB | 27 MiB |
+| Folded session JSON | not measured | 545 bytes | 546 bytes |
+
+Generation and terminal I/O are excluded. Default folding on the baseline was
+stopped after ten seconds, so no folded-session size is reported for that run.
+Persisting scope metadata increases the 100k-scope index from about 22 MiB to
+32–33 MiB and adds first-open work. Subsequent opens reuse that metadata. These
+are wide hierarchies with short histories; explicit expansions and fragmented
+selections still have their own costs. Regression tests also cover a hierarchy
+1,800 levels deep, declaration-order parity, legacy index upgrades, cancellation,
+and saved-view restoration.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

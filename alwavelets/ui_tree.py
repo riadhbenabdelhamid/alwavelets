@@ -7,7 +7,7 @@ from .rendering import *  # noqa: F401,F403
 from .decoders import *  # noqa: F401,F403
 from .parsers import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
-from .hierarchy import scope_signal_ids, scope_all_selected, walk_scopes
+from .hierarchy import scope_signal_ids, scope_all_selected, scope_ranges
 from .display_order import DisplayOrder
 
 
@@ -161,7 +161,7 @@ class TreePanelMixin:
         """Add all signals in scope (and subscopes) to display."""
         if isinstance(self.display_order, DisplayOrder):
             order = self.display_order
-            order.add_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
+            order.add_ranges(scope_ranges(scope_node, order.catalog))
             self._scope_check_cache = {}
             return
         self._sync_display_set()
@@ -176,7 +176,7 @@ class TreePanelMixin:
         """Remove all signals in scope (and subscopes) from display."""
         if isinstance(self.display_order, DisplayOrder):
             order = self.display_order
-            order.remove_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
+            order.remove_ranges(scope_ranges(scope_node, order.catalog, ordered=False))
             self._scope_check_cache = {}
             return
         drop = set(self._scope_signal_ids(scope_node))
@@ -194,7 +194,7 @@ class TreePanelMixin:
         """Check if all signals in scope (and subscopes) are in display. Cached."""
         if isinstance(self.display_order, DisplayOrder):
             order = self.display_order
-            return order.contains_ranges(part for node in walk_scopes(scope_node) for part in order.catalog.scope_ranges(node.full_path))
+            return order.contains_ranges(scope_ranges(scope_node, order.catalog, ordered=False))
         return scope_all_selected(scope_node, self._display_order_set, self._scope_check_cache)
 
     # ── Bus Expansion ──

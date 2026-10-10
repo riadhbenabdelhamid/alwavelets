@@ -1094,9 +1094,10 @@ def _restore(store, source, *, allow_partial=False):
     return vcd
 
 
-def _open_partial(source, memory, manager):
+def _open_partial(source, memory, manager, cancel=None):
     """Acquire or create a checkpoint, falling back if its cache is unavailable."""
     from .index_cache import discard_partial
+    from .streaming import OperationCancelled
     path = partial_index_path(source)
     store = lease = vcd = None
     try:
@@ -1104,21 +1105,37 @@ def _open_partial(source, memory, manager):
         if os.path.exists(path):
             try:
                 store = TraceStore(path, memory)
+                if cancel is not None:
+                    store.cancel = cancel
                 vcd = _restore(store, source, allow_partial=True)
+            except OperationCancelled:
+                raise
             except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
                 vcd = None
             if vcd is None:
                 if store is not None:
+                    # Closing a rejected probe must not cancel the replacement
+                    # load, which shares the caller's cancellation event.
+                    store.cancel = threading.Event()
                     store.close()
                     store = None
                 discard_partial(path)
         if store is None:
             store = TraceStore(path, memory)
+            if cancel is not None:
+                store.cancel = cancel
         store.index_lease = lease
         store.cache_manager = manager
         return store, vcd
+    except OperationCancelled:
+        if store is not None:
+            store.close()
+        if lease is not None:
+            lease.close()
+        raise
     except (OSError, sqlite3.Error):
         if store is not None:
+            store.cancel = threading.Event()
             store.close()
         if lease is not None:
             lease.close()
@@ -1135,7 +1152,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     source = os.path.abspath(source)
     if memory_mib <= 0:
         raise ValueError('memory_mib must be positive')
-    from .streaming import check_cancel
+    from .streaming import check_cancel, OperationCancelled
     cancel = cancel if cancel is not None else threading.Event()
     check_cancel(cancel)
     memory = int(memory_mib * 1024 * 1024)
@@ -1147,15 +1164,23 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         try:
             lease = manager.acquire(target, shared=True)
             store = TraceStore(target, memory)
+            store.cancel = cancel
             store.index_lease = lease
             vcd = _restore(store, source)
             if vcd is not None:
                 store.cache_manager = manager
                 manager.touch(target)
                 return vcd
+        except OperationCancelled:
+            if store is not None:
+                store.close()
+            elif lease is not None:
+                lease.close()
+            raise
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             pass
         if store is not None:
+            store.cancel = threading.Event()
             store.close()
         elif lease is not None:
             lease.close()
@@ -1170,7 +1195,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     state = ValueState()
     try:
         if use_cache:
-            store, vcd = _open_partial(source, memory, manager)
+            store, vcd = _open_partial(source, memory, manager, cancel)
             use_cache = store is not None
             if store is not None:
                 lease, path = store.index_lease, store.path

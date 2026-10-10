@@ -78,6 +78,7 @@ class SignalCatalog(Mapping):
         self._scope_ranges = OrderedDict()
         self._layout_hash = hashlib.sha256() if create else None
         self._layout_signature = None
+        self._scope_hierarchy = None
         if create:
             store.db.executescript('''
                 CREATE TABLE signals(seq INTEGER PRIMARY KEY,sid TEXT UNIQUE,definition TEXT,
@@ -155,6 +156,7 @@ class SignalCatalog(Mapping):
             self.pending_bytes = 0
             self._ordinals.clear()
             self._scope_ranges.clear()
+            self._scope_hierarchy = None
 
     @property
     def layout_signature(self):
@@ -288,24 +290,11 @@ class SignalCatalog(Mapping):
                 yield row[1:]
 
     def scope_tree(self):
-        from .parsers import ScopeNode
+        from .scope_store import ScopeHierarchy
         self.flush_declarations()
-        root = ScopeNode('', '')
-        root.signal_ids = SignalOrder(self, '', 0)
-        nodes = {'': root}
-        # First occurrence order preserves the eager tree's declaration order.
-        for path, count in self.store.db.execute('SELECT path,n FROM scopes ORDER BY rowid'):
-            node, prefix = root, ''
-            for part in path.split('.') if path else ():
-                prefix = prefix + '.' + part if prefix else part
-                child = nodes.get(prefix)
-                if child is None:
-                    child = nodes[prefix] = ScopeNode(part, prefix)
-                    child.signal_ids = SignalOrder(self, prefix, 0)
-                    node.children[part] = child
-                node = child
-            node.signal_ids = SignalOrder(self, path, count)
-        return root
+        if self._scope_hierarchy is None:
+            self._scope_hierarchy = ScopeHierarchy(self)
+        return self._scope_hierarchy.root
 
     def visible_ids(self, collapsed):
         # Scope checks run on short row batches, without creating signal objects.
