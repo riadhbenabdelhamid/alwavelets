@@ -1,0 +1,274 @@
+"""Disk-backed declarations, order and scope membership for wide traces."""
+from collections import OrderedDict
+from collections.abc import Mapping, MutableMapping, Sequence
+import json
+import operator
+import weakref
+
+from .core import AliasSignal
+
+
+class CatalogAlias(AliasSignal):
+    __slots__ = ('__weakref__',)
+
+
+class SignalOrder(Sequence):
+    """Indexed declaration order, optionally restricted to one direct scope."""
+    def __init__(self, catalog, scope=None, count=None):
+        self.catalog, self.scope = catalog, scope
+        self.count = count
+
+    def __len__(self):
+        return len(self.catalog) if self.count is None else self.count
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            from .storage import SequenceView
+            return SequenceView(self, range(*index.indices(len(self))))
+        index = operator.index(index)
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        store = self.catalog.store
+        with store.lock:
+            if self.scope is None:
+                row = store.db.execute('SELECT sid FROM signals WHERE seq=?', (index,)).fetchone()
+            else:
+                row = store.db.execute('SELECT sid FROM signals WHERE scope=? AND local_seq=?',
+                                       (self.scope, index)).fetchone()
+        return row[0]
+
+    def __iter__(self):
+        if self.scope is None:
+            yield from (row[0] for row in self.catalog.rows('sid'))
+            return
+        # Match the scope index's ordering. Ordering by global seq here would
+        # make SQLite sort the remaining scope again for every fetched batch.
+        store = self.catalog.store
+        for start in range(0, len(self), 256):
+            with store.lock:
+                rows = store.db.execute('SELECT sid FROM signals WHERE scope=? AND local_seq>=? '
+                                        'AND local_seq<? ORDER BY local_seq',
+                                        (self.scope, start, start + 256)).fetchall()
+            yield from (row[0] for row in rows)
+
+    def __eq__(self, other):
+        return len(self) == len(other) and all(a == b for a, b in zip(self, other))
+
+
+class SignalCatalog(Mapping):
+    """Immutable metadata with a bounded strong cache and live-object identity.
+
+    Weak references keep a held signal (including an alias's master) identical
+    across cache eviction, without retaining every visited declaration.
+    """
+    cache_limit = 1024
+
+    def __init__(self, store, create=False):
+        self.store = store
+        self.cache = OrderedDict()
+        self.live = weakref.WeakValueDictionary()
+        if create:
+            store.db.executescript('''
+                CREATE TABLE signals(seq INTEGER PRIMARY KEY,sid TEXT UNIQUE,definition TEXT,
+                    master TEXT,n INTEGER DEFAULT 0,scope TEXT,local_seq INTEGER,
+                    full_name TEXT,kind TEXT,size INTEGER,written INTEGER,last_time INTEGER,aliases INTEGER DEFAULT 1);
+                CREATE UNIQUE INDEX scope_order ON signals(scope,local_seq);
+                CREATE INDEX unpublished_counts ON signals(written) WHERE written IS NOT NULL AND n!=written;
+                CREATE TABLE scopes(path TEXT PRIMARY KEY,n INTEGER);
+            ''')
+        self.count = store.db.execute('SELECT COUNT(*) FROM signals').fetchone()[0]
+        self.order = SignalOrder(self)
+
+    def declare(self, name, identifier, size, kind, scope, bounds, *, deduplicate=True):
+        from .storage import _signal
+        from .streaming import check_cancel
+        check_cancel(self.store.cancel)
+        definition = [name, identifier, size, kind, scope, bounds]
+        db = self.store.db
+        row = db.execute('SELECT definition FROM signals WHERE sid=?', (identifier,)).fetchone()
+        if row is not None and deduplicate:
+            old = json.loads(row[0])
+            if (old[0], old[4], old[5]) == (name, scope, list(bounds) if bounds is not None else None):
+                return
+        key = identifier if row is None else '%s #%d' % (identifier, self.count)
+        # Construct only this transient metadata object, never the entire header.
+        full = _signal(definition, metadata_only=True).full_name
+        local = db.execute('SELECT n FROM scopes WHERE path=?', (scope,)).fetchone()
+        local = local[0] if local else 0
+        db.execute('INSERT INTO signals(seq,sid,definition,master,scope,local_seq,full_name,kind,size) '
+                   'VALUES(?,?,?,?,?,?,?,?,?)',
+                   (self.count, key, json.dumps(definition), identifier, scope, local, full, kind, size))
+        db.execute('INSERT INTO scopes VALUES(?,?) ON CONFLICT(path) DO UPDATE SET n=excluded.n', (scope, local + 1))
+        if row is not None:
+            db.execute('UPDATE signals SET aliases=aliases+1 WHERE sid=?', (identifier,))
+        self.count += 1
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        return iter(self.order)
+
+    def __contains__(self, key):
+        with self.store.lock:
+            return self.store.db.execute('SELECT 1 FROM signals WHERE sid=?', (key,)).fetchone() is not None
+
+    def __getitem__(self, key):
+        from .storage import StoredSignal, _signal
+        with self.store.lock:
+            sig = self.live.get(key)
+            if sig is None:
+                row = self.store.db.execute('SELECT definition,master FROM signals WHERE sid=?', (key,)).fetchone()
+                if row is None:
+                    raise KeyError(key)
+                definition, master = json.loads(row[0]), row[1]
+                if key == master:
+                    sig = StoredSignal(_signal(definition, metadata_only=True), key, self.store)
+                else:
+                    name, identifier, size, kind, scope, bounds = definition
+                    sig = CatalogAlias(name, identifier, size, kind, scope, self[master],
+                                       tuple(bounds) if bounds is not None else None)
+                self.live[key] = sig
+            self.cache[key] = sig
+            self.cache.move_to_end(key)
+            while len(self.cache) > self.cache_limit:
+                self.cache.popitem(last=False)
+            return sig
+
+    def rows(self, columns, where='', args=()):
+        """Bounded keyset traversal; no cursor spans a writer's publication."""
+        last = -1
+        clause = ' AND (' + where + ')' if where else ''
+        while True:
+            with self.store.lock:
+                if self.store.closed:
+                    return
+                rows = self.store.db.execute('SELECT seq,' + columns + ' FROM signals WHERE seq>?' +
+                                             clause + ' ORDER BY seq LIMIT 256', (last,) + args).fetchall()
+            if not rows:
+                return
+            last = rows[-1][0]
+            for row in rows:
+                yield row[1:]
+
+    def scope_tree(self):
+        from .parsers import ScopeNode
+        root = ScopeNode('', '')
+        root.signal_ids = SignalOrder(self, '', 0)
+        nodes = {'': root}
+        # First occurrence order preserves the eager tree's declaration order.
+        for path, count in self.store.db.execute('SELECT path,n FROM scopes ORDER BY rowid'):
+            node, prefix = root, ''
+            for part in path.split('.') if path else ():
+                prefix = prefix + '.' + part if prefix else part
+                child = nodes.get(prefix)
+                if child is None:
+                    child = nodes[prefix] = ScopeNode(part, prefix)
+                    child.signal_ids = SignalOrder(self, prefix, 0)
+                    node.children[part] = child
+                node = child
+            node.signal_ids = SignalOrder(self, path, count)
+        return root
+
+    def visible_ids(self, collapsed):
+        # Scope checks run on short row batches, without creating signal objects.
+        for sid, scope in self.rows('sid,scope'):
+            parts = scope.split('.') if scope else ()
+            if not any('.'.join(parts[:i]) in collapsed for i in range(1, len(parts) + 1)):
+                yield sid
+
+
+class CatalogDefinitions(Mapping):
+    def __init__(self, catalog):
+        self.catalog = catalog
+
+    def __getitem__(self, key):
+        store = self.catalog.store
+        with store.lock:
+            row = store.db.execute('SELECT definition FROM signals WHERE sid=? AND master=sid', (key,)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return json.loads(row[0])
+
+    def __iter__(self):
+        return (row[0] for row in self.catalog.rows('sid', 'master=sid'))
+
+    def __len__(self):
+        with self.catalog.store.lock:
+            return self.catalog.store.db.execute('SELECT COUNT(*) FROM signals WHERE master=sid').fetchone()[0]
+
+
+class CatalogField(MutableMapping):
+    """Bounded write-back state for counts and timestamps during ingestion."""
+    def __init__(self, catalog, column, writable=False):
+        assert column in ('n', 'written', 'last_time')
+        self.catalog, self.column, self.writable = catalog, column, writable
+        self.cache, self.dirty = OrderedDict(), set()
+        self.limit = 1024
+
+    def __getitem__(self, key):
+        with self.catalog.store.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                value = self.cache[key]
+            else:
+                row = self.catalog.store.db.execute('SELECT ' + self.column + ' FROM signals WHERE sid=?', (key,)).fetchone()
+                value = row[0] if row else None
+                self._cache(key, value)
+            if value is None:
+                raise KeyError(key)
+            return value
+
+    def _write(self, key, value):
+        self.catalog.store.db.execute('UPDATE signals SET ' + self.column + '=? WHERE sid=?', (value, key))
+
+    def _cache(self, key, value):
+        self.cache[key] = value
+        self.cache.move_to_end(key)
+        while len(self.cache) > self.limit:
+            old, value = self.cache.popitem(last=False)
+            if old in self.dirty:
+                self._write(old, value)
+                self.dirty.remove(old)
+
+    def __setitem__(self, key, value):
+        if not self.writable:
+            raise TypeError('read-only field')
+        with self.catalog.store.lock:
+            self._cache(key, value)
+            self.dirty.add(key)
+
+    def __delitem__(self, key):
+        self[key] = None
+
+    def flush(self):
+        with self.catalog.store.lock:
+            for key in self.dirty:
+                self._write(key, self.cache[key])
+            self.dirty.clear()
+
+    def __iter__(self):
+        self.flush()
+        return (row[0] for row in self.catalog.rows('sid', self.column + ' IS NOT NULL'))
+
+    def __len__(self):
+        self.flush()
+        with self.catalog.store.lock:
+            return self.catalog.store.db.execute('SELECT COUNT(*) FROM signals WHERE ' + self.column + ' IS NOT NULL').fetchone()[0]
+
+    def clear(self):
+        if not self.writable:
+            raise TypeError('read-only field')
+        with self.catalog.store.lock:
+            self.cache.clear()
+            self.dirty.clear()
+            self.catalog.store.db.execute('UPDATE signals SET ' + self.column + '=NULL')
+
+
+def attach_catalog(store, vcd, catalog):
+    vcd.signals, vcd.signal_order = catalog, catalog.order
+    store.definitions = CatalogDefinitions(catalog)
+    store.counts = CatalogField(catalog, 'n')
+    store.vcd, vcd._store = vcd, store

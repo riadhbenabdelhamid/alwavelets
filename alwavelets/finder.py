@@ -5,9 +5,8 @@ displayed ones): space-separated terms are AND-ed, each term matches as a
 substring or, failing that, a subsequence of the full hierarchical name.
 Enter adds the highlighted signal (or all Tab-marked ones) to the display and
 jumps to it; a signal that is already displayed is just jumped to. Pure
-stdlib, and fast enough to re-rank tens of thousands of names per keystroke:
-the hot path is str.find (C speed), with the Python subsequence walk only as
-a fallback, and extending a query re-ranks only the previous match set.
+stdlib. Large catalogs are ranked in a cancellable background worker with
+paged results; small in-memory traces filter immediately.
 """
 import curses
 
@@ -90,15 +89,15 @@ class FinderMixin:
     """Modal fuzzy-finder overlay (state lives on the viewer; see run())."""
 
     def open_finder(self):
-        cands = []
-        for sid in self.vcd.signal_order:
-            sig = self.vcd.signals.get(sid)
-            if sig is None:
-                continue
-            fn = sig.full_name
-            type_ch = '~' if sig.analog_mode else ('═' if sig.size > 1 else '─')
-            cands.append((sid, fn, fn.lower(), type_ch, sig.size))
-        self._finder_cands = cands
+        from .finder_search import FinderCandidates, FinderSearch
+        FinderMixin.close_finder(self)
+        cands = FinderCandidates(self.vcd)
+        # Small in-memory traces retain immediate feedback. Wide or disk-backed
+        # traces never duplicate the whole name set on the UI thread.
+        asynchronous = hasattr(self.vcd, '_store') or len(cands) > 4096
+        self._finder_cands = cands if asynchronous else list(cands)
+        self._finder_worker = FinderSearch(self.vcd) if asynchronous else None
+        self._finder_busy = False
         self.finder_query = ""
         self._finder_filter_query = None   # query finder_matches corresponds to
         self.finder_matches = []           # candidate indices, best first
@@ -113,6 +112,18 @@ class FinderMixin:
         q = ' '.join(self.finder_query.lower().split())
         prev = self._finder_filter_query
         cands = self._finder_cands
+        worker = getattr(self, '_finder_worker', None)
+        if worker is not None:
+            from .results import close_results
+            close_results(self.finder_matches)
+            worker.invalidate()
+            self.finder_matches = [] if q else range(len(cands))
+            self._finder_busy = bool(q)
+            if q:
+                worker.request(cands, q)
+            self._finder_filter_query = q
+            self.finder_sel = self.finder_scroll = 0
+            return
         if not q:
             self.finder_matches = list(range(len(cands)))
         else:
@@ -135,10 +146,15 @@ class FinderMixin:
 
     def finder_handle_key(self, key):
         """Handle a key in finder mode. Returns False to close the overlay."""
+        FinderMixin.poll_finder(self)
         if key == 27:                                  # Esc: cancel
+            FinderMixin.close_finder(self)
             return False
         if key in (10, curses.KEY_ENTER):              # Enter: commit
+            if getattr(self, '_finder_busy', False) and not self.finder_marked:
+                return True
             self._finder_commit()
+            FinderMixin.close_finder(self)
             return False
 
         n = len(self.finder_matches)
@@ -159,6 +175,10 @@ class FinderMixin:
                 self.finder_sel = min(self.finder_sel + 1, n - 1)
         elif key in (curses.KEY_UP, 16):               # ↑ / Ctrl-P
             self.finder_sel = max(self.finder_sel - 1, 0)
+        elif key == curses.KEY_HOME:
+            self.finder_sel = 0
+        elif key == curses.KEY_END:
+            self.finder_sel = max(0, n - 1)
         elif key == curses.KEY_NPAGE:
             if n:
                 self.finder_sel = min(self.finder_sel + page, n - 1)
@@ -181,6 +201,69 @@ class FinderMixin:
             self.finder_query += chr(key)
             self._finder_refilter()
         return True
+
+    def poll_finder(self):
+        changed = FinderMixin.poll_finder_navigation(self)
+        worker = getattr(self, '_finder_worker', None)
+        if worker is None or not getattr(self, '_finder_busy', False):
+            return changed
+        try:
+            matches = worker.poll()
+        except Exception as exc:
+            self._finder_busy = False
+            self._show_message('Signal search failed: ' + str(exc))
+            return True
+        if matches is None:
+            return changed
+        self.finder_matches = matches
+        self._finder_busy = False
+        return True
+
+    def close_finder_navigation(self):
+        from .results import close_results
+        worker = getattr(self, '_finder_next_worker', None)
+        if worker is not None:
+            worker.close()
+        self._finder_next_worker = None
+        self._finder_next_order = None
+        self._finder_next_jump = False
+        close_results(getattr(self, 'search_results', ()))
+        self.search_results = []
+
+    def poll_finder_navigation(self):
+        worker = getattr(self, '_finder_next_worker', None)
+        if worker is None:
+            return False
+        try:
+            matches = worker.poll()
+        except Exception as exc:
+            FinderMixin.close_finder_navigation(self)
+            self._show_message('Signal search failed: ' + str(exc))
+            return True
+        if matches is None:
+            return False
+        worker.close()
+        self._finder_next_worker = None
+        if self.display_order == self._finder_next_order:
+            self.search_results = matches
+            if self._finder_next_jump:
+                self.next_search_result()
+        else:
+            matches.close()
+        self._finder_next_order = None
+        self._finder_next_jump = False
+        return True
+
+    def close_finder(self):
+        from .results import close_results
+        worker = getattr(self, '_finder_worker', None)
+        if worker is not None:
+            worker.close()
+            self._finder_worker = None
+        close_results(getattr(self, 'finder_matches', ()))
+        self.finder_matches = []
+        self._finder_busy = False
+        self.show_finder = False
 
     def _finder_commit(self):
         """Add the marked (or highlighted) signals to the display, jump to
@@ -222,9 +305,18 @@ class FinderMixin:
 
         # Let `n` keep cycling this query's matches among displayed signals.
         q = ' '.join(self.finder_query.lower().split())
+        FinderMixin.close_finder_navigation(self)
         self.search_term = q
         self.search_results = []
-        if q:
+        if q and len(self.display_order) > 4096:
+            from .finder_search import FinderCandidates, FinderSearch
+            self._finder_next_order = list(self.display_order)
+            self._finder_next_worker = FinderSearch(self.vcd)
+            self._finder_next_worker.request(FinderCandidates(self.vcd, self._finder_next_order,
+                                                             dict(getattr(self, 'virtual_signals', {}))), q,
+                                             declaration_order=True)
+            self.search_idx = 0
+        elif q:
             for i, sid in enumerate(self.display_order):
                 sig = self.get_signal(sid)
                 if sig and fuzzy_match(q, sig.full_name.lower()) is not None:
@@ -257,7 +349,8 @@ class FinderMixin:
 
         n = len(self.finder_matches)
         marked = len(self.finder_marked)
-        counts = f"  {n}/{len(self._finder_cands)} signals"
+        busy = getattr(self, '_finder_busy', False)
+        counts = f"  {n}/{len(self._finder_cands)} signals" if not busy else "  searching…"
         if marked:
             counts += f" · {marked} marked"
         try:
@@ -275,7 +368,7 @@ class FinderMixin:
 
         if n == 0:
             try:
-                put(top, 3, "no matches", curses.A_DIM)
+                put(top, 3, "searching…" if busy else "no matches", curses.A_DIM)
             except curses.error:
                 pass
         for i in range(min(vis, n - self.finder_scroll)):

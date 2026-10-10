@@ -249,7 +249,8 @@ class DrawingMixin:
         w = self.width
 
         # ── Row 0: Title bar ──
-        total = sum(s.num_changes() for s in self.vcd.signals.values())
+        store = getattr(self.vcd, '_store', None)
+        total = store.total_changes if store is not None else sum(s.num_changes() for s in self.vcd.signals.values())
         parts = [
             " ◆ Alwavelets",
             os.path.basename(self.vcd._filename),

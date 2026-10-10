@@ -144,6 +144,9 @@ class LiveReloadMixin:
         soff, fidx = self.sig_offset, self.focus_idx
         collapsed = set(self.collapsed_scopes)
 
+        if hasattr(self, 'close_finder'):
+            self.close_finder()
+            self.close_finder_navigation()
         job = getattr(self, '_analysis_job', None)
         if job is not None:
             job.close()

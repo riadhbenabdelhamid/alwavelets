@@ -206,7 +206,7 @@ def main():
     parser.add_argument('--signals', '-s', help="Signal filter patterns, comma-separated (e.g. 'clk,data*,alu.*')")
     parser.add_argument('--sync', action='store_true', help="Force synchronous parse (disable background loading)")
     parser.add_argument('--storage', choices=('auto', 'memory', 'disk'), default='auto',
-                        help="Waveform storage (auto uses disk above 50 MiB or for large FST expansion)")
+                        help="Waveform storage (auto uses disk for large files, many declarations, or large FST expansion)")
     parser.add_argument('--memory-mib', type=int, default=256, metavar='N',
                         help="Decoded waveform page cache budget in MiB (default: 256)")
     parser.add_argument('--loadunchecked', action='store_true', help="Load with no signals shown (select via B tree browser)")
@@ -343,7 +343,8 @@ def main():
         else:
             print(f"Warning: No signals match '{args.signals}', showing all.", file=sys.stderr)
 
-    total = sum(s.num_changes() for s in vcd.signals.values())
+    store = getattr(vcd, '_store', None)
+    total = store.total_changes if store is not None else sum(s.num_changes() for s in vcd.signals.values())
     if vcd.is_loading:
         print(f"Loaded {len(vcd.signal_order)} signals (values loading in background...)")
     else:

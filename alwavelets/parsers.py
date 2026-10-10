@@ -36,6 +36,10 @@ def _declare_var(vcd, parts, scope, metadata_only=False):
     sig_id, size, stype, name = parts[3], _safe_int(parts[2]), parts[1], parts[4]
     reference = ' '.join(parts[4:]).split('$end', 1)[0].strip()
     name, declared_range = split_reference(reference)
+    declare = getattr(vcd.signals, 'declare', None)
+    if declare is not None:
+        declare(name, sig_id, size, stype, scope, declared_range)
+        return
     master = vcd.signals.get(sig_id)
     if master is None:
         vcd.signals[sig_id] = VCDSignal(name, sig_id, size, stype, scope, declared_range,
@@ -126,7 +130,7 @@ def parse_file(filename, progress_cb=None, use_cache=True, jobs=None,
                storage='auto', memory_mib=256):
     """Universal reader with persistent caching and optional disk storage.
 
-    Auto storage pages files above 50 MiB and FSTs with large estimated expansion
+    Auto storage pages files above 50 MiB, wide headers, and large FST expansion
     to disk, keeping all signal declarations available. memory_mib bounds the decoded-page cache, not total
     process memory. Close the returned trace (or use a with statement) when done.
     storage='memory' preserves the eager reader and full parse-cache path.
@@ -236,6 +240,9 @@ class ScopeNode:
 
 def build_scope_tree(vcd):
     """Build a scope hierarchy tree from parsed VCD signals."""
+    catalog_tree = getattr(vcd.signals, 'scope_tree', None)
+    if catalog_tree is not None:
+        return catalog_tree()
     root = ScopeNode("", "")
     for sig_id in vcd.signal_order:
         sig = vcd.signals[sig_id]
@@ -322,10 +329,13 @@ class VCDFile:
     # ══ Phase 1: Header-only parse (synchronous, <100ms) ══
 
     @staticmethod
-    def parse_header(filename, *, metadata_only=False):
+    def parse_header(filename, *, metadata_only=False, catalog=None):
         """Parse VCD header only. Returns (vcd, values_offset)."""
         vcd = VCDFile()
-        if metadata_only:
+        if catalog is not None:
+            from .catalog import attach_catalog
+            attach_catalog(catalog.store, vcd, catalog)
+        elif metadata_only:
             vcd.signals = {}  # insertion order without linked-list overhead
         vcd._filename = filename
         from .analysis_cache import stamp_source
@@ -575,6 +585,8 @@ class VCDFile:
 
     def close(self):
         """Cancel indexing and release disk pages and temporary storage."""
+        for worker in tuple(getattr(self, '_finder_workers', ())):
+            worker.close()
         for results in tuple(getattr(self, '_result_stores', ())):
             results.close()
         for derived in getattr(self, '_derived_stores', ()):

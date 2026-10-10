@@ -217,12 +217,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self._group_by_name = {}
         self._member_group = {}
         self._group_depth = {}        # name -> nesting depth (header indent)
-        self.view_rows = list(self.display_order)   # rebuilt each draw
+        self.view_rows = self.display_order   # ungrouped rows share the selection
 
         # Scope folding
         self.scope_tree = vcd.scopes
         self.collapsed_scopes = set()  # set of full_path strings
-        self._rebuild_display_order()
 
         # Time units
         self.show_time_units = True   # show ns/us/ms in ruler instead of raw ticks
@@ -345,7 +344,6 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.tree_selected = set()    # sig_ids checked in tree
         self._tree_flat = []
         self._scope_check_cache = {}
-        self._sync_display_set()   # full_path -> bool (cached)          # cached flattened tree entries
         self._rebuild_tree()
 
         # Bus expansion
@@ -1218,12 +1216,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         signals. (Collapsing at parts[:1] used to fold the ROOT scope itself,
         which hid every signal — a trace with top/top.alu started EMPTY until
         the user expanded scopes by hand.)"""
-        for sid in self.vcd.signal_order:
-            sig = self.vcd.signals.get(sid)
-            if sig and sig.scope and '.' in sig.scope:
-                # Collapse at first sub-level (e.g. top.alu, not top)
-                parts = sig.scope.split('.')
-                self.collapsed_scopes.add('.'.join(parts[:2]))
+        from .hierarchy import walk_scopes
+        for node in walk_scopes(self.vcd.scopes):
+            if '.' in node.full_path:
+                self.collapsed_scopes.add('.'.join(node.full_path.split('.')[:2]))
         self._rebuild_display_order()
         self.sig_offset = 0
         self.focus_idx = 0
@@ -1242,6 +1238,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         """
         if not self.collapsed_scopes:
             self.display_order = list(self.vcd.signal_order)
+            self._sync_display_set()
+            return
+        catalog = self.vcd.signals
+        if getattr(catalog, 'order', None) is self.vcd.signal_order and hasattr(catalog, 'visible_ids'):
+            self.display_order = list(catalog.visible_ids(self.collapsed_scopes))
             self._sync_display_set()
             return
         result = []
@@ -2388,6 +2389,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     # the finder seeds search_term/search_results, so `n` still cycles.)
 
     def next_search_result(self):
+        if getattr(self, '_finder_next_worker', None) is not None:
+            self._finder_next_jump = True
+            self._show_message('Finding the next displayed match…')
+            return
         if not self.search_results:
             return
         self.search_idx = (self.search_idx + 1) % len(self.search_results)
@@ -2616,6 +2621,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     self._dirty = True
                 if queries is not None and queries.errors:
                     self._show_message('Read failed: ' + queries.errors.pop(0))
+                if self.poll_finder():
+                    self._dirty = True
                 self.poll_instruction_results()
                 job = getattr(self, '_analysis_job', None)
                 if job is not None and job.progress != getattr(self, '_analysis_progress', None):
@@ -2779,6 +2786,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     break
 
         finally:
+            self.close_finder()
+            self.close_finder_navigation()
             job = getattr(self, '_analysis_job', None)
             if job is not None:
                 job.close()

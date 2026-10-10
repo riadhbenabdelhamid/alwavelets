@@ -85,7 +85,7 @@ Flags:
 | --- | --- |
 | `--signals`, `-s` | Comma-separated name/glob filters |
 | `--sync` | Force synchronous parse (disable background loading) |
-| `--storage auto\|memory\|disk` | Use disk above 50 MiB or for FSTs with large estimated expansion; override either way |
+| `--storage auto\|memory\|disk` | Use disk above 50 MiB, for large declaration counts, or large FST expansion; override either way |
 | `--memory-mib N` | Decoded waveform page-cache budget, default 256 MiB |
 | `--loadunchecked` | Start with no signals shown (pick them in the `B` tree browser) |
 | `--expanded` | Start with all scope modules expanded |
@@ -111,6 +111,8 @@ to in-memory VCD parsing (`--storage memory --sync --jobs 8`).
 ### Very large traces
 
 VCD and FST files above 50 MiB automatically use an indexed SQLite trace store.
+Smaller VCDs also use disk when their declaration count predicts large metadata
+allocations, even if their waveform history is short.
 For smaller native FSTs, automatic selection also examines uncompressed block
 sizes, timestamp counts, and declaration counts. Gzip-wrapped FSTs use disk
 storage conservatively, since inspecting their inner block layout requires
@@ -130,30 +132,40 @@ indexing progresses. Rows and cursor values load on a background worker; panning
 discards obsolete requests. Complete analyses wait until indexing finishes.
 The index includes signal/time lookups and a hierarchy of exact min/max
 summaries, so overview scaling need not decode the whole history. Reopening an
-unchanged source reads metadata immediately and fetches values on demand.
+unchanged source opens the signal catalog and fetches declarations and values
+on demand, without reconstructing every signal object.
 Changed sources rebuild the index; incomplete/cancelled indexes are never reused.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
-pages, **not total process memory**: Python, declarations, SQLite, builder buffers,
-and active query pages need additional memory. FST chains, frames, hierarchies,
-geometry, block/chain indexes, and timestamp tables use bounded buffers that
+pages, **not total process memory**: Python, scopes, selected signal IDs, SQLite,
+builder buffers, and active query pages need additional memory. FST chains,
+frames, hierarchies, handle geometry, block/chain indexes, and timestamp tables use bounded buffers that
 spill to temporary files. zlib, LZ4, FastLZ, and outer gzip decompression process
 small chunks and check cancellation. A single declaration name or signal value
-can still exceed the working-buffer budget, and metadata grows with signal
-count. There is no new native dependency. Disk mode
+can still exceed the working-buffer budget. There is no new native dependency. Disk mode
 trades a slower first scan and disk space for low memory use and quick subsequent
 opens. `--no-cache` still uses temporary disk storage, removed on close.
-Declarations share metadata with the page store, and sequence wrappers are
-created only when a signal is accessed. Pending index-summary groups spill to
-disk when their bounded builder cache fills. Metadata still grows with the
-number of declared signals; all signals remain available.
+Declarations, declaration order, and direct scope membership live in SQLite
+during both the first parse and cached reopening. Signal objects use a bounded
+cache; held objects and alias masters retain their identity across eviction.
+Event counts, ingestion timestamps, and pending summary groups also use bounded
+caches. The scope tree still grows with the number of scopes, and displaying or
+explicitly collecting every signal ID still requires space proportional to that
+selection. All declarations remain available without selecting a shortlist.
 
 The signal browser indexes scope runs and creates signal rows only when they
 are visible. Expanding a large scope does not create one UI entry per signal.
 The split panel reads the selected scope directly; subtree counts and
 checkmarks are cached. Home/End and Page Up/Down navigate both tree views.
-Selecting an entire scope still visits its signals, and declaration metadata
-continues to grow with signal count.
+Selecting an entire scope still visits its signals.
+
+The `/` finder reads names without materializing the catalog. Disk-backed and
+large in-memory traces rank fuzzy matches on a cancellable background worker;
+typing again discards the previous query. Results are stored on disk and paged,
+with no match-count limit. Empty queries show declaration order immediately.
+Home/End jump to the first/last result. Full fuzzy matching still scans candidate
+names, so completing a broad search can take time while the interface remains
+responsive. Small in-memory traces continue to filter immediately.
 
 During background disk indexing, `;cancel` stops the load; closing the viewer
 also cancels it. Partial indexes are never published, and spill files close on
@@ -426,6 +438,7 @@ whenever an agent is connected and acting.
 | `hierarchy` | Cached scope counts and virtual rows for large signal browsers |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
+| `catalog`, `finder_search` | Disk-backed declarations and scope membership; cancellable, paged fuzzy ranking |
 | `background` | Bounded UI read queue and cancellable analysis jobs |
 | `instruction_store` | Indexed instruction fields and paged record-ID selections |
 | `instruction_analysis` | Streaming instruction filters, statistics, and register snapshots |
@@ -570,6 +583,37 @@ waveform rendering, and terminal I/O. The allocation metric covers rebuilding
 the expanded tree; process RSS also includes declarations and selection state.
 Slow baseline operations stop at `--timeout` seconds and are reported as
 timeouts rather than completed measurements.
+
+For real million-declaration VCD/FST files, including one initial value per
+signal, cold indexing, cached reopening, browsing, and narrow/broad finder
+queries:
+
+```sh
+python3 tools/stress_catalog.py --signals 1000000 --output catalog.json
+python3 tools/stress_catalog.py --repo /path/to/baseline --output catalog-baseline.json
+```
+
+Cold and cached phases run in separate processes. Reports include index size,
+peak RSS, finder submission latency, and total ranking time. The cached phase
+uses the real viewer constructor with all signals selected and a recording
+screen; terminal I/O and waveform painting are excluded. `--formats vcd` or
+`--formats fst` restricts the generated inputs.
+
+A local million-signal run against `a09597c`, with an 8 MiB waveform cache,
+measured the following (timings depend on the machine and storage):
+
+| Measurement | Before | Catalog + paged finder |
+| --- | ---: | ---: |
+| Cold VCD/FST peak RSS | 650–750 MiB | 39–41 MiB |
+| Cached reopen | 5.0–5.1 s | 6–8 ms |
+| Headless browsing/search peak RSS, all selected | 808 MiB | 128 MiB |
+| Finder open | 616–706 ms | below 1 ms |
+| FST cold indexing | 47 s | 73 s |
+
+The lower memory use trades additional disk work for capacity: fuzzy ranking
+still took 1.4–2.4 seconds to finish in the background. The first all-selected
+scope checkmark paint took about 0.5 seconds; subsequent paints reuse its cached
+state. Disk indexes for these synthetic inputs grew from 261–271 MiB to 323 MiB.
 
 ## License
 

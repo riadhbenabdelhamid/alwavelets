@@ -7,7 +7,7 @@ pages; sequence views preserve the existing read-only signal API.
 import array
 import bisect
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import ExitStack
 import heapq
 import json
@@ -20,10 +20,10 @@ import threading
 import time
 import zlib
 
-from .core import VCDSignal, AliasSignal, numeric_value, clear_pack_memos
+from .core import VCDSignal, numeric_value, clear_pack_memos
 from .value_stream import ValueState
 
-VERSION = 4  # bounded FST reader and stricter block validation
+VERSION = 5  # disk-backed declarations, order and scope membership
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 AUTO_THRESHOLD = 50 * 1024 * 1024
@@ -110,7 +110,7 @@ class PageSequence(Sequence):
 
 
 class StoredSignal(VCDSignal):
-    __slots__ = ('store', 'key', '_time_view', '_value_view')
+    __slots__ = ('store', 'key', '_time_view', '_value_view', '__weakref__')
 
     def __init__(self, metadata, key, store):
         # The metadata object owns no event data. Do not call the mutable
@@ -182,8 +182,25 @@ def use_disk_storage(source, mode='auto'):
         return False  # dispatcher converts first, then applies storage policy
     if mode == 'disk' and not supported:
         raise ValueError('Disk storage requires VCD or FST input')
-    return supported and (mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD or
-                          (FSTReader.is_fst(source) and FSTReader.prefers_disk(source, AUTO_THRESHOLD)))
+    if not supported:
+        return False
+    if mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD:
+        return True
+    if FSTReader.is_fst(source):
+        return FSTReader.prefers_disk(source, AUTO_THRESHOLD)
+    # A short waveform can still have an enormous declaration header. Stop as
+    # soon as metadata alone would exceed the automatic storage threshold.
+    declarations = 0
+    with open(source, 'rb') as f:
+        for line in f:
+            line = line.lstrip()
+            if line.startswith(b'$var '):
+                declarations += 1
+                if declarations * 640 > AUTO_THRESHOLD:
+                    return True
+            elif line.startswith(b'$enddefinitions'):
+                break
+    return False
 
 
 def _definition(sig):
@@ -195,24 +212,6 @@ def _signal(definition, *, metadata_only=False):
     name, identifier, size, kind, scope, bounds = definition
     return VCDSignal(name, identifier, size, kind, scope, tuple(bounds) if bounds is not None else None,
                      metadata_only=metadata_only)
-
-
-class SignalDefinitions(Mapping):
-    """Reuse declarations on signal objects instead of retaining a second copy."""
-    def __init__(self, signals):
-        self.signals = signals
-
-    def __getitem__(self, key):
-        signal = self.signals[key]
-        if not signal.owns_storage:
-            raise KeyError(key)
-        return _definition(signal)
-
-    def __iter__(self):
-        return (key for key, signal in self.signals.items() if signal.owns_storage)
-
-    def __len__(self):
-        return sum(signal.owns_storage for signal in self.signals.values())
 
 
 class TraceStore:
@@ -228,6 +227,7 @@ class TraceStore:
         self.cache_bytes = self.peak_cache_bytes = self.page_reads = 0
         self.counts, self.definitions = {}, {}
         self.generation = 0
+        self.total_changes = 0
         self.cancel = threading.Event()
         self.thread = None
         self.temporary = None
@@ -354,22 +354,25 @@ class PageWriter:
         self.builders = OrderedDict()
         self.summary_groups = OrderedDict()
         self.summary_group_limit = 4096
-        self.sizes, self.totals, self.last_time = {}, {}, {}
+        self.sizes = {}
         self.buffer_bytes = 0
         self.buffer_limit = min(32 * 1024 * 1024, max(PAGE_BYTES, store.memory_bytes // 4))
         self.disordered = False
         self.changes = 0
         self.last_publish = time.monotonic()
         self._initialize(vcd)
+        from .catalog import CatalogField
+        self.totals = CatalogField(vcd.signals, 'written', writable=True)
+        self.last_time = CatalogField(vcd.signals, 'last_time', writable=True)
 
     def _initialize(self, vcd):
         from .parsers import build_scope_tree
+        from .catalog import SignalCatalog, attach_catalog
         store = self.store
         store.vcd = vcd
         db = store.db
         db.executescript('''
             CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
-            CREATE TABLE signals(sid TEXT PRIMARY KEY,definition TEXT,master TEXT,n INTEGER);
             CREATE TABLE pages(id INTEGER PRIMARY KEY,sid TEXT,lo INTEGER,n INTEGER,
                                t0 INTEGER,t1 INTEGER,vmin TEXT,vmax TEXT,data BLOB);
             CREATE TABLE summaries(sid TEXT,lo INTEGER,n INTEGER,level INTEGER,vmin TEXT,vmax TEXT,
@@ -380,20 +383,14 @@ class PageWriter:
             CREATE TEMP TABLE pending_summaries(sid TEXT,level INTEGER,data TEXT,
                                                 PRIMARY KEY(sid,level));
         ''')
-        if not isinstance(vcd.signals, dict) or isinstance(vcd.signals, OrderedDict):
-            vcd.signals = dict(vcd.signals)
-        store.definitions = SignalDefinitions(vcd.signals)
-        for sid in vcd.signal_order:
-            sig = vcd.signals[sid]
-            definition = _definition(sig)
-            master = sid if sig.owns_storage else sig.master.identifier
-            db.execute('INSERT INTO signals VALUES(?,?,?,0)', (sid, json.dumps(definition), master))
-            if sig.owns_storage:
-                store.counts[sid] = 0
-                vcd.signals[sid] = StoredSignal(sig, sid, store)
-            else:
-                vcd.signals[sid] = AliasSignal(sig.reference, sig.identifier, sig.size,
-                                               sig.signal_type, sig.scope, vcd.signals[master], sig.declared_range)
+        if not isinstance(vcd.signals, SignalCatalog):
+            catalog = SignalCatalog(store, create=True)
+            for sid in vcd.signal_order:
+                sig = vcd.signals[sid]
+                catalog.declare(sig.reference, sig.identifier, sig.size, sig.signal_type,
+                                sig.scope, sig.declared_range, deduplicate=False)
+            attach_catalog(store, vcd, catalog)
+            vcd.scopes = None
         db.commit()
         vcd._store = store
         vcd._lazy_mode = False
@@ -527,11 +524,15 @@ class PageWriter:
         for key in list(self.builders):
             self.flush(key)
         with self.store.lock:
-            self.store.db.executemany('UPDATE signals SET n=? WHERE sid=?',
-                                      ((n, key) for key, n in self.totals.items()))
-            self.store.db.commit()
+            self.totals.flush()
+            self.last_time.flush()
             if not self.disordered:
-                self.store.counts.update(self.totals)
+                delta = self.store.db.execute('SELECT COALESCE(SUM((written-n)*aliases),0) FROM signals '
+                                              'WHERE written IS NOT NULL AND n!=written').fetchone()[0]
+                self.store.total_changes += delta
+                self.store.db.execute('UPDATE signals SET n=written WHERE written IS NOT NULL AND n!=written')
+                self.store.counts.cache.clear()
+            self.store.db.commit()
             self.store.generation += 1
         self.vcd._load_changes = self.changes
         self.last_publish = time.monotonic()
@@ -578,7 +579,8 @@ class PageWriter:
                 'timescale': self.vcd.timescale, 'timescale_number': self.vcd.timescale_number,
                 'timescale_unit': self.vcd.timescale_unit, 'date': self.vcd.date,
                 'simulator_version': self.vcd.version, 'max_time': self.vcd.max_time,
-                'min_time': self.vcd.min_time}
+                'min_time': self.vcd.min_time, 'total_changes': self.store.total_changes,
+                'changes': self.changes}
         with self.store.lock:
             self.store.db.execute('DROP TABLE pending_summaries')
             self.store.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('trace', json.dumps(meta)))
@@ -616,29 +618,15 @@ def _restore(store, source):
     if meta['version'] != VERSION or meta['signature'] != _signature(source) or not meta['complete']:
         return None
     vcd = VCDFile()
-    vcd.signals = {}
-    store.definitions = SignalDefinitions(vcd.signals)
+    from .catalog import SignalCatalog, attach_catalog
+    attach_catalog(store, vcd, SignalCatalog(store))
     vcd._filename = source
     vcd._analysis_source = source_state
     for field in ('timescale', 'timescale_number', 'timescale_unit', 'date', 'max_time', 'min_time'):
         setattr(vcd, field, meta[field])
     vcd.version = meta['simulator_version']
-    scopes, kinds = {}, {}
-    for key, definition, master, count in store.db.execute('SELECT sid,definition,master,n FROM signals ORDER BY rowid'):
-        definition = json.loads(definition)
-        definition[3] = kinds.setdefault(definition[3], definition[3])
-        definition[4] = scopes.setdefault(definition[4], definition[4])
-        definition[1] = key if master == key else vcd.signals[master].identifier
-        sig = _signal(definition, metadata_only=True)
-        if master == key:
-            store.counts[key] = count
-            sig = StoredSignal(sig, key, store)
-        else:
-            sig = AliasSignal(sig.reference, sig.identifier, sig.size, sig.signal_type,
-                              sig.scope, vcd.signals[master], sig.declared_range)
-        vcd.signals[key] = sig
-        vcd.signal_order.append(key)
-    store.vcd, vcd._store = vcd, store
+    store.total_changes = meta['total_changes']
+    vcd._load_changes = meta['changes']
     vcd.scopes = build_scope_tree(vcd)
     return vcd
 
@@ -673,14 +661,6 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     preparation = ExitStack()
     store = temporary = None
     try:
-        if is_fst:
-            reader = FSTReader(source)
-            vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib))
-            offset = 0
-        else:
-            vcd, offset = VCDFile.parse_header(source, metadata_only=True)
-        if not vcd.signal_order:
-            raise ValueError('Trace has no signal declarations')
         if use_cache:
             try:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -693,6 +673,16 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         store = TraceStore(path, memory)
         store.cancel = cancel
         store.temporary = temporary
+        from .catalog import SignalCatalog
+        catalog = SignalCatalog(store, create=True)
+        if is_fst:
+            reader = FSTReader(source)
+            vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib, catalog=catalog))
+            offset = 0
+        else:
+            vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
+        if not vcd.signal_order:
+            raise ValueError('Trace has no signal declarations')
         writer = PageWriter(store, vcd)
         vcd._loading = True
         vcd._extent_known = False

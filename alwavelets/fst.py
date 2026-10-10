@@ -204,6 +204,7 @@ class FSTReader:
     def __init__(self, filename):
         self.filename = filename
         self._blocks = []            # [(type, offset, section_length)]
+        self._catalog = None
         self._handles = []           # handle -> {name,size,type,scope,hid,real}
         self._max_handle = 0
         self._geom = []              # handle -> bit length (0 = real)
@@ -338,7 +339,7 @@ class FSTReader:
             return vcd
 
     @contextmanager
-    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True):
+    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True, catalog=None):
         """Keep metadata and input open until value loading finishes or is cancelled.
 
         The context may be handed to a background worker after preparation;
@@ -346,6 +347,7 @@ class FSTReader:
         """
         if memory_mib <= 0:
             raise ValueError('FST memory budget must be positive')
+        self._catalog = catalog
         self._cancel = cancel
         self._limit = max(CHUNK, min(1024 * 1024, int(memory_mib * 1024 * 1024) // 16))
         self._frame0, self._geom = None, []
@@ -358,6 +360,7 @@ class FSTReader:
                 self._frame0, self._geom, self._blocks = None, [], []
                 self._times = self._vals = None
                 self._handles, self._writer, self._file = [], None, None
+                self._catalog = None
 
     def _check(self):
         check_cancel(self._cancel)
@@ -373,6 +376,9 @@ class FSTReader:
         from .parsers import VCDFile, build_scope_tree
         self._check()
         vcd = VCDFile()
+        if self._catalog is not None:
+            from .catalog import attach_catalog
+            attach_catalog(self._catalog.store, vcd, self._catalog)
         vcd._filename = self.filename
         from .analysis_cache import stamp_source
         stamp_source(vcd, self.filename)
@@ -419,7 +425,7 @@ class FSTReader:
                 raise ValueError("FST file has no hierarchy block")
             btype, bpos, bslen = hierarchy
             f.seek(bpos + 9)
-            if compact:
+            if compact and self._catalog is None:
                 vcd.signals = {}
             with self._read_hier_block(f, btype, bslen - 8) as hierarchy:
                 self._parse_hierarchy(hierarchy, vcd, compact)
@@ -531,7 +537,7 @@ class FSTReader:
         pos, n = 0, len(data)
         scope_stack = []
         next_handle = 0
-        self._handles = [None]
+        self._handles = _HandleTable(self._records('<QB')) if self._catalog is not None else [None]
         while pos < n:
             self._check()
             tag = data[pos]
@@ -571,7 +577,9 @@ class FSTReader:
                 disp, declared_range = split_reference(name)
                 size = 64 if is_real else length         # reals: 64, as fst2vcd declares them
                 hid = str(handle)
-                if hid not in vcd.signals:
+                if self._catalog is not None:
+                    self._catalog.declare(disp, hid, size, type_name, scope, declared_range, deduplicate=False)
+                elif hid not in vcd.signals:
                     vcd.signals[hid] = VCDSignal(disp, hid, size, type_name, scope, declared_range,
                                                 metadata_only=metadata_only)
                     vcd.signal_order.append(hid)
@@ -580,10 +588,14 @@ class FSTReader:
                     vcd.signals[key] = AliasSignal(disp, hid, size, type_name,
                                                    scope, vcd.signals[hid], declared_range)
                     vcd.signal_order.append(key)
-                while len(self._handles) <= handle:
-                    self._handles.append(None)
-                if self._handles[handle] is None:
-                    self._handles[handle] = {'hid': hid, 'size': length, 'real': is_real}
+                if isinstance(self._handles, _HandleTable):
+                    if alias == 0:
+                        self._handles.records.append((length, is_real))
+                else:
+                    while len(self._handles) <= handle:
+                        self._handles.append(None)
+                    if self._handles[handle] is None:
+                        self._handles[handle] = {'hid': hid, 'size': length, 'real': is_real}
             else:
                 pos += 1
         self._max_handle = max(self._max_handle, next_handle)
@@ -947,3 +959,18 @@ class _FrameValues:
             value = self.get(h)
             if value is not None:
                 yield h, value
+
+
+class _HandleTable:
+    """Compact, spillable FST handle geometry; identifiers derive from indexes."""
+    def __init__(self, records):
+        self.records = records
+
+    def __len__(self):
+        return len(self.records) + 1
+
+    def __getitem__(self, handle):
+        if handle == 0:
+            return None
+        size, real = self.records[handle - 1]
+        return {'hid': str(handle), 'size': size, 'real': bool(real)}
