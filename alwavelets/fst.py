@@ -305,7 +305,7 @@ class FSTReader:
             return False
 
     @classmethod
-    def prefers_disk(cls, filename, threshold):
+    def prefers_disk(cls, filename, threshold, *, cancel=None):
         """Cheap, conservative expansion estimate; never decompress the waveform."""
         try:
             size = os.path.getsize(filename)
@@ -318,6 +318,7 @@ class FSTReader:
                 estimate = cls._read_u64(f) * 640  # declared signal metadata
                 position = 0
                 while position < size:
+                    check_cancel(cancel)
                     f.seek(position)
                     kind = f.read(1)[0]
                     length = cls._read_u64(f)
@@ -339,13 +340,14 @@ class FSTReader:
                     position = end
                 return False
         except (OSError, ValueError, IndexError, struct.error):
+            check_cancel(cancel)
             return True  # Let the bounded parser report the malformed input.
 
     # ── top level ────────────────────────────────────────────────────
 
-    def parse(self, progress_cb=None, writer_factory=None, metadata_only=False, *, cancel=None, memory_mib=8):
+    def parse(self, progress_cb=None, writer_factory=None, metadata_only=False, *, cancel=None, memory_mib=8, stage_cb=None):
         """Read with bounded decompression; eager output still retains all events."""
-        with self.prepare(progress_cb, cancel=cancel, memory_mib=memory_mib,
+        with self.prepare(progress_cb, cancel=cancel, memory_mib=memory_mib, stage_cb=stage_cb,
                           compact=metadata_only or writer_factory is not None) as vcd:
             if not metadata_only:
                 writer = writer_factory(vcd) if writer_factory else None
@@ -353,7 +355,7 @@ class FSTReader:
             return vcd
 
     @contextmanager
-    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True, catalog=None, resume=None):
+    def prepare(self, progress_cb=None, *, cancel=None, memory_mib=8, compact=True, catalog=None, resume=None, stage_cb=None):
         """Keep metadata and input open until value loading finishes or is cancelled.
 
         The context may be handed to a background worker after preparation;
@@ -364,6 +366,7 @@ class FSTReader:
         self._catalog = catalog
         self._resume_vcd = resume
         self._cancel = cancel
+        self._stage_cb = stage_cb
         self._limit = max(CHUNK, min(1024 * 1024, int(memory_mib * 1024 * 1024) // 16))
         self._frame0, self._geom = None, []
         with ExitStack() as resources:
@@ -380,6 +383,10 @@ class FSTReader:
 
     def _check(self):
         check_cancel(self._cancel)
+
+    def _stage(self, name, done=None, total=None, unit='bytes'):
+        from .loading import report_stage
+        report_stage(getattr(self, '_stage_cb', None), name, done, total, unit)
 
     def _records(self, fmt='<Q', resources=None):
         table = Records(fmt, self._limit, self._cancel)
@@ -418,6 +425,7 @@ class FSTReader:
                 progress_cb(f.tell(), file_size)
 
             # Block map
+            self._stage('Reading FST blocks', 0, file_size)
             self._blocks = self._records('<BQQ')
             f.seek(0)
             while True:
@@ -431,6 +439,8 @@ class FSTReader:
                     raise ValueError('Truncated or invalid FST section')
                 self._blocks.append((tb[0], pos, sec_len))
                 f.seek(pos + 1 + sec_len)
+                if len(self._blocks) % 256 == 0:
+                    self._stage('Reading FST blocks', f.tell(), file_size)
 
             # Hierarchy (the last one wins if a writer emitted several)
             hierarchy = None
@@ -443,6 +453,7 @@ class FSTReader:
                 # The durable declaration catalog is authoritative. Rebuild only
                 # the bounded handle geometry, without inserting declarations.
                 self._handles = _HandleTable(self._records('<QB'))
+                self._stage('Restoring signal widths')
                 for width, kind in self._catalog.rows('size,kind', 'master=sid'):
                     self._check()
                     self._handles.records.append((width, kind in ('real', 'realtime', 'shortreal')))
@@ -457,6 +468,7 @@ class FSTReader:
                 progress_cb(f.tell(), file_size)
 
             # Geometry: bit width per handle (0 = real)
+            self._stage('Reading signal widths')
             for btype, bpos, bslen in self._blocks:
                 if btype == self.BL_GEOM:
                     f.seek(bpos + 9)
@@ -465,13 +477,14 @@ class FSTReader:
 
             self._file, self._file_size = f, file_size
             if self._resume_vcd is None:
-                vcd.scopes = build_scope_tree(vcd)
+                vcd.scopes = build_scope_tree(vcd, cancel=self._cancel, stage_cb=self._stage_cb)
             return vcd
 
     def read_values(self, vcd, writer=None, progress_cb=None, *, checkpoint=None, resume=None):
         """Consume a prepared reader without rebuilding declarations or hierarchy."""
         from .parsers import _compact_times
         self._check()
+        self._stage('Indexing values' if writer is not None else 'Reading values')
         self._writer = writer
         self._checkpoint = checkpoint
         self._resume = resume or checkpoint_state()
@@ -544,7 +557,8 @@ class FSTReader:
         f.seek(0, os.SEEK_END)
         compressed_size = f.tell() - 17
         unpacked = self._resources.enter_context(self._decompress(
-            FileSlice(f, 17, compressed_size), 'zlib', expected, wbits=15 + 32))
+            FileSlice(f, 17, compressed_size), 'zlib', expected, wbits=15 + 32,
+            progress_cb=lambda done, total: self._stage('Unpacking FST', done, total)))
         return unpacked.file if unpacked.file is not None else self._resources.enter_context(io.BytesIO(unpacked[:]))
 
     # ── header ───────────────────────────────────────────────────────
@@ -576,28 +590,34 @@ class FSTReader:
 
     def _read_hier_block(self, f, btype, data_len):
         uncomp_len = self._read_u64(f)
+        progress = lambda done, total: self._stage('Unpacking declarations', done, total)
         if btype == self.BL_HIER:
             data = FileSlice(f, f.tell(), data_len - 8)
             for wbits in (15 + 32, 0, -15):
                 try:
-                    return self._decompress(data, 'zlib', uncomp_len, wbits=wbits)
+                    return self._decompress(data, 'zlib', uncomp_len, wbits=wbits, progress_cb=progress)
                 except zlib.error:
                     continue
             raise ValueError("FST hierarchy: zlib decompression failed")
         if btype == self.BL_HIER_LZ4:
-            return self._decompress(FileSlice(f, f.tell(), data_len - 8), 'lz4', uncomp_len)
+            return self._decompress(FileSlice(f, f.tell(), data_len - 8), 'lz4', uncomp_len, progress_cb=progress)
         mid_len = self._read_u64(f)
-        with self._decompress(FileSlice(f, f.tell(), data_len - 16), 'lz4', mid_len) as middle:
-            return self._decompress(middle, 'lz4', uncomp_len)
+        with self._decompress(FileSlice(f, f.tell(), data_len - 16), 'lz4', mid_len, progress_cb=progress) as middle:
+            return self._decompress(middle, 'lz4', uncomp_len, progress_cb=progress)
 
     def _parse_hierarchy(self, data, vcd, metadata_only=False):
         data = data.data if data.file is None else data
         pos, n = 0, len(data)
+        self._stage('Reading declarations', 0, n)
+        reported = 0
         scope_stack = []
         next_handle = 0
         self._handles = _HandleTable(self._records('<QB')) if self._catalog is not None else [None]
         while pos < n:
             self._check()
+            if pos - reported >= 65536:
+                self._stage('Reading declarations', pos, n)
+                reported = pos
             tag = data[pos]
             if tag == self.HT_SCOPE:
                 pos += 2                                   # tag + scope type

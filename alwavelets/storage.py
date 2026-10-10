@@ -188,7 +188,9 @@ def partial_index_path(path):
     return index_path(path) + '.partial'
 
 
-def use_disk_storage(source, mode='auto'):
+def use_disk_storage(source, mode='auto', *, cancel=None):
+    from .streaming import check_cancel
+    check_cancel(cancel)
     if mode not in ('auto', 'memory', 'disk'):
         raise ValueError('storage must be auto, memory, or disk')
     if mode == 'memory':
@@ -205,12 +207,13 @@ def use_disk_storage(source, mode='auto'):
     if mode == 'disk' or os.path.getsize(source) > AUTO_THRESHOLD:
         return True
     if FSTReader.is_fst(source):
-        return FSTReader.prefers_disk(source, AUTO_THRESHOLD)
+        return FSTReader.prefers_disk(source, AUTO_THRESHOLD, cancel=cancel)
     # A short waveform can still have an enormous declaration header. Stop as
     # soon as metadata alone would exceed the automatic storage threshold.
     declarations = 0
     with open(source, 'rb') as f:
         for line in f:
+            check_cancel(cancel)
             line = line.lstrip()
             if line.startswith(b'$var '):
                 declarations += 1
@@ -266,6 +269,7 @@ class TraceStore:
         self.generation = 0
         self.total_changes = 0
         self.cancel = threading.Event()
+        self.stage_cb = None
         self.thread = None
         self.temporary = None
         self.index_lease = None
@@ -1094,7 +1098,7 @@ def _restore(store, source, *, allow_partial=False):
     return vcd
 
 
-def _open_partial(source, memory, manager, cancel=None):
+def _open_partial(source, memory, manager, cancel=None, stage_cb=None):
     """Acquire or create a checkpoint, falling back if its cache is unavailable."""
     from .index_cache import discard_partial
     from .streaming import OperationCancelled
@@ -1105,6 +1109,7 @@ def _open_partial(source, memory, manager, cancel=None):
         if os.path.exists(path):
             try:
                 store = TraceStore(path, memory)
+                store.stage_cb = stage_cb
                 if cancel is not None:
                     store.cancel = cancel
                 vcd = _restore(store, source, allow_partial=True)
@@ -1127,12 +1132,6 @@ def _open_partial(source, memory, manager, cancel=None):
         store.index_lease = lease
         store.cache_manager = manager
         return store, vcd
-    except OperationCancelled:
-        if store is not None:
-            store.close()
-        if lease is not None:
-            lease.close()
-        raise
     except (OSError, sqlite3.Error):
         if store is not None:
             store.cancel = threading.Event()
@@ -1140,10 +1139,21 @@ def _open_partial(source, memory, manager, cancel=None):
         if lease is not None:
             lease.close()
         return None, None
+    except BaseException:
+        if store is not None:
+            store.close()
+        if lease is not None:
+            lease.close()
+        raise
 
 
-def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None, cancel=None):
-    """Open VCD/FST into paged storage; all declarations remain available."""
+def open_trace(source, memory_mib=256, background=False, use_cache=True, progress_cb=None, cancel=None, stage_cb=None):
+    """Open VCD/FST into paged storage; all declarations remain available.
+
+    stage_cb(stage, done, total, unit) reports preparation stages and counts;
+    unavailable counts are None. It runs on the thread doing that work.
+    progress_cb retains its waveform-byte progress semantics.
+    """
     from .parsers import VCDFile
     from . import cache
     from .index_cache import WaveformCache, disk_full
@@ -1153,7 +1163,10 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     if memory_mib <= 0:
         raise ValueError('memory_mib must be positive')
     from .streaming import check_cancel, OperationCancelled
+    from .loading import report_stage
     cancel = cancel if cancel is not None else threading.Event()
+    check_cancel(cancel)
+    report_stage(stage_cb, 'Checking saved index')
     check_cancel(cancel)
     memory = int(memory_mib * 1024 * 1024)
     target = index_path(source)
@@ -1164,6 +1177,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         try:
             lease = manager.acquire(target, shared=True)
             store = TraceStore(target, memory)
+            store.stage_cb = stage_cb
             store.cancel = cancel
             store.index_lease = lease
             vcd = _restore(store, source)
@@ -1179,6 +1193,12 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             raise
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             pass
+        except BaseException:
+            if store is not None:
+                store.close()
+            elif lease is not None:
+                lease.close()
+            raise
         if store is not None:
             store.cancel = threading.Event()
             store.close()
@@ -1195,7 +1215,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     state = ValueState()
     try:
         if use_cache:
-            store, vcd = _open_partial(source, memory, manager, cancel)
+            store, vcd = _open_partial(source, memory, manager, cancel, stage_cb)
             use_cache = store is not None
             if store is not None:
                 lease, path = store.index_lease, store.path
@@ -1225,6 +1245,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
         store.index_lease = lease
         store.cache_manager = manager if use_cache else None
         store.cancel = cancel
+        store.stage_cb = stage_cb
         store.temporary = temporary
         if vcd is not None:
             resume = vcd._checkpoint
@@ -1232,7 +1253,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             if is_fst:
                 reader = FSTReader(source)
                 preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib,
-                                                         catalog=vcd.signals, resume=vcd))
+                                                         catalog=vcd.signals, resume=vcd, stage_cb=stage_cb))
             else:
                 state = ValueState(*resume['checkpoint']['state'])
                 state.monotonic = resume['checkpoint']['monotonic']
@@ -1241,13 +1262,17 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
             catalog = SignalCatalog(store, create=True)
             if is_fst:
                 reader = FSTReader(source)
-                vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib, catalog=catalog))
+                vcd = preparation.enter_context(reader.prepare(cancel=cancel, memory_mib=memory_mib,
+                                                               catalog=catalog, stage_cb=stage_cb))
                 offset = 0
             else:
-                vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog)
+                vcd, offset = VCDFile.parse_header(source, metadata_only=True, catalog=catalog,
+                                                  cancel=cancel, stage_cb=stage_cb)
         if not vcd.signal_order:
             raise ValueError('Trace has no signal declarations')
         writer = PageWriter(store, vcd, checkpointed=lease is not None, resume=resume)
+        report_stage(stage_cb, 'Saving preparation')
+        check_cancel(cancel)
         if writer.checkpointed and resume is None:
             if is_fst:
                 from .fst import checkpoint_state
@@ -1272,6 +1297,7 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     def build():
         try:
             with preparation:
+                report_stage(stage_cb, 'Indexing values')
                 if is_fst:
                     checkpoint_time, checkpoint_work = time.monotonic(), 0
 

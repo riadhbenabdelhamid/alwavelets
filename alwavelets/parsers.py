@@ -236,13 +236,19 @@ class ScopeNode:
         return sum(len(node.signal_ids) for node in walk_scopes(self))
 
 
-def build_scope_tree(vcd):
+def build_scope_tree(vcd, *, cancel=None, stage_cb=None):
     """Build a scope hierarchy tree from parsed VCD signals."""
     catalog_tree = getattr(vcd.signals, 'scope_tree', None)
     if catalog_tree is not None:
         return catalog_tree()
+    from .loading import report_stage
+    from .streaming import check_cancel
+    report_stage(stage_cb, 'Preparing scopes', 0, len(vcd.signal_order), 'signals')
     root = ScopeNode("", "")
-    for sig_id in vcd.signal_order:
+    for i, sig_id in enumerate(vcd.signal_order):
+        if i % 256 == 0:
+            check_cancel(cancel)
+            report_stage(stage_cb, 'Preparing scopes', i, len(vcd.signal_order), 'signals')
         sig = vcd.signals[sig_id]
         parts = sig.scope.split('.') if sig.scope else []
         node = root
@@ -325,10 +331,10 @@ class VCDFile:
                 return f"{s}{unit}"
         return f"{ticks}"
 
-    # ══ Phase 1: Header-only parse (synchronous, <100ms) ══
+    # ══ Phase 1: Header-only parse ══
 
     @staticmethod
-    def parse_header(filename, *, metadata_only=False, catalog=None):
+    def parse_header(filename, *, metadata_only=False, catalog=None, cancel=None, stage_cb=None):
         """Parse VCD header only. Returns (vcd, values_offset)."""
         vcd = VCDFile()
         if catalog is not None:
@@ -342,9 +348,15 @@ class VCDFile:
         vcd._extent_known = False
         scope_stack = []
         current_scope = ""
+        from .loading import report_stage
+        from .streaming import check_cancel
+        report_stage(stage_cb, 'Reading declarations', 0)
 
         with open(filename, 'rb') as f:
-            for raw_line in f:
+            for line_number, raw_line in enumerate(f):
+                if line_number % 256 == 0:
+                    check_cancel(cancel)
+                    report_stage(stage_cb, 'Reading declarations', f.tell())
                 if len(raw_line) <= 1:
                     continue
                 line = raw_line.decode('ascii', errors='ignore').rstrip('\n\r')
@@ -354,7 +366,7 @@ class VCDFile:
                 if not line or line[0] != '$':
                     continue
                 if line.startswith('$timescale'):
-                    ts = _extract_block(line, '$timescale', _TextWrapper(f))
+                    ts = _extract_block(line, '$timescale', _TextWrapper(f, cancel))
                     vcd.timescale = ts
                     m = re.match(r'(\d+)\s*(s|ms|us|ns|ps|fs)', ts)
                     if m:
@@ -376,15 +388,16 @@ class VCDFile:
                 elif line.startswith('$enddefinitions'):
                     break
                 elif line.startswith('$comment'):
-                    _extract_block(line, '$comment', _TextWrapper(f))
+                    _extract_block(line, '$comment', _TextWrapper(f, cancel))
                 elif line.startswith('$date'):
-                    vcd.date = _extract_block(line, '$date', _TextWrapper(f))
+                    vcd.date = _extract_block(line, '$date', _TextWrapper(f, cancel))
                 elif line.startswith('$version'):
-                    vcd.version = _extract_block(line, '$version', _TextWrapper(f))
+                    vcd.version = _extract_block(line, '$version', _TextWrapper(f, cancel))
 
             vcd._values_offset = f.tell()
 
-        vcd.scopes = build_scope_tree(vcd)
+        check_cancel(cancel)
+        vcd.scopes = build_scope_tree(vcd, cancel=cancel, stage_cb=stage_cb)
         return vcd, vcd._values_offset
 
     # ══ Phase 2a: Background full value parse ══
@@ -401,7 +414,9 @@ class VCDFile:
         sig.add_change(time, value[-1:].lower() if sig._scalar else value)
         return 1
 
-    def _read_values(self, offset, progress_cb=None):
+    def _read_values(self, offset, progress_cb=None, *, cancel=None):
+        from .streaming import check_cancel
+        check_cancel(cancel)
         self._value_signals = {k.encode('ascii'): s for k, s in self.signals.items()
                                if s.owns_storage}
         state = ValueState()
@@ -411,10 +426,14 @@ class VCDFile:
         active, current_time = True, 0
         size = os.path.getsize(self._filename)
         pos, reported, changes = offset, offset, 0
+        checked = pos
         with open(self._filename, 'rb', buffering=1 << 20) as f:
             f.seek(offset)
             for raw in f:
                 pos += len(raw)
+                if cancel is not None and pos - checked >= 65536:
+                    check_cancel(cancel)
+                    checked = pos
                 # Scalar lines cannot alter directive state. Avoid creating
                 # an intermediate event/string on this common storage path.
                 c = raw[0]
@@ -466,8 +485,10 @@ class VCDFile:
                     self._load_changes = changes
                     if progress_cb:
                         progress_cb(pos, size)
+        check_cancel(cancel)
         if not state.monotonic:
             for sig in self.signals.values():
+                check_cancel(cancel)
                 if sig.owns_storage:
                     sig._sort_by_time()
         self._parsed_offset = pos
@@ -482,9 +503,10 @@ class VCDFile:
 
     def _parse_values_background(self, offset):
         try:
-            self._read_values(offset)
+            self._read_values(offset, cancel=getattr(self, '_load_cancel', None))
             from . import cache
-            cache.save_cache(self, self._filename)
+            if getattr(self, '_save_background_cache', True):
+                cache.save_cache(self, self._filename, cancel=getattr(self, '_load_cancel', None))
         except Exception as e:
             self._load_error = str(e)
         finally:
@@ -502,6 +524,8 @@ class VCDFile:
         First-change times let a cold window find predecessor values without
         searching for signals that have never changed. No values are retained.
         """
+        from .streaming import check_cancel
+        cancel = getattr(self, '_load_cancel', None)
         size = os.path.getsize(self._filename)
         state = ValueState()
         index = [(0, offset)]
@@ -514,6 +538,7 @@ class VCDFile:
             with open(self._filename, 'rb', buffering=1 << 20) as f:
                 f.seek(offset)
                 for raw in f:
+                    check_cancel(cancel)
                     line = raw.lstrip() if raw[0] <= 32 else raw
                     c = line[:1]
                     if state.comment:
@@ -593,6 +618,12 @@ class VCDFile:
         store = getattr(self, '_store', None)
         if store is not None:
             store.close()
+        cancel = getattr(self, '_load_cancel', None)
+        if cancel is not None:
+            cancel.set()
+            thread = getattr(self, '_load_thread', None)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join()
 
     def __enter__(self):
         return self
@@ -803,10 +834,12 @@ class VCDFile:
 
     # ══ Combined: choose strategy based on file size ══
 
-    def start_background_load(self, lazy_threshold=50 * 1024 * 1024):
+    def start_background_load(self, lazy_threshold=50 * 1024 * 1024, *, cancel=None, use_cache=True):
         """Start background loading. Files >lazy_threshold use lazy chunk mode."""
         self._loading = True
         self._load_progress = 0
+        self._load_cancel = cancel if cancel is not None else threading.Event()
+        self._save_background_cache = use_cache
         file_size = os.path.getsize(self._filename)
         if file_size > lazy_threshold:
             self._load_thread = threading.Thread(
@@ -906,10 +939,12 @@ def _extract_block(first_line, keyword, fileobj):
 
 class _TextWrapper:
     """Wrap binary file object to yield decoded strings for _extract_block."""
-    __slots__ = ('_f',)
-    def __init__(self, f): self._f = f
+    __slots__ = ('_f', '_cancel')
+    def __init__(self, f, cancel=None): self._f, self._cancel = f, cancel
     def __iter__(self): return self
     def __next__(self):
+        from .streaming import check_cancel
+        check_cancel(self._cancel)
         line = self._f.readline()
         if not line: raise StopIteration
         return line.decode('ascii', errors='ignore')

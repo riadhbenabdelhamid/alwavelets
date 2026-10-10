@@ -192,7 +192,49 @@ def main_curses(stdscr, vcd, start_collapsed=True, load_unchecked=False,
         # would appear to do nothing, with no way to override from the CLI.
         if use_session and not demo_view:
             viewer.restore_session()
+    if getattr(vcd, '_startup_message', None):
+        viewer._show_message(vcd._startup_message)
     viewer.run()
+
+
+def _prepare_native_view(args, cancel, report):
+    from .loading import prepare_native
+    from .streaming import check_cancel
+    vcd = prepare_native(args.file, storage=args.storage, memory_mib=args.memory_mib,
+                         use_cache=not args.no_cache, cancel=cancel, stage_cb=report)
+    try:
+        if args.signals:
+            patterns = [p.strip() for p in args.signals.split(',')]
+            report('Selecting displayed signals', 0, len(vcd.signal_order), 'signals')
+            selected = []
+            for i, sid in enumerate(vcd.signal_order):
+                if i % 256 == 0:
+                    check_cancel(cancel)
+                    report('Selecting displayed signals', i, len(vcd.signal_order), 'signals')
+                sig = vcd.signals[sid]
+                if any(fnmatch.fnmatch(sig.name, p) or fnmatch.fnmatch(sig.full_name, p) for p in patterns):
+                    selected.append(sid)
+            if selected:
+                vcd.signal_order = selected
+            else:
+                vcd._startup_message = f"No signals match '{args.signals}'; showing all."
+        check_cancel(cancel)
+        return vcd
+    except BaseException:
+        vcd.close()
+        raise
+
+
+def _open_native_curses(stdscr, args):
+    from .loading import wait_for_trace
+    vcd = wait_for_trace(stdscr, args.file, lambda cancel, report: _prepare_native_view(args, cancel, report))
+    try:
+        main_curses(stdscr, vcd, start_collapsed=not args.expanded,
+                    load_unchecked=args.loadunchecked,
+                    use_session=not (args.no_session or args.expanded or args.loadunchecked),
+                    control=args.control)
+    finally:
+        vcd.close()
 
 
 def main():
@@ -300,6 +342,21 @@ def main():
         if not os.path.isfile(args.file):
             print(f"Error: File not found: {args.file}", file=sys.stderr)
             sys.exit(1)
+        # Enter curses before storage detection, cache upgrades, or declarations.
+        # --sync and converted legacy formats retain their synchronous path.
+        with open(args.file, 'rb') as source:
+            native = source.read(1) in (b'$', b'\0', b'\xfe')
+        if native and not args.sync:
+            import sqlite3
+            from .streaming import OperationCancelled
+            try:
+                curses.wrapper(_open_native_curses, args)
+            except (OperationCancelled, KeyboardInterrupt):
+                print('Opening cancelled.')
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                print(f'Error: {exc}', file=sys.stderr)
+                sys.exit(1)
+            return
         fsize = os.path.getsize(args.file)
         print(f"Parsing: {args.file} ({fsize/1024/1024:.1f} MB)")
 

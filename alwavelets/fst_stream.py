@@ -246,14 +246,18 @@ class Cursor:
 
 
 class Output:
-    def __init__(self, buffer, expected):
+    def __init__(self, buffer, expected, progress_cb=None):
         self.buffer, self.expected = buffer, expected
+        self.progress_cb, self.reported = progress_cb, 0
         self.history = bytearray()
 
     def write(self, data):
         if self.expected is not None and len(self.buffer) + len(data) > self.expected:
             raise ValueError('FST decompressed size exceeds declaration')
         self.buffer.write(data)
+        if self.progress_cb is not None and len(self.buffer) - self.reported >= CHUNK:
+            self.reported = len(self.buffer)
+            self.progress_cb(self.reported, self.expected)
         self.history.extend(data)
         if len(self.history) > HISTORY * 2:
             del self.history[:-HISTORY]
@@ -269,13 +273,15 @@ class Output:
             size -= count
 
 
-def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=15):
+def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=15, progress_cb=None):
     """Decode to a closeable buffer; working memory is independent of block size."""
     result = Buffer(limit, cancel)
-    output = Output(result, expected)
+    output = Output(result, expected, progress_cb)
     source = Cursor(data, cancel)
     try:
         check_cancel(cancel)
+        if progress_cb is not None:
+            progress_cb(0, expected)
         if codec == 'raw':
             while source:
                 output.write(source.read(min(CHUNK, len(data) - source.pos)))
@@ -344,6 +350,8 @@ def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=1
         if expected is not None and len(result) != expected:
             raise ValueError('FST decompressed size mismatch (%d != %d)' % (len(result), expected))
         check_cancel(cancel)
+        if progress_cb is not None:
+            progress_cb(len(result), expected)
         return result
     except BaseException:
         result.close()

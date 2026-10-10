@@ -52,6 +52,9 @@ class ScopeHierarchy(Mapping):
                 raise
 
     def _build(self):
+        from .loading import report_stage
+        progress = self.store.stage_cb
+        report_stage(progress, 'Preparing scopes', 0, unit='scopes')
         db = self.store.db
         db.execute('DROP TABLE IF EXISTS scope_nodes')
         db.execute('''CREATE TABLE scope_nodes(id INTEGER PRIMARY KEY,parent INTEGER,child_seq INTEGER,
@@ -64,8 +67,11 @@ class ScopeHierarchy(Mapping):
             (SELECT seq FROM signals WHERE scope=scopes.path AND local_seq=0),
             (SELECT seq FROM signals WHERE scope=scopes.path AND local_seq=scopes.n-1)
             FROM scopes ORDER BY rowid''')
-        for path, count, lo, hi in cursor:
+        created_count = 1
+        for number, (path, count, lo, hi) in enumerate(cursor):
             check_cancel(self.store.cancel)
+            if number % 256 == 0:
+                report_stage(progress, 'Preparing scopes', created_count, unit='scopes')
             found = (0, 0) if not path else known.get(path)
             if found is None:
                 parent, depth, prefix = 0, 0, ''
@@ -80,6 +86,7 @@ class ScopeHierarchy(Mapping):
                                              (parent, part, prefix, depth + 1, parent))
                         db.execute('UPDATE scope_nodes SET children=children+1 WHERE id=?', (parent,))
                         found = (created.lastrowid, depth + 1)
+                        created_count += 1
                     known[prefix] = found
                     known.move_to_end(prefix)
                     if len(known) > self.cache_limit:
@@ -90,6 +97,7 @@ class ScopeHierarchy(Mapping):
         # Iterative postorder computes counts and ordinal bounds with storage
         # proportional to depth, never the number of sibling scopes.
         serial = 0
+        report_stage(progress, 'Counting scope signals', 0, created_count, 'scopes')
 
         def frame(node_id):
             nonlocal serial
@@ -111,6 +119,8 @@ class ScopeHierarchy(Mapping):
             db.execute('UPDATE scope_nodes SET total=?,pre=?,stop=?,lo=?,hi=?,ordered=? WHERE id=?',
                        (total, pre, serial, lo, hi, ordered, node_id))
             stack.pop()
+            if pre % 256 == 0:
+                report_stage(progress, 'Counting scope signals', serial, created_count, 'scopes')
             if stack:
                 parent = stack[-1]
                 if total:

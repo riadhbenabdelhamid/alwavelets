@@ -19,6 +19,7 @@ import zlib
 
 from .core import VCDSignal, AliasSignal
 from .parsers import VCDFile, build_scope_tree
+from .streaming import OperationCancelled, check_cancel
 
 _MAGIC = b'WLT1'
 _VERSION = 6      # declared signal ranges; invalidate old parser semantics
@@ -63,7 +64,7 @@ def _rstr(mv, pos):
 
 # ── save / load ──────────────────────────────────────────────────────
 
-def save_cache(vcd, source):
+def save_cache(vcd, source, *, cancel=None):
     """Write `vcd` to its cache file. Returns True on success, False otherwise."""
     from .index_cache import WaveformCache
     manager = WaveformCache()
@@ -71,6 +72,7 @@ def save_cache(vcd, source):
         return False
     lease = tmp = None
     try:
+        check_cancel(cancel)
         st = os.stat(source)
         if (getattr(vcd, '_store', None) is not None or getattr(vcd, '_lazy_mode', False) or not vcd._extent_known
                 or getattr(vcd, '_parsed_offset', st.st_size) != st.st_size):
@@ -84,10 +86,12 @@ def save_cache(vcd, source):
         body += struct.pack('<qq', vcd.max_time, vcd.min_time)
         body += struct.pack('<I', len(vcd.signal_order))
         for sid in vcd.signal_order:
+            check_cancel(cancel)
             _wstr(body, sid)
         body += struct.pack('<I', len(vcd.signals))
         master_keys = {}
         for key, sig in vcd.signals.items():
+            check_cancel(cancel)
             _wstr(body, key)
             _wstr(body, sig.reference)
             _wstr(body, ','.join(map(str, sig.declared_range)) if sig.declared_range else '')
@@ -120,7 +124,17 @@ def save_cache(vcd, source):
                 blob = "\n".join(sig._values).encode('utf-8', 'replace')
                 body += struct.pack('<I', len(blob))
                 body += blob
-        comp = zlib.compress(bytes(body), 6)
+        if cancel is None:
+            comp = zlib.compress(bytes(body), 6)
+        else:
+            compressor, chunks = zlib.compressobj(6), []
+            view = memoryview(body)
+            for start in range(0, len(view), 65536):
+                check_cancel(cancel)
+                chunks.append(compressor.compress(view[start:start + 65536]))
+            chunks.append(compressor.flush())
+            comp = b''.join(chunks)
+            check_cancel(cancel)
         header = _MAGIC + struct.pack('<IBQQ', _VERSION, _BO, st.st_size, st.st_mtime_ns)
         path = cache_path(source)
         if manager.quota is not None and len(header) + len(comp) > manager.quota:
@@ -133,6 +147,8 @@ def save_cache(vcd, source):
             f.write(comp)
         os.replace(tmp, path)
         return True
+    except OperationCancelled:
+        raise
     except Exception:
         return False
     finally:
@@ -149,7 +165,7 @@ def save_cache(vcd, source):
 _HDR = struct.calcsize('<IBQQ') + 4   # magic + version + bo + size + mtime
 
 
-def load_cache(source):
+def load_cache(source, *, cancel=None):
     """Return a fully-loaded VCDFile from a valid cache, or None."""
     from .index_cache import WaveformCache
     manager = WaveformCache()
@@ -161,7 +177,7 @@ def load_cache(source):
     lease = None
     try:
         lease = manager.acquire(path, shared=True)
-        result = _load_cache(source)
+        result = _load_cache(source, cancel=cancel)
         if result is not None:
             manager.touch(path)
         return result
@@ -173,8 +189,9 @@ def load_cache(source):
             manager.trim()
 
 
-def _load_cache(source):
+def _load_cache(source, *, cancel=None):
     try:
+        check_cancel(cancel)
         from .analysis_cache import source_signature
         source_state = source_signature(source)
         st = os.stat(source)
@@ -186,7 +203,23 @@ def _load_cache(source):
             if (ver != _VERSION or bo != _BO
                     or size != st.st_size or mtime_ns != st.st_mtime_ns):
                 return None
-            body = zlib.decompress(f.read())
+            if cancel is None:
+                body = zlib.decompress(f.read())
+            else:
+                decoder, body = zlib.decompressobj(), bytearray()
+                while True:
+                    check_cancel(cancel)
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    while chunk:
+                        check_cancel(cancel)
+                        body.extend(decoder.decompress(chunk, 65536))
+                        chunk = decoder.unconsumed_tail
+                if not decoder.eof:
+                    return None
+    except OperationCancelled:
+        raise
     except Exception:
         return None
 
@@ -206,12 +239,14 @@ def _load_cache(source):
         (n_order,) = struct.unpack_from('<I', mv, pos); pos += 4
         order = []
         for _ in range(n_order):
+            check_cancel(cancel)
             s, pos = _rstr(mv, pos)
             order.append(s)
         vcd.signal_order = order
         (n_sig,) = struct.unpack_from('<I', mv, pos); pos += 4
         _intern = sys.intern
         for _ in range(n_sig):
+            check_cancel(cancel)
             key, pos = _rstr(mv, pos)
             name, pos = _rstr(mv, pos)
             range_text, pos = _rstr(mv, pos)
@@ -243,7 +278,9 @@ def _load_cache(source):
                 sig._values = [_intern(s) for s in blob.split("\n")] if n else []
                 sig._packed = False              # e.g. a de-packed signal
             vcd.signals[key] = sig
-        vcd.scopes = build_scope_tree(vcd)
+        vcd.scopes = build_scope_tree(vcd, cancel=cancel)
         return vcd
+    except OperationCancelled:
+        raise
     except Exception:
         return None

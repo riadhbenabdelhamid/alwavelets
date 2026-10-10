@@ -150,8 +150,19 @@ The first available histories publish promptly. Completed pages and progress
 normally publish every quarter second; later partial pages can accumulate for
 about a second, or until page/memory limits require a flush. Finishing a load
 always publishes all remaining values. Existing prepared indexes remain usable.
-The viewer opens after metadata parsing and displays available data as
-indexing progresses. Rows and cursor values load on a background worker; panning
+Opening a native VCD/FST now shows a loading screen before storage detection,
+decompression, declaration parsing, or scope-index upgrades. Preparation runs on
+a worker; the screen shows the current stage, available byte/scope counts, and
+elapsed time. Press Esc, q, or Ctrl-C to cancel. Cleanup finishes on the worker,
+including temporary files and any unclaimed trace. Existing durable checkpoints
+remain available for resuming; preparation before the first checkpoint must be
+repeated. The same opening screen supports `--storage memory`, including eager
+cache reads and writes. `--sync`, demo generation, and converted legacy formats
+retain their synchronous startup path.
+The screen transitions into the viewer when metadata is ready, and disk
+waveforms become available as indexing progresses. Cached opens wake the UI
+immediately when ready, without a fixed polling delay. Signal selection remains
+optional. Rows and cursor values load on a background worker; panning
 discards obsolete requests. Complete analyses wait until indexing finishes.
 The index includes signal/time lookups and a hierarchy of exact min/max
 summaries, so overview scaling need not decode the whole history. Reopening an
@@ -785,6 +796,36 @@ are wide hierarchies with short histories; explicit expansions and fragmented
 selections still have their own costs. Regression tests also cover a hierarchy
 1,800 levels deep, declaration-order parity, legacy index upgrades, cancellation,
 and saved-view restoration.
+
+Startup timing now separates the loading screen, completed metadata, usable
+browser, first readable value, and finished indexing:
+
+```sh
+python3 tools/stress_startup.py --scopes 100000 --formats vcd fst wrapped --output startup.json
+python3 tools/stress_startup.py --scopes 1000000 --output startup-1m.json
+python3 tools/stress_startup.py --scopes 100000 --repo /path/to/baseline --output startup-before.json
+```
+
+A local comparison with `aec9eb5`, using 100k scopes and VCD, FST, and
+gzip-wrapped FST, measured:
+
+| Measurement | Before | Background preparation |
+| --- | ---: | ---: |
+| First screen on cold open | 2.2–3.3 s | below 1 ms |
+| Metadata ready on cold open | 2.2–3.3 s | 2.3–3.4 s |
+| First readable value | 2.5–3.6 s | 2.5–3.7 s |
+| Full indexing | 2.8–4.2 s | 2.9–4.3 s |
+| Cached browser ready | 3.5–4.8 ms | 4.8–6.0 ms |
+
+At one million scopes, the new loading screen still painted below 1 ms,
+metadata took 25.5 s (VCD) / 37.0 s (FST), and full indexing took 33.2 / 45.7 s
+with about 32 MiB peak RSS. Cached browser startup took 10–13 ms. Preparation
+is now visible and cancellable throughout that wait; its parsing and indexing
+work still needs to finish. The benchmark uses fresh processes, an 8 MiB page
+cache, real files, and a recording screen. Generation, imports, curses setup,
+and terminal I/O are excluded. First-value timing is the first successful value
+query after browser setup. Stage start times are included in the JSON for
+profiling declaration parsing, scope construction, and decompression separately.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
