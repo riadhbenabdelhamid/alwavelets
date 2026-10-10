@@ -69,11 +69,14 @@ class SignalCatalog(Mapping):
         self.store = store
         self.cache = OrderedDict()
         self.live = weakref.WeakValueDictionary()
+        self.pending = []
+        self.pending_bytes = 0
         if create:
             store.db.executescript('''
                 CREATE TABLE signals(seq INTEGER PRIMARY KEY,sid TEXT UNIQUE,definition TEXT,
                     master TEXT,n INTEGER DEFAULT 0,scope TEXT,local_seq INTEGER,
-                    full_name TEXT,kind TEXT,size INTEGER,written INTEGER,last_time INTEGER,aliases INTEGER DEFAULT 1);
+                    full_name TEXT,kind TEXT,size INTEGER,written INTEGER,last_time INTEGER,aliases INTEGER DEFAULT 1,
+                    short_n INTEGER DEFAULT 0,short_data BLOB);
                 CREATE UNIQUE INDEX scope_order ON signals(scope,local_seq);
                 CREATE INDEX unpublished_counts ON signals(written) WHERE written IS NOT NULL AND n!=written;
                 CREATE TABLE scopes(path TEXT PRIMARY KEY,n INTEGER);
@@ -82,41 +85,74 @@ class SignalCatalog(Mapping):
         self.order = SignalOrder(self)
 
     def declare(self, name, identifier, size, kind, scope, bounds, *, deduplicate=True):
-        from .storage import _signal
         from .streaming import check_cancel
         check_cancel(self.store.cancel)
-        definition = [name, identifier, size, kind, scope, bounds]
-        db = self.store.db
-        row = db.execute('SELECT definition FROM signals WHERE sid=?', (identifier,)).fetchone()
-        if row is not None and deduplicate:
-            old = json.loads(row[0])
-            if (old[0], old[4], old[5]) == (name, scope, list(bounds) if bounds is not None else None):
-                return
-        key = identifier if row is None else '%s #%d' % (identifier, self.count)
-        # Construct only this transient metadata object, never the entire header.
-        full = _signal(definition, metadata_only=True).full_name
-        local = db.execute('SELECT n FROM scopes WHERE path=?', (scope,)).fetchone()
-        local = local[0] if local else 0
-        db.execute('INSERT INTO signals(seq,sid,definition,master,scope,local_seq,full_name,kind,size) '
-                   'VALUES(?,?,?,?,?,?,?,?,?)',
-                   (self.count, key, json.dumps(definition), identifier, scope, local, full, kind, size))
-        db.execute('INSERT INTO scopes VALUES(?,?) ON CONFLICT(path) DO UPDATE SET n=excluded.n', (scope, local + 1))
-        if row is not None:
-            db.execute('UPDATE signals SET aliases=aliases+1 WHERE sid=?', (identifier,))
-        self.count += 1
+        self.pending.append((name, identifier, size, kind, scope, bounds, deduplicate))
+        self.pending_bytes += 256 + 4 * (len(name) + len(identifier) + len(kind) + len(scope))
+        if len(self.pending) >= 512 or self.pending_bytes >= 256 * 1024:
+            self.flush_declarations()
+
+    def flush_declarations(self):
+        """Resolve duplicates and aliases against a bounded batch and the DB."""
+        if not self.pending:
+            return
+        from .core import signal_display_name
+        from .streaming import check_cancel
+        with self.store.lock:
+            check_cancel(self.store.cancel)
+            db = self.store.db
+            keys = list(dict.fromkeys(row[1] for row in self.pending))
+            scopes = list(dict.fromkeys(row[4] for row in self.pending))
+            masters = dict(db.execute('SELECT sid,definition FROM signals WHERE sid IN (' +
+                                      ','.join('?' for _ in keys) + ')', keys))
+            counts = dict(db.execute('SELECT path,n FROM scopes WHERE path IN (' +
+                                     ','.join('?' for _ in scopes) + ')', scopes))
+            rows, aliases, touched = [], {}, {}
+            for name, identifier, size, kind, scope, bounds, deduplicate in self.pending:
+                check_cancel(self.store.cancel)
+                definition = [name, identifier, size, kind, scope, list(bounds) if bounds is not None else None]
+                old = masters.get(identifier)
+                if old is not None and deduplicate:
+                    previous = json.loads(old)
+                    if (previous[0], previous[4], previous[5]) == (name, scope, definition[5]):
+                        continue
+                key = identifier if old is None else '%s #%d' % (identifier, self.count)
+                encoded = json.dumps(definition)
+                full = signal_display_name(name, size, bounds)
+                if scope:
+                    full = scope + '.' + full
+                local = counts.get(scope, 0)
+                rows.append((self.count, key, encoded, identifier, scope, local, full, kind, size))
+                counts[scope] = local + 1
+                touched[scope] = local + 1
+                if old is None:
+                    masters[identifier] = encoded
+                else:
+                    aliases[identifier] = aliases.get(identifier, 0) + 1
+                self.count += 1
+            db.executemany('INSERT INTO signals(seq,sid,definition,master,scope,local_seq,full_name,kind,size) '
+                           'VALUES(?,?,?,?,?,?,?,?,?)', rows)
+            db.executemany('INSERT INTO scopes VALUES(?,?) ON CONFLICT(path) DO UPDATE SET n=excluded.n', touched.items())
+            db.executemany('UPDATE signals SET aliases=aliases+? WHERE sid=?',
+                           ((n, key) for key, n in aliases.items()))
+            self.pending.clear()
+            self.pending_bytes = 0
 
     def __len__(self):
+        self.flush_declarations()
         return self.count
 
     def __iter__(self):
         return iter(self.order)
 
     def __contains__(self, key):
+        self.flush_declarations()
         with self.store.lock:
             return self.store.db.execute('SELECT 1 FROM signals WHERE sid=?', (key,)).fetchone() is not None
 
     def __getitem__(self, key):
         from .storage import StoredSignal, _signal
+        self.flush_declarations()
         with self.store.lock:
             sig = self.live.get(key)
             if sig is None:
@@ -139,6 +175,7 @@ class SignalCatalog(Mapping):
 
     def rows(self, columns, where='', args=()):
         """Bounded keyset traversal; no cursor spans a writer's publication."""
+        self.flush_declarations()
         last = -1
         clause = ' AND (' + where + ')' if where else ''
         while True:
@@ -155,6 +192,7 @@ class SignalCatalog(Mapping):
 
     def scope_tree(self):
         from .parsers import ScopeNode
+        self.flush_declarations()
         root = ScopeNode('', '')
         root.signal_ids = SignalOrder(self, '', 0)
         nodes = {'': root}

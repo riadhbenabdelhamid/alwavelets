@@ -126,15 +126,19 @@ alwavelets huge.vcd --storage disk --memory-mib 64
 alwavelets huge.fst --storage disk --loadunchecked
 ```
 
-The first open scans the source and writes independently compressed signal
-pages. The viewer opens after metadata parsing and displays available data as
+The first open scans the source and batches declaration writes. Short histories
+(up to eight events and 512 encoded bytes) stay in the signal catalog; longer
+histories use independently compressed pages. FST initial values are also written
+in bounded batches and published periodically during indexing.
+The viewer opens after metadata parsing and displays available data as
 indexing progresses. Rows and cursor values load on a background worker; panning
 discards obsolete requests. Complete analyses wait until indexing finishes.
 The index includes signal/time lookups and a hierarchy of exact min/max
 summaries, so overview scaling need not decode the whole history. Reopening an
 unchanged source opens the signal catalog and fetches declarations and values
 on demand, without reconstructing every signal object.
-Changed sources rebuild the index; incomplete/cancelled indexes are never reused.
+Changed sources and older index formats rebuild the index;
+incomplete/cancelled indexes are never reused.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, selected signal IDs, SQLite,
@@ -599,21 +603,28 @@ uses the real viewer constructor with all signals selected and a recording
 screen; terminal I/O and waveform painting are excluded. `--formats vcd` or
 `--formats fst` restricts the generated inputs.
 
-A local million-signal run against `a09597c`, with an 8 MiB waveform cache,
+A local million-signal run against `312c8c6`, with an 8 MiB waveform cache,
 measured the following (timings depend on the machine and storage):
 
-| Measurement | Before | Catalog + paged finder |
+| Measurement | Before | Batched ingestion + inline histories |
 | --- | ---: | ---: |
-| Cold VCD/FST peak RSS | 650–750 MiB | 39–41 MiB |
-| Cached reopen | 5.0–5.1 s | 6–8 ms |
-| Headless browsing/search peak RSS, all selected | 808 MiB | 128 MiB |
-| Finder open | 616–706 ms | below 1 ms |
-| FST cold indexing | 47 s | 73 s |
+| FST cold indexing | 69.3 s | 19.4 s |
+| VCD cold indexing | 55.5 s | 32.4 s |
+| FST index size | 323 MiB | 160 MiB |
+| VCD index size | 323 MiB | 164 MiB |
+| Cold VCD/FST peak RSS | 39–41 MiB | 28–37 MiB |
+| Cached reopen | 6–7 ms | 6–7 ms |
 
-The lower memory use trades additional disk work for capacity: fuzzy ranking
-still took 1.4–2.4 seconds to finish in the background. The first all-selected
-scope checkmark paint took about 0.5 seconds; subsequent paints reuse its cached
-state. Disk indexes for these synthetic inputs grew from 261–271 MiB to 323 MiB.
+These synthetic traces contain one initial value per signal; gains depend on
+history length and value width. Headless browsing/search with all signals
+selected still used about 128 MiB. Fuzzy ranking completed in 1.5–2.3 seconds
+in the background, and the first all-selected scope checkmark paint took about
+0.5 seconds; subsequent paints reuse its cached state.
+
+A separate background FST run with 100,000 signals made metadata available in
+1.1 seconds and the first waveform readable in 1.6 seconds, before indexing
+finished at 2.0 seconds. A ten-million-event scalar FST indexed in 8.9 seconds
+with 25 MiB peak RSS. These startup measurements exclude terminal rendering.
 
 ## License
 

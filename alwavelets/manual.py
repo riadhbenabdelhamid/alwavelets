@@ -1387,6 +1387,7 @@ class AlwaveletsManual:
             "    • Signal selection remains optional; all declarations stay available",
             "    • Avoid --sync for background indexing; ;cancel stops indexing",
             "    • Declarations and scope membership load on demand from disk",
+            "    • Short histories use compact storage; FST initials appear in batches",
             "    • Large finder searches run in a cancellable background worker",
             "    • FST decompression and time tables spill to temporary files",
             "    • Spilling can slow the first parse; cached reopening stays fast",

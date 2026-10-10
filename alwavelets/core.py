@@ -105,6 +105,14 @@ def split_reference(reference):
     return m[1], (int(m[2]), int(m[3] if m[3] is not None else m[2]))
 
 
+def signal_display_name(reference, size, declared_range):
+    """Preserve declared slices while keeping conventional bus names concise."""
+    if declared_range is not None and (size == 1 or tuple(declared_range) != (size - 1, 0)):
+        hi, lo = declared_range
+        return reference + ('[%d]' % hi if hi == lo else '[%d:%d]' % (hi, lo))
+    return reference
+
+
 class VCDSignal:
     """
     Signal with C-level array for timestamps and interned value strings.
@@ -124,9 +132,7 @@ class VCDSignal:
         self.declared_range = declared_range
         # Keep familiar names for conventional buses; disambiguate slices
         # and separately declared bits in every name-based consumer.
-        if declared_range is not None and (size == 1 or declared_range != (size - 1, 0)):
-            hi, lo = declared_range
-            name += '[%d]' % hi if hi == lo else '[%d:%d]' % (hi, lo)
+        name = signal_display_name(name, size, declared_range)
         self.name = name
         self.full_name = f"{scope}.{name}" if scope else name
         self.identifier = identifier
@@ -531,9 +537,7 @@ class AliasSignal(VCDSignal):
         self.master = master
         self.reference = name
         self.declared_range = declared_range
-        if declared_range is not None and (size == 1 or declared_range != (size - 1, 0)):
-            hi, lo = declared_range
-            name += '[%d]' % hi if hi == lo else '[%d:%d]' % (hi, lo)
+        name = signal_display_name(name, size, declared_range)
         self.name = name
         self.full_name = f"{scope}.{name}" if scope else name
         self.identifier = identifier

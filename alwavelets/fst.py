@@ -462,10 +462,7 @@ class FSTReader:
                 progress_cb(min(file_size, bpos + bslen), file_size)
         if self._writer is not None:
             beg0, fvals = self._frame0 if self._frame0 else (0, {})
-            for h, value in fvals.items():
-                key = self._handles[h]['hid']
-                if key not in self._writer.last_time:
-                    self._writer.add(key, beg0, value)
+            self._writer.add_initial_values(beg0, ((str(h), value) for h, value in fvals.items()))
 
         # Insert blackout changes after initial values, preserving same-tick
         # changes already present in the waveform.

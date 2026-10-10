@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import threading
@@ -23,9 +24,11 @@ import zlib
 from .core import VCDSignal, numeric_value, clear_pack_memos
 from .value_stream import ValueState
 
-VERSION = 5  # disk-backed declarations, order and scope membership
+VERSION = 6  # inline short histories and batched declarations/initial values
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
+SHORT_EVENTS = 8
+SHORT_BYTES = 512
 AUTO_THRESHOLD = 50 * 1024 * 1024
 
 
@@ -214,6 +217,25 @@ def _signal(definition, *, metadata_only=False):
                      metadata_only=metadata_only)
 
 
+def _encode_page(sig):
+    kind = 1 if sig._scalar else (2 if type(sig._values) is bytearray else 0)
+    values = bytes(sig._values) if kind else json.dumps(sig._values, separators=(',', ':')).encode()
+    return bytes([kind]) + sig._times.tobytes() + values
+
+
+def _decode_page(definition, data, count):
+    sig = _signal(definition)
+    sig._times = array.array('q')
+    sig._times.frombytes(data[1:1 + count * 8])
+    raw = data[1 + count * 8:]
+    if data[0] in (1, 2):
+        sig._values = bytearray(raw)
+    else:
+        sig._packed = False
+        sig._values = json.loads(raw)
+    return sig
+
+
 class TraceStore:
     """A cache budget covers decoded pages; metadata and SQLite are separate."""
     def __init__(self, path, memory_bytes=256 * 1024 * 1024):
@@ -243,6 +265,12 @@ class TraceStore:
                 return n
             if bound < -(1 << 63):
                 return 0
+            short = self.short_page(key)
+            if short is not None:
+                count = min(n, len(short._times))
+                index = (bisect.bisect_right if right else bisect.bisect_left)(short._times, timestamp, 0, count)
+                if index < count or count == n:
+                    return index
             op = '>' if right else '>='
             row = self.db.execute(f'SELECT lo FROM pages WHERE sid=? AND t1{op}? '
                                   'AND lo<? ORDER BY t1,lo LIMIT 1', (key, bound, n)).fetchone()
@@ -257,7 +285,12 @@ class TraceStore:
             # offsets in Python for files with millions of blocks.
             row = self.db.execute('SELECT id,lo,n FROM pages WHERE sid=? AND lo<=? '
                                   'ORDER BY lo DESC LIMIT 1', (key, index)).fetchone()
-            if row is None or index >= row[1] + row[2]:
+            if row is None:
+                short = self.short_page(key)
+                if short is not None and 0 <= index < len(short._times):
+                    return short, 0
+                raise IndexError(index)
+            if index >= row[1] + row[2]:
                 raise IndexError(index)
             pid, lo, count = row
             cached = self.pages.get(pid)
@@ -266,28 +299,42 @@ class TraceStore:
                 return cached[0], lo
             blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
             data = zlib.decompress(blob)
-            kind = data[0]
-            sig = _signal(self.definitions[key])
-            sig._times = array.array('q')
-            sig._times.frombytes(data[1:1 + count * 8])
-            raw = data[1 + count * 8:]
-            if kind in (1, 2):
-                sig._values = bytearray(raw)
-            else:
-                sig._packed = False
-                sig._values = json.loads(raw)
-            size = sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
-            if kind == 0:
-                size += sum(sys.getsizeof(v) for v in sig._values)
-            while self.pages and self.cache_bytes + size > self.memory_bytes:
-                _, (_, old_size) = self.pages.popitem(last=False)
-                self.cache_bytes -= old_size
-            if size <= self.memory_bytes:
-                self.pages[pid] = (sig, size)
-                self.cache_bytes += size
-                self.peak_cache_bytes = max(self.peak_cache_bytes, self.cache_bytes)
-            self.page_reads += 1
+            sig = _decode_page(self.definitions[key], data, count)
+            self.cache_page(pid, sig, data[0])
             return sig, lo
+
+    def cache_page(self, pid, sig, kind):
+        size = sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
+        if kind == 0:
+            size += sum(sys.getsizeof(v) for v in sig._values)
+        while self.pages and self.cache_bytes + size > self.memory_bytes:
+            _, (_, old_size) = self.pages.popitem(last=False)
+            self.cache_bytes -= old_size
+        if size <= self.memory_bytes:
+            self.pages[pid] = (sig, size)
+            self.cache_bytes += size
+            self.peak_cache_bytes = max(self.peak_cache_bytes, self.cache_bytes)
+        self.page_reads += 1
+
+    def short_page(self, key):
+        """The inline prefix shares the same bounded cache as regular pages."""
+        pid = ('short', key)
+        cached = self.pages.get(pid)
+        if cached is not None:
+            self.pages.move_to_end(pid)
+            return cached[0]
+        row = self.db.execute('SELECT short_n,short_data FROM signals WHERE sid=?', (key,)).fetchone()
+        if row is None or not row[0]:
+            return None
+        count, data = row
+        sig = _decode_page(self.definitions[key], data, count)
+        self.cache_page(pid, sig, data[0])
+        return sig
+
+    def forget_short(self, key):
+        cached = self.pages.pop(('short', key), None)
+        if cached is not None:
+            self.cache_bytes -= cached[1]
 
     def numeric_range(self, sig, start, end):
         # Match changes_in_window, including the preceding baseline event.
@@ -391,6 +438,7 @@ class PageWriter:
                                 sig.scope, sig.declared_range, deduplicate=False)
             attach_catalog(store, vcd, catalog)
             vcd.scopes = None
+        vcd.signals.flush_declarations()
         db.commit()
         vcd._store = store
         vcd._lazy_mode = False
@@ -464,10 +512,96 @@ class PageWriter:
         self._write_page(key, sig)
         self.changes += len(timestamps)
 
+    def add_initial_values(self, timestamp, values):
+        """Ingest an FST frame in bounded batches, skipping handles with chains.
+
+        Scalar initials need neither signal objects nor a separate compressed
+        page. Wider initials use the identical page encoding as ordinary writes.
+        """
+        self.publish(True)  # make chain-written state available to bulk lookups
+        batch, size = {}, 0
+        for key, value in values:
+            if self.store.cancel.is_set():
+                raise Cancelled('Indexing cancelled')
+            if key not in batch:
+                batch[key] = value
+                size += 128 + 4 * (len(key) + len(value))
+            if len(batch) >= 512 or size >= PAGE_BYTES:
+                self._initial_batch(timestamp, batch)
+                batch, size = {}, 0
+                self.publish()
+        if batch:
+            self._initial_batch(timestamp, batch)
+        self.publish()
+
+    def _initial_batch(self, timestamp, batch):
+        store = self.store
+        with store.lock:
+            rows = store.db.execute('SELECT sid,size,kind,definition FROM signals WHERE master=sid '
+                                    'AND written IS NULL AND last_time IS NULL AND sid IN (' +
+                                    ','.join('?' for _ in batch) + ')', tuple(batch)).fetchall()
+        updates, large = [], []
+        for key, width, kind, definition in rows:
+            if store.cancel.is_set():
+                raise Cancelled('Indexing cancelled')
+            # A repeated wide initial may still be buffered from a prior batch.
+            if self.last_time.cache.get(key) is not None:
+                continue
+            value = batch[key]
+            if width == 1 and kind not in ('real', 'realtime'):
+                scalar = value[-1:].lower()
+                raw = b'\x01' + struct.pack('=q', timestamp) + bytes([ord(scalar) if scalar in ('0', '1', 'x', 'z') else 120])
+            else:
+                sig = _signal(json.loads(definition))
+                sig._memo = None
+                sig._times.append(timestamp)
+                sig._append_value(value, intern=False)
+                raw = _encode_page(sig)
+            if len(raw) <= SHORT_BYTES:
+                updates.append((raw, timestamp, key))
+            else:
+                large.append((key, value))
+        with store.lock:
+            store.db.executemany('UPDATE signals SET short_n=1,short_data=?,written=1,last_time=? WHERE sid=?', updates)
+            for _, _, key in updates:
+                # The bulk write bypasses the per-signal write-back caches.
+                self.totals.cache.pop(key, None)
+                self.last_time.cache.pop(key, None)
+                store.forget_short(key)
+        self.changes += len(updates)
+        for key, value in large:
+            self.add(key, timestamp, value)
+
     def _write_page(self, key, sig):
-        kind = 1 if sig._scalar else (2 if type(sig._values) is bytearray else 0)
-        values = bytes(sig._values) if kind else json.dumps(sig._values, separators=(',', ':')).encode()
-        data = zlib.compress(bytes([kind]) + sig._times.tobytes() + values, 1)
+        page_data = raw = _encode_page(sig)
+        lo = self.totals.get(key, 0)
+        n = len(sig._times)
+        if lo + n <= SHORT_EVENTS and len(raw) <= SHORT_BYTES:
+            with self.store.lock:
+                if lo:
+                    row = self.store.db.execute('SELECT short_n,short_data FROM signals WHERE sid=?', (key,)).fetchone()
+                    if row[0] == lo:
+                        old = _decode_page(_definition(sig), row[1], lo)
+                        merged = _signal(_definition(sig))
+                        merged._memo = None
+                        merged._times = old._times + sig._times
+                        if merged._scalar:
+                            merged._values = old._values + sig._values
+                        else:
+                            for part in (old, sig):
+                                for i in range(len(part._times)):
+                                    merged._append_value(part.value_str(i), intern=False)
+                        raw = _encode_page(merged)
+                    else:
+                        raw = None
+                if raw is not None and len(raw) <= SHORT_BYTES:
+                    self.store.db.execute('UPDATE signals SET short_n=?,short_data=? WHERE sid=?', (lo + n, raw, key))
+                    self.store.forget_short(key)
+                    self.totals[key] = lo + n
+                    return
+        # An inline prefix remains in place when a signal grows; later pages
+        # begin at its event count, retaining exact same-tick ordinal order.
+        data = zlib.compress(page_data, 1)
         minimum = maximum = None
         if sig._scalar:
             zero, one = 48 in sig._values, 49 in sig._values
@@ -479,8 +613,6 @@ class PageWriter:
                 if value is not None:
                     minimum = value if minimum is None else min(minimum, value)
                     maximum = value if maximum is None else max(maximum, value)
-        lo = self.totals.get(key, 0)
-        n = len(sig._times)
         with self.store.lock:
             self.store.db.execute('INSERT INTO pages(sid,lo,n,t0,t1,vmin,vmax,data) VALUES(?,?,?,?,?,?,?,?)',
                                   (key, lo, n, min(sig._times), max(sig._times),
@@ -551,6 +683,7 @@ class PageWriter:
                 index = lo + len(page._times)
         db.commit()
         db.execute('DELETE FROM pages')
+        db.execute('UPDATE signals SET short_n=0,short_data=NULL WHERE short_n!=0')
         db.execute('DELETE FROM summaries')
         self.summary_groups.clear()
         db.execute('DELETE FROM pending_summaries')
