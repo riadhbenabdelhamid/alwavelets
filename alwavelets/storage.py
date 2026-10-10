@@ -29,6 +29,9 @@ PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 SHORT_EVENTS = 8
 SHORT_BYTES = 512
+VCD_BATCH_KEYS = 512
+VCD_BATCH_BYTES = 256 * 1024
+_SCALAR_BYTES = {'0': 48, '1': 49, 'x': 120, 'X': 120, 'z': 122, 'Z': 122}
 AUTO_THRESHOLD = 50 * 1024 * 1024
 
 
@@ -482,6 +485,104 @@ class PageWriter:
         self.buffer_bytes -= self.sizes.pop(key)
         self._write_page(key, sig)
 
+    def add_vcd_batch(self, batch):
+        """Append bounded, per-handle event lists in original delta order.
+
+        Resolve cold handles with one query. Short scalar histories can be
+        updated together without constructing signal objects; longer histories
+        retain builders across batches so input batches don't fragment pages.
+        """
+        store = self.store
+        if store.cancel.is_set():
+            raise Cancelled('Indexing cancelled')
+        missing = {key for key in batch if key not in self.builders}
+        with store.lock:
+            rows = dict((row[0], row[1:]) for row in store.db.execute(
+                'SELECT sid,definition,written,last_time,short_n,short_data,size,kind FROM signals '
+                'WHERE master=sid AND sid IN (' + ','.join('?' for _ in missing) + ')', tuple(missing))) if missing else {}
+        updates = []
+        for key, events in batch.items():
+            if store.cancel.is_set():
+                raise Cancelled('Indexing cancelled')
+            sig = self.builders.get(key)
+            if sig is None:
+                row = rows.get(key)
+                if row is None and key not in missing:
+                    # An earlier handle in this batch can evict this builder.
+                    with store.lock:
+                        row = store.db.execute('SELECT definition,written,last_time,short_n,short_data,size,kind '
+                                               'FROM signals WHERE sid=?', (key,)).fetchone()
+                if row is None:
+                    continue
+                definition, written, previous, short_n, short_data, width, kind = row
+                written = self.totals.cache.get(key, written) or 0
+                previous = self.last_time.cache.get(key, previous)
+            else:
+                previous = sig._times[-1]
+            for timestamp, _ in events:
+                if previous is not None and timestamp < previous:
+                    self.disordered = True
+                previous = timestamp
+            if sig is None and width == 1 and kind not in ('real', 'realtime') and written == short_n and written + len(events) <= SHORT_EVENTS:
+                times = array.array('q', (event[0] for event in events)).tobytes()
+                values = bytes(_SCALAR_BYTES.get(value[-1:], 120) for _, value in events)
+                raw = (b'\x01' + short_data[1:1 + written * 8] + times + short_data[1 + written * 8:] + values
+                       if written else b'\x01' + times + values)
+                updates.append((written + len(events), raw, written + len(events), previous, key))
+                self.changes += len(events)
+                continue
+            if sig is None:
+                sig = _signal(json.loads(definition))
+                sig._memo = None
+                with store.lock:
+                    if key not in self.totals.cache:
+                        self.totals._cache(key, written)
+            self.last_time[key] = previous
+            if key not in self.builders:
+                self.builders[key] = sig
+                self.sizes[key] = 256
+                self.buffer_bytes += 256
+            size, added = self.sizes[key], 0
+            definition = _definition(sig)
+            # Account once per piece, retaining the same page limits. Buffer
+            # eviction happens at each page boundary and at the batch's end.
+            for timestamp, value in events:
+                if sig is None:
+                    sig = self.builders[key] = _signal(definition)
+                    sig._memo = None
+                    self.sizes[key] = size = 256
+                    self.buffer_bytes += 256
+                before = len(sig._values)
+                if sig._scalar:
+                    sig._values.append(_SCALAR_BYTES.get(value[-1:], 120))
+                else:
+                    sig._append_value(value, intern=False)
+                sig._times.append(timestamp)
+                cost = 16 + (len(sig._values) - before if type(sig._values) is bytearray else sys.getsizeof(value) + 8)
+                size += cost
+                added += cost
+                if len(sig._times) >= PAGE_EVENTS or size >= PAGE_BYTES:
+                    self.sizes[key] = size
+                    self.buffer_bytes += added
+                    self.flush(key)
+                    sig, added = None, 0
+                    while self.builders and self.buffer_bytes > self.buffer_limit:
+                        self.flush(next(iter(self.builders)))
+            if sig is not None:
+                self.sizes[key] = size
+                self.buffer_bytes += added
+            self.changes += len(events)
+            while self.builders and self.buffer_bytes > self.buffer_limit:
+                self.flush(next(iter(self.builders)))
+        with store.lock:
+            store.db.executemany('UPDATE signals SET short_n=?,short_data=?,written=?,last_time=? WHERE sid=?', updates)
+            for _, _, _, _, key in updates:
+                self.totals.cache.pop(key, None)
+                self.totals.dirty.discard(key)
+                self.last_time.cache.pop(key, None)
+                self.last_time.dirty.discard(key)
+                store.forget_short(key)
+
     def add_batch(self, key, timestamps, values):
         """Write one bounded FST batch, preserving every event and delta order.
 
@@ -854,6 +955,23 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
     def ingest_vcd():
         state = ValueState()
         pos = offset
+        batch, batch_bytes, batch_events = {}, 0, 0
+
+        def append(key, timestamp, value):
+            nonlocal batch, batch_bytes, batch_events
+            events = batch.get(key)
+            if events is None:
+                events = batch[key] = []
+                batch_bytes += 160 + 4 * len(key)
+            events.append((timestamp, value))
+            batch_bytes += 128 + 4 * len(value)
+            batch_events += 1
+            if len(batch) >= VCD_BATCH_KEYS or batch_events >= PAGE_EVENTS or batch_bytes >= VCD_BATCH_BYTES:
+                writer.add_vcd_batch(batch)
+                batch, batch_bytes, batch_events = {}, 0, 0
+                vcd.max_time = state.max_time
+                writer.publish()
+
         with open(source, 'rb', buffering=1 << 20) as f:
             f.seek(offset)
             for raw in f:
@@ -863,15 +981,24 @@ def open_trace(source, memory_mib=256, background=False, use_cache=True, progres
                 event = state.feed(raw)
                 if event is not None:
                     bid, value = event
-                    keys = store.definitions if bid is None else (bid.decode('ascii', 'ignore'),)
-                    for key in keys:
-                        writer.add(key, state.time, value)
+                    if bid is None:
+                        # A blackout applies once per storage owner. Traverse
+                        # declarations in bounded batches, including hidden nets.
+                        for key, in vcd.signals.rows('sid', 'master=sid'):
+                            append(key, state.time, value)
+                    else:
+                        append(bid.decode('ascii', 'ignore'), state.time, value)
                 if pos % (1 << 16) < len(raw):
                     vcd.max_time = state.max_time
                     vcd._load_progress = min(99, pos * 100 // max(1, signature[0]))
+                    if batch:
+                        writer.add_vcd_batch(batch)
+                        batch, batch_bytes, batch_events = {}, 0, 0
                     writer.publish()
                     if progress_cb:
                         progress_cb(pos, signature[0])
+        if batch:
+            writer.add_vcd_batch(batch)
         vcd.max_time = state.max_time
     if background:
         store.thread = threading.Thread(target=build, daemon=True, name='wavelet-index')

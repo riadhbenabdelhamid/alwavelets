@@ -4,6 +4,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 import hashlib
 from itertools import islice
 import json
+from json.encoder import encode_basestring_ascii
 import operator
 import weakref
 
@@ -113,7 +114,7 @@ class SignalCatalog(Mapping):
                                       ','.join('?' for _ in keys) + ')', keys))
             counts = dict(db.execute('SELECT path,n FROM scopes WHERE path IN (' +
                                      ','.join('?' for _ in scopes) + ')', scopes))
-            rows, aliases, touched = [], {}, {}
+            rows, aliases, touched, tails = [], {}, {}, {}
             for name, identifier, size, kind, scope, bounds, deduplicate in self.pending:
                 check_cancel(self.store.cancel)
                 definition = [name, identifier, size, kind, scope, list(bounds) if bounds is not None else None]
@@ -123,8 +124,16 @@ class SignalCatalog(Mapping):
                     if (previous[0], previous[4], previous[5]) == (name, scope, definition[5]):
                         continue
                 key = identifier if old is None else '%s #%d' % (identifier, self.count)
-                encoded = json.dumps(definition)
-                self._layout_hash.update(json.dumps([name, size, kind, scope, definition[5]]).encode() + b'\n')
+                # Reuse the common type/scope JSON within this bounded batch.
+                # These strings exactly match the original json.dumps format,
+                # including escaping, so existing session hashes stay valid.
+                tail_key = size, kind, scope, tuple(bounds) if bounds is not None else None
+                tail = tails.get(tail_key)
+                if tail is None:
+                    tail = tails[tail_key] = json.dumps([size, kind, scope, definition[5]])[1:]
+                prefix = '[' + encode_basestring_ascii(name) + ', '
+                encoded = prefix + encode_basestring_ascii(identifier) + ', ' + tail
+                self._layout_hash.update((prefix + tail + '\n').encode())
                 full = signal_display_name(name, size, bounds)
                 if scope:
                     full = scope + '.' + full

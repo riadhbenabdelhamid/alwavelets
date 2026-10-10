@@ -89,12 +89,12 @@ def test_cancelled_index_is_not_published(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))
     path = trace(tmp_path, '#0\n0!\n')
     entered, release = threading.Event(), threading.Event()
-    original = storage.PageWriter.add
+    original = storage.PageWriter.add_vcd_batch
     def pause(writer, *args):
         entered.set()
         assert release.wait(5)
         return original(writer, *args)
-    monkeypatch.setattr(storage.PageWriter, 'add', pause)
+    monkeypatch.setattr(storage.PageWriter, 'add_vcd_batch', pause)
     disk = open_trace(path, background=True)
     assert entered.wait(5)
     with pytest.raises(ValueError, match='still loading'):

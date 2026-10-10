@@ -128,8 +128,11 @@ alwavelets huge.fst --storage disk --loadunchecked
 
 The first open scans the source and batches declaration writes. Short histories
 (up to eight events and 512 encoded bytes) stay in the signal catalog; longer
-histories use independently compressed pages. FST initial values are also written
-in bounded batches and published periodically during indexing.
+histories use independently compressed pages. VCD events and FST initial values
+use bounded batches with bulk metadata lookups and periodic publication.
+VCD batches preserve same-timestamp event order, and longer histories retain
+their page buffers across input batches. Declaration serialization reuses common
+type/scope fields while preserving existing saved-session fingerprints.
 The viewer opens after metadata parsing and displays available data as
 indexing progresses. Rows and cursor values load on a background worker; panning
 discards obsolete requests. Complete analyses wait until indexing finishes.
@@ -663,8 +666,36 @@ formatting; the application's indented default session also stays below 1 KiB.
 Fragmented orders, many scopes, or large explicit groups need more memory/work.
 The separate million-signal FST browsing/finder workflow used 29 MiB with compact
 display ranges, versus about 128 MiB at `ae4ed59`. Cached reopening stayed near
-6 ms. Computing declaration fingerprints adds work to the initial indexing
-pass; cold indexing measured 24.7 seconds in this run.
+6 ms. At `a79ca5e`, cold FST indexing measured 24.7 seconds in this run.
+
+Cold VCD ingestion checks cover a million declarations and mixed scalar,
+16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
+
+```sh
+python3 tools/stress_vcd.py --signals 1000000 --events 10000000 --output vcd.json
+python3 tools/stress_vcd.py --signals 1000000 --events 10000000 --repo /path/to/baseline --output vcd-before.json
+python3 tools/stress_vcd.py --cases mixed --active-signals 4096 --events 1000000 --output vcd-interleaved.json
+```
+
+A local paired run against `a79ca5e`, using the same source files in fresh
+processes with an 8 MiB page cache, measured:
+
+| VCD workload | Previous load | Batched load | Previous peak RSS | Batched peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 1M signals, one initial value each | 50.5 s | 19.0 s | 34.6 MiB | 26.6 MiB |
+| 128 signals, 10M mixed events | 66.7 s | 29.6 s | 29.3 MiB | 29.5 MiB |
+| 4,096 signals, 1M mixed events | 75.2 s | 33.7 s | 34.5 MiB | 41.9 MiB |
+
+Process CPU time fell from 38.9 to 13.5 seconds, 42.8 to 24.9 seconds, and
+36.9 to 20.0 seconds respectively. The first readable value in the million-signal
+trace arrived at 8.8 seconds instead of 13.6; in mixed traces it arrived within
+0.5 seconds. These synthetic measurements exclude generation and terminal
+rendering, and wall times vary with system load and storage. More interleaved
+histories can keep more buffers active between publications: the last case used
+more RSS but its index shrank from 76.9 to 57.1 MB. Doubling that case to 2M events
+in a separate run used 41.8 MiB peak RSS. The memory option limits the decoded-page
+cache, not total process RSS. All declarations remain available; signal selection
+is optional.
 
 ## License
 
