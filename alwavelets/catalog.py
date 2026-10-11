@@ -14,6 +14,9 @@ from .core import AliasSignal
 class CatalogAlias(AliasSignal):
     __slots__ = ('__weakref__',)
 
+    def value_at(self, time):
+        return self.master.value_at(time)
+
 
 class SignalOrder(Sequence):
     """Indexed declaration order, optionally restricted to one direct scope."""

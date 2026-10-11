@@ -256,7 +256,11 @@ different time ranges per signal while indexing is incomplete.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, display edits, SQLite,
-builder buffers, and active query pages need additional memory. FST value chains
+builder buffers, and active query pages need additional memory. A separate cache
+of at most 1,024 recent page locations lets nearby cursor, timestamp and ordinal
+queries reuse a decoded page without repeating SQLite lookups. These locations
+retain no decoded arrays and are valid only while the page remains cached and
+the published history is unchanged. FST value chains
 stream through bounded decompression history and read buffers without a separate
 decompressed-chain file. Frames, hierarchies, handle geometry, block/chain indexes,
 and timestamp tables use bounded buffers that spill to temporary files.
@@ -1132,6 +1136,46 @@ The separate 1.28M-event mixed scalar/bus/real workload was essentially unchange
 in indexing time (1.51 → 1.49 s), while its FST index shrank from 6.28 to 6.01 MB.
 VCD loading remained about 2.55 seconds, and cached reopening about 3 ms. Complete
 waveform digests matched across both formats, readers and cached opens.
+
+Disk-backed reads now locate a value's page directly, using page metadata to
+avoid decoding a following page when the query falls in a gap. A bounded cache
+of recent page locations also serves timestamp bisections and ordinal reads,
+including aliases. Cache checks respect published counts and the different
+left/right boundaries required when a timestamp spans multiple pages. Short
+history updates, publication, sorting, rollback and eviction cannot expose
+stale or unpublished values. Existing index formats remain compatible and
+signal selection remains optional.
+
+`tools/stress_queries.py` measures this read path in fresh processes for each
+repository and format. Each case contains 200,000 events and an alias, uses an
+8 MiB decoded-page budget, verifies every event, and compares rendered-frame
+digests. Paired local runs against `e8c26e3` measured:
+
+| Workload | Format | Cold random median before → after | Nearby cursor median before → after | 30 pan/zoom frames, total before → after |
+| --- | --- | ---: | ---: | ---: |
+| Dense 1,024-bit bus | VCD | 218 → 196 µs | 30.6 → 0.92 µs | 677 → 498 ms |
+| Dense 1,024-bit bus | FST | 214 → 193 µs | 32.1 → 2.25 µs | 485 → 299 ms |
+| Scalar | VCD | 93.4 → 72.2 µs | 30.2 → 0.95 µs | 261 → 32.6 ms |
+| Scalar | FST | 94.0 → 73.6 µs | 30.1 → 0.95 µs | 265 → 37.3 ms |
+| Real | VCD | 140 → 120 µs | 30.3 → 0.94 µs | 312 → 165 ms |
+| Real | FST | 118 → 95.8 µs | 30.3 → 0.94 µs | 207 → 47.4 ms |
+
+Cold queries clear the decoded-page cache before each of 1,000 deterministic
+random lookups; SQLite and OS caches may remain warm. Nearby cursor queries
+make 4,000 reads across a repeated 256-tick region, alternating the signal and
+its alias. Viewports cover five zoom levels and six pan positions at 160 columns;
+timing includes waveform rendering but excludes terminal output. Generation,
+indexing and full-history verification are outside the query timings. Waveform
+and frame digests matched across both formats and readers, and decoded-page
+memory stayed within budget. Cold dense reads still pay for decompressing larger
+pages; the largest gains come from nearby reads. These are individual local
+runs, not guaranteed speedups on every trace.
+
+```sh
+python3 tools/stress_queries.py --baseline /path/to/baseline --output queries-bus.json
+python3 tools/stress_queries.py --kind scalar --baseline /path/to/baseline --output queries-scalar.json
+python3 tools/stress_queries.py --kind real --baseline /path/to/baseline --output queries-real.json
+```
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

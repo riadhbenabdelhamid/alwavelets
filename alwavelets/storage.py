@@ -29,6 +29,7 @@ VERSION = 6  # inline short histories and batched declarations/initial values
 FST_VERSION = 8  # packed bus pages at arbitrary widths; can also read version 7
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
+PAGE_HINTS = 1024
 SHORT_EVENTS = 8
 SHORT_BYTES = 512
 VCD_BATCH_KEYS = 512
@@ -154,6 +155,9 @@ class StoredSignal(VCDSignal):
     def num_changes(self):
         return self.store.counts.get(self.key, 0)
 
+    def value_at(self, time):
+        return self.store.value_at(self.key, time)
+
     def changes_in_window(self, start, end):
         lo = max(0, self._times.bisect(start) - 1)
         hi = self._times.bisect(end, True)
@@ -273,6 +277,9 @@ class TraceStore:
         self.db.execute('PRAGMA cache_size=-2048')
         self.db.execute('PRAGMA temp_store=FILE')
         self.pages = OrderedDict()
+        # Locations only: decoded arrays still belong exclusively to pages and
+        # its memory budget. One recent location per signal, with a fixed cap.
+        self.page_hints = OrderedDict()
         self.cache_bytes = self.peak_cache_bytes = self.page_reads = 0
         self.counts, self.definitions = {}, {}
         self.generation = 0
@@ -286,6 +293,73 @@ class TraceStore:
         self.preserve_checkpoint = False
         self.closed = False
 
+    def _hint(self, key):
+        hint = self.page_hints.get(key)
+        if hint is not None:
+            generation, pid, lo = hint
+            cached = self.pages.get(pid)
+            if generation == self.generation and cached is not None:
+                self.page_hints.move_to_end(key)
+                self.pages.move_to_end(pid)
+                return cached[0], lo
+            del self.page_hints[key]
+        return None
+
+    def _remember_page(self, key, pid, lo):
+        if pid in self.pages:
+            self.page_hints[key] = (self.generation, pid, lo)
+            self.page_hints.move_to_end(key)
+            while len(self.page_hints) > PAGE_HINTS:
+                self.page_hints.popitem(last=False)
+
+    def _bisect_hint(self, key, timestamp, n, right):
+        hint = self._hint(key)
+        if hint is not None:
+            page, lo = hint
+            times = page._times
+            count = min(len(times), n - lo)
+            if count > 0:
+                # At a shared timestamp, left-bisect may need an earlier page
+                # and right-bisect a later one. Only outer published boundaries
+                # can safely extend a cached page's interval in that direction.
+                lower = lo == 0 or (times[0] <= timestamp if right else times[0] < timestamp)
+                upper = lo + count == n or (timestamp < times[count - 1] if right else timestamp <= times[count - 1])
+                if lower and upper:
+                    index = (bisect.bisect_right if right else bisect.bisect_left)(times, timestamp, 0, count)
+                    return page, lo, index
+        return None
+
+    def value_at(self, key, timestamp):
+        """Find the containing page once, without decoding a following page."""
+        with self.lock:
+            n = self.counts.get(key, 0)
+            if not n:
+                return 'x'
+            bound = math.floor(timestamp)
+            if bound < -(1 << 63):
+                return 'x'
+            hint = self._bisect_hint(key, timestamp, n, True)
+            if hint is not None:
+                page, _, index = hint
+                return page.value_str(index - 1) if index else 'x'
+            # page_end orders equal end times by event ordinal. Strictly greater
+            # skips every page ending at this timestamp, keeping the last delta.
+            row = self.db.execute('SELECT id,lo,n,t0 FROM pages WHERE sid=? AND t1>? '
+                                  'AND lo<? ORDER BY t1,lo LIMIT 1',
+                                  (key, min(bound, (1 << 63) - 1), n)).fetchone()
+            if row is not None and row[3] <= timestamp:
+                page, lo = self._page(key, *row[:3])
+            else:
+                # The query is in a gap, before the first page, or after the
+                # published tail. Read only the preceding page (possibly inline).
+                previous = row[1] - 1 if row is not None else n - 1
+                if previous < 0:
+                    return 'x'
+                page, lo = self.page_at(key, previous)
+            count = min(len(page._times), n - lo)
+            index = bisect.bisect_right(page._times, timestamp, 0, count)
+            return page.value_str(index - 1) if index else 'x'
+
     def bisect(self, key, timestamp, right=False):
         with self.lock:
             n = self.counts.get(key, 0)
@@ -296,6 +370,9 @@ class TraceStore:
                 return n
             if bound < -(1 << 63):
                 return 0
+            hint = self._bisect_hint(key, timestamp, n, right)
+            if hint is not None:
+                return hint[1] + hint[2]
             short = self.short_page(key)
             if short is not None:
                 count = min(n, len(short._times))
@@ -303,15 +380,19 @@ class TraceStore:
                 if index < count or count == n:
                     return index
             op = '>' if right else '>='
-            row = self.db.execute(f'SELECT lo FROM pages WHERE sid=? AND t1{op}? '
+            row = self.db.execute(f'SELECT id,lo,n FROM pages WHERE sid=? AND t1{op}? '
                                   'AND lo<? ORDER BY t1,lo LIMIT 1', (key, bound, n)).fetchone()
             if row is None:
                 return n
-            page, lo = self.page_at(key, row[0])
-            return lo + (bisect.bisect_right if right else bisect.bisect_left)(page._times, timestamp)
+            page, lo = self._page(key, *row)
+            count = min(len(page._times), n - lo)
+            return lo + (bisect.bisect_right if right else bisect.bisect_left)(page._times, timestamp, 0, count)
 
     def page_at(self, key, index):
         with self.lock:
+            hint = self._hint(key)
+            if hint is not None and hint[1] <= index < hint[1] + len(hint[0]._times):
+                return hint
             # A lookup in the compact SQL index avoids keeping all page
             # offsets in Python for files with millions of blocks.
             row = self.db.execute('SELECT id,lo,n FROM pages WHERE sid=? AND lo<=? '
@@ -323,16 +404,20 @@ class TraceStore:
                 raise IndexError(index)
             if index >= row[1] + row[2]:
                 raise IndexError(index)
-            pid, lo, count = row
-            cached = self.pages.get(pid)
-            if cached is not None:
-                self.pages.move_to_end(pid)
-                return cached[0], lo
+            return self._page(key, *row)
+
+    def _page(self, key, pid, lo, count):
+        cached = self.pages.get(pid)
+        if cached is not None:
+            self.pages.move_to_end(pid)
+            sig = cached[0]
+        else:
             blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
             data = zlib.decompress(blob)
             sig = _decode_page(self.definitions[key], data, count)
             self.cache_page(pid, sig, data[0])
-            return sig, lo
+        self._remember_page(key, pid, lo)
+        return sig, lo
 
     def cache_page(self, pid, sig, kind):
         size = sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
@@ -353,6 +438,7 @@ class TraceStore:
         cached = self.pages.get(pid)
         if cached is not None:
             self.pages.move_to_end(pid)
+            self._remember_page(key, pid, 0)
             return cached[0]
         row = self.db.execute('SELECT short_n,short_data FROM signals WHERE sid=?', (key,)).fetchone()
         if row is None or not row[0]:
@@ -360,9 +446,11 @@ class TraceStore:
         count, data = row
         sig = _decode_page(self.definitions[key], data, count)
         self.cache_page(pid, sig, data[0])
+        self._remember_page(key, pid, 0)
         return sig
 
     def forget_short(self, key):
+        self.page_hints.pop(key, None)
         cached = self.pages.pop(('short', key), None)
         if cached is not None:
             self.cache_bytes -= cached[1]
@@ -421,6 +509,7 @@ class TraceStore:
             self.closed = True
             self.db.close()
             self.pages.clear()
+            self.page_hints.clear()
             self.cache_bytes = 0
             if self.temporary:
                 self.temporary.cleanup()
@@ -450,6 +539,7 @@ def _storage_error(exc, store=None):
                     format_name = meta['checkpoint'].get('format', 'vcd').upper()
                     store.preserve_checkpoint = True
                     store.pages.clear()
+                    store.page_hints.clear()
                     store.cache_bytes = 0
                     store.counts.cache.clear()
                     store.total_changes = meta['total_changes']
@@ -984,6 +1074,7 @@ class PageWriter:
         self.summary_groups.clear()
         db.execute('DELETE FROM pending_summaries')
         self.store.pages.clear()
+        self.store.page_hints.clear()
         self.store.cache_bytes = 0
         self.positions.clear()
         db.execute('UPDATE signals SET written=NULL,last_time=NULL')
