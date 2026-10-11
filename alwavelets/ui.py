@@ -946,14 +946,23 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         return time_to_column(time, self.time_start, self.time_end, self.wave_width)
 
     def col_to_time(self, col):
-        return int(self.time_start + col / max(self.wave_width, 1) * (self.time_end - self.time_start))
+        return column_to_time(col, self.time_start, self.time_end, self.wave_width)
 
     def zoom(self, factor, center=None):
         span = self.time_end - self.time_start
-        new_span = max(int(span * factor), 10)
+        if span <= 0:
+            return
+        new_span = max(int(span * Fraction(factor)), min(span, 10))
+        if new_span == span:
+            return
         if center is None:
             center = self.cursor_time if self.cursor_on else (self.time_start + self.time_end) // 2
-        self.time_start = max(0, center - new_span // 2)
+        if not self.time_start <= center <= self.time_end:
+            center = (self.time_start + self.time_end) // 2
+        # Keep the anchor at the same fraction of the viewport. Rounding the
+        # new offset to a tick and clamping at t=0 are the only adjustments.
+        offset = time_to_column(center, self.time_start, self.time_end, new_span)
+        self.time_start = max(0, center - offset)
         self.time_end = self.time_start + new_span
 
     def scroll_time(self, direction):

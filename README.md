@@ -87,6 +87,13 @@ half-column resolution, or zoom in for more detail. Dense activity that cannot
 be resolved is shown with a busy glyph; displayed pulse widths are approximate,
 while cursor time measurements use the trace timestamps.
 
+Keyboard zoom keeps the visible active cursor at its screen position; mouse-wheel
+zoom keeps the time under the pointer in place. With a hidden or off-screen
+cursor, keyboard zoom uses the center of the view. Positions round to trace
+ticks, and zooming out stops the left edge at time zero. The optional grid (`Q`)
+follows the ruler ticks, dims stable waveform cells, and draws dotted marks in
+empty cells while preserving transitions and labels.
+
 ## Requirements
 
 - Python 3.8+ with the standard library `curses` module (Unix/Linux/macOS;

@@ -415,14 +415,9 @@ class DrawingMixin:
             nice = 10
         return max(1, int(nice * mag))
 
-    def draw_ruler(self):
-        row = self.ruler_row
-        ruler = [' '] * self.wave_width
-        span = self.time_end - self.time_start
-        if span <= 0:
-            span = 1
-
-        # Compute aligned ticks at round time intervals
+    def _ruler_ticks(self):
+        """Shared (column, time) ticks for the ruler and waveform grid."""
+        span = max(1, self.time_end - self.time_start)
         label_width = max(text_width(self.format_ruler_time(self.time_start)),
                           text_width(self.format_ruler_time(self.time_end)))
         n_ticks = max(1, min(8, self.wave_width // (label_width + 3)))
@@ -434,18 +429,24 @@ class DrawingMixin:
         if first_tick > self.time_start + span:
             first_tick = self.time_start
 
+        ticks = []
         t = first_tick
         while t <= self.time_end:
             c = self.time_to_col(t)
             if 0 <= c < self.wave_width:
-                ruler[c] = '┬'
-                label = self.format_ruler_time(t)
-                start = c + 1
-                if start + len(label) <= self.wave_width:
-                    for j, ch in enumerate(label):
-                        if start + j < self.wave_width:
-                            ruler[start + j] = ch
+                ticks.append((c, t))
             t += tick_interval
+        return ticks
+
+    def draw_ruler(self):
+        row = self.ruler_row
+        ruler = [' '] * self.wave_width
+        for c, t in self._ruler_ticks():
+            ruler[c] = '┬'
+            label = self.format_ruler_time(t)
+            start = c + 1
+            if start + len(label) <= self.wave_width:
+                ruler[start:start + len(label)] = label
 
         name_header = elide(" Signals", self.name_width).ljust(self.name_width)
         if self.show_values and self.cursor_on and self.name_width >= 18:
@@ -532,7 +533,7 @@ class DrawingMixin:
                         labels = {}
                         if k == 'bus':
                             columns = result[2]
-                            labels = dict(zip(columns, sig.values_at(int(t0 + col / max(ww, 1) * (t1 - t0))
+                            labels = dict(zip(columns, sig.values_at(column_to_time(col, t0, t1, ww)
                                                                      for col in columns)))
                         return result, labels, limits
                 result, labels, limits = self._queries.request(
@@ -562,8 +563,23 @@ class DrawingMixin:
         else:
             self._draw_signals()
 
+    def _draw_wave_grid(self, row, chars, attrs, columns):
+        """Keep waveform shapes intact; edges, x/z, and later overlays win."""
+        grid_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
+        for col in columns:
+            screen_col = self.name_width + 1 + col
+            if screen_col >= self.width - 1 or col >= len(chars):
+                continue
+            if attrs[col] in (1, 2, 3):  # transition/busy, unknown, high impedance
+                continue
+            try:
+                self.stdscr.addch(row, screen_col, chars[col] if chars[col] != ' ' else '┊', grid_attr)
+            except curses.error:
+                pass
+
     def _draw_signals(self):
         start_row = self.wave_top
+        grid_columns = [col for col, _ in self._ruler_ticks()] if self.show_grid else ()
         # Compute row stride: all non-zero spacing adds at least 1 separator row
         if self.signal_spacing > 0 and self.signal_spacing < 1:
             row_stride = 2  # signal + thin separator
@@ -738,19 +754,27 @@ class DrawingMixin:
                     arows = self._render_row(akind, sig, sig_id, sig_rows)
                     for sr, (a_chars, a_attrs) in enumerate(arows):
                         self._batched_addstr(row + sr, self.name_width + 1, a_chars, a_attrs)
+                        if grid_columns:
+                            self._draw_wave_grid(row + sr, a_chars, a_attrs, grid_columns)
                     extra_rows += sig_rows - 1   # reserve the extra rows
                     chars = arows[0][0]
                     wave_rows = [a[0] for a in arows]   # per-row glyphs for the band
                 else:
                     chars, attrs = self._render_row('analog', sig, sig_id)
                     self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                    if grid_columns:
+                        self._draw_wave_grid(row, chars, attrs, grid_columns)
             elif sig.size == 1 and getattr(sig, 'signal_type', 'wire') != "real":
                 chars, attrs = self._render_row(
                     'sub' if self.line_thickness == 2 else 'bit', sig, sig_id)
                 self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                if grid_columns:
+                    self._draw_wave_grid(row, chars, attrs, grid_columns)
             else:
                 chars, attrs, labels = self._render_row('bus', sig, sig_id, sig_rx)
                 self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                if grid_columns:
+                    self._draw_wave_grid(row, chars, attrs, grid_columns)
                 if self.value_label_size > 0:
                     max_lbl_len = 4 if self.value_label_size == 1 else 999
                     for bcol, lbl in labels.items():
@@ -770,18 +794,6 @@ class DrawingMixin:
                             except curses.error:
                                 pass
 
-            # ── Grid lines ──
-            if self.show_grid >= 1:
-                grid_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
-                # Vertical grid
-                grid_step = max(self.wave_width // 8, 1)
-                for gc in range(0, self.wave_width, grid_step):
-                    gac = self.name_width + 1 + gc
-                    if gac < self.width:
-                        try:
-                            self.stdscr.addch(row, gac, '┊', grid_attr)
-                        except curses.error:
-                            pass
             if self.show_grid >= 2:
                 # Horizontal separator after each signal
                 sep_row = row + row_stride - 1 if row_stride > 1 else row
@@ -819,6 +831,8 @@ class DrawingMixin:
                     else:
                         d_chars, d_attrs, _ = self._render_row('dbus', sig_b, sig_id, sig_rx)
                     self._batched_addstr(diff_row, self.name_width + 1, d_chars, d_attrs)
+                    if grid_columns:
+                        self._draw_wave_grid(diff_row, d_chars, d_attrs, grid_columns)
 
                     # Draw vertical delimiter columns at diff boundaries
                     span = self.time_end - self.time_start

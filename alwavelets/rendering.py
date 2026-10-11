@@ -75,6 +75,11 @@ def time_to_column(timestamp, start, end, width):
     return int((2 * (timestamp - start) * width + span) // (2 * span))
 
 
+def column_to_time(column, start, end, width):
+    """Time at a column, rounded down to a tick without float precision loss."""
+    return int(start + column * (end - start) // max(width, 1))
+
+
 def _column_samples(times, value_str, start, end, width, transform=None, lo=0, hi=None):
     # Nearest-column bins match time_to_column: [c - 0.5, c + 0.5).
     # Exact boundaries also preserve tick precision late in a long trace.

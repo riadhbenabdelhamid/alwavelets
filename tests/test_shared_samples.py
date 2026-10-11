@@ -170,7 +170,8 @@ def test_bus_label_batch_preserves_exact_pixel_time_lookups(tmp_path, monkeypatc
         writer.publish(True)
         signal = trace.signals['0']
         expected = rendering.draw_bus_culled(signal, offset, offset + 43, 13, Radix.HEX)
-        labels = {col: signal.value_at(int(offset + col / 13 * 43)) for col in expected[2]}
+        ticks = [offset + delta for delta in (0, 3, 6, 9, 13, 16, 19, 23, 26, 29, 33, 36, 39)]
+        labels = {col: signal.value_at(ticks[col]) for col in expected[2]}
         monkeypatch.setattr(storage.StoredSignal, 'values_at', batch)
         DrawingMixin._render_row(viewer, 'bus', signal, '0', Radix.HEX)
         for future in list(viewer._queries.pending.values()):
@@ -178,7 +179,7 @@ def test_bus_label_batch_preserves_exact_pixel_time_lookups(tmp_path, monkeypatc
         viewer._queries.poll()
         assert DrawingMixin._render_row(viewer, 'bus', signal, '0', Radix.HEX) == expected
         assert viewer._row_extras['bus', '0'] == (labels, None)
-        assert len(calls) == 1 and len(calls[0]) == len(labels)
+        assert calls == [[ticks[col] for col in labels]]
     finally:
         if hasattr(viewer, '_queries'):
             viewer._queries.close()
