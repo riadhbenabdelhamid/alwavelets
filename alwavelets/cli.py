@@ -161,7 +161,7 @@ def _setup_demo_view(viewer):
 
 
 def main_curses(stdscr, vcd, start_collapsed=True, load_unchecked=False,
-                demo_view=False, use_session=True, control=False):
+                demo_view=False, use_session=True, control=False, workmode=None):
     viewer = Alwavelets(stdscr, vcd)
     if control:
         # Opt-in agent control channel. Failing to bind is not fatal — the
@@ -192,6 +192,9 @@ def main_curses(stdscr, vcd, start_collapsed=True, load_unchecked=False,
         # would appear to do nothing, with no way to override from the CLI.
         if use_session and not demo_view:
             viewer.restore_session()
+    if workmode is not None:
+        # An explicit launch choice wins over config and saved appearance.
+        viewer.apply_workmode(workmode, notify=False)
     if getattr(vcd, '_startup_message', None):
         viewer._show_message(vcd._startup_message)
     viewer.run()
@@ -232,7 +235,7 @@ def _open_native_curses(stdscr, args):
         main_curses(stdscr, vcd, start_collapsed=not args.expanded,
                     load_unchecked=args.loadunchecked,
                     use_session=not (args.no_session or args.expanded or args.loadunchecked),
-                    control=args.control)
+                    control=args.control, workmode=getattr(args, 'workmode', None))
     finally:
         vcd.close()
 
@@ -253,6 +256,8 @@ def main():
                         help="Decoded waveform page cache budget in MiB (default: 256)")
     parser.add_argument('--loadunchecked', action='store_true', help="Load with no signals shown (select via B tree browser)")
     parser.add_argument('--expanded', action='store_true', help="Start with all modules expanded (default: collapsed)")
+    parser.add_argument('--workmode', choices=tuple(Alwavelets.WORKMODES),
+                        help="UI presentation: calm, classic, or minimal (overrides saved appearance)")
     parser.add_argument('--mcp', action='store_true', help="Run as an MCP server (stdio) instead of the viewer")
     parser.add_argument('--no-cache', action='store_true', help="Disable persistent waveform and instruction caches")
     parser.add_argument('--cache-dir', metavar='PATH',
@@ -448,7 +453,7 @@ def main():
     try:
         curses.wrapper(main_curses, vcd, start_collapsed=not expanded,
                        load_unchecked=load_unchecked, demo_view=args.demo,
-                       use_session=use_session, control=args.control)
+                       use_session=use_session, control=args.control, workmode=args.workmode)
     finally:
         vcd.close()
 

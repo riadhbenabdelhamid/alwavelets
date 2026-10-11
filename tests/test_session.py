@@ -46,21 +46,21 @@ def _viewer(w, tmp_path):
     s = types.SimpleNamespace(
         vcd=vcd, display_order=list(vcd.signal_order),
         groups=[], _group_by_name={}, _member_group={},
-        view_rows=list(vcd.signal_order), sig_offset=0, focus_idx=0,
+        view_rows=list(vcd.signal_order), sig_offset=0, focus_idx=0, visible_signals=20,
         analog_signals=set(), collapsed_scopes=set(),
         radix=w.Radix.HEX, sig_radix={}, sig_color={}, sig_height={},
         markers=[], time_start=0, time_end=vcd.max_time,
         cursor_a=0, cursor_b=0, cursor_b_on=False,
         name_width=20, _name_width_manual=False, signal_spacing=0,
         show_grid=0, line_thickness=1, value_label_size=2,
-        current_theme='dark', THEMES={'dark': {}}, messages=[],
+        current_theme='dark', THEMES=Alwavelets.THEMES, WORKMODES=Alwavelets.WORKMODES, messages=[],
         _display_order_set=set(vcd.signal_order))
     s._show_message = s.messages.append
     s.apply_theme = lambda *a: None
     s.update_layout = lambda: None
     s._sync_display_set = lambda: None
     for m in ("session_path", "_session_state", "save_session",
-              "clear_session", "restore_session",
+              "clear_session", "restore_session", "apply_workmode",
               "_reindex_groups", "_rebuild_view_rows", "_group_chain"):
         f = getattr(Alwavelets, m)
         setattr(s, m, f if isinstance(f, staticmethod) else f.__get__(s))

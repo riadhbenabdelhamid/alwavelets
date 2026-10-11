@@ -64,6 +64,7 @@ class CommandLineMixin:
             'measure': lambda: self._cmd_stats(),
             'radix': lambda: self._cmd_set_radix(args),
             'theme': lambda: self._cmd_load_theme(args),
+            'workmode': lambda: self._cmd_workmode(args),
             'export': lambda: self.do_export_menu(),
             'diff': lambda: self.load_diff_file() if not self.diff_vcd else self.clear_diff(),
             'grid': lambda: setattr(self, 'show_grid', (self.show_grid + 1) % 3),
@@ -162,6 +163,7 @@ class CommandLineMixin:
             "            (transitions, period/freq, duty; min/max for buses)",
             "radix R   — Set radix (bin/hex/dec/uns/f16/f32/f64)",
             "theme T   — Set theme or load JSON file",
+            "workmode M — calm | classic | minimal (F3 cycles)",
             "export    — Export menu (CSV/SVG/PDF/screenshot)",
             "diff      — Toggle diff file comparison",
             "grid      — Toggle vertical grid",
@@ -549,6 +551,13 @@ class CommandLineMixin:
             self._show_message(f"Theme: {name}")
         else:
             self._show_message(f"Themes: {', '.join(self.THEME_ORDER)}")
+
+    def _cmd_workmode(self, args):
+        name = args.strip().lower()
+        if not name:
+            self._show_message(f"Workmode: {self.workmode} · choose calm, classic, minimal · F3 cycles")
+        else:
+            self.apply_workmode(name)
 
     def _cmd_load_decode_file(self, args):
         fname = args.strip()

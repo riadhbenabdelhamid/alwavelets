@@ -176,7 +176,31 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             'BUSNAME': (252, -1), 'DIFF_BG': (255, 236), 'DIFF_ED': (248, -1),
         },
     }
-    THEME_ORDER = ['dark', 'light', 'phosphor', 'futuristic', 'mono']
+    THEMES['calm'] = {
+        **THEMES['dark'], 'name': 'Calm',
+        'HIGH': (114, -1), 'LOW': (72, -1), 'EDGE': (109, -1),
+        'BUS': (110, -1), 'BUSNAME': (110, -1), 'ANALOG': (110, -1),
+        'ANHI': (181, -1), 'ANMID': (180, -1), 'ANLO': (109, -1),
+        'UNDEF': (180, -1), 'HIZ': (139, -1),
+    }
+    THEMES['classic'] = {
+        **THEMES['dark'], 'name': 'Classic',
+        'DELTA': (228, 25), 'HEADER': (255, 236), 'MENU': (252, 234),
+        'MENUKEY': (82, 234), 'HELP': (255, 24),
+        'SELECT': (16, 114), 'FOCUS': (255, 238),
+    }
+    THEMES['minimal'] = {
+        **THEMES['mono'], 'name': 'Minimal',
+        'HEADER': (252, -1), 'MENU': (245, -1), 'MENUKEY': (255, -1),
+        'MENUSEP': (240, -1), 'ROWALT': (-1, -1), 'BUSLBL': (252, -1),
+        'DELTA': (252, 234), 'HELP': (252, 234), 'FOCUS': (255, 235),
+    }
+    THEME_ORDER = ['calm', 'classic', 'minimal', 'dark', 'light', 'phosphor', 'futuristic', 'mono']
+    WORKMODES = {
+        'calm': {'name': 'Calm', 'theme': 'calm', 'menu_bar': True, 'scope_separators': True},
+        'classic': {'name': 'Classic', 'theme': 'classic', 'menu_bar': True, 'scope_separators': False},
+        'minimal': {'name': 'Minimal', 'theme': 'minimal', 'menu_bar': False, 'scope_separators': False},
+    }
 
     @property
     def display_order(self):
@@ -301,8 +325,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         # Vertical grid
         self.show_grid = 0
 
-        # Theme
-        self.current_theme = 'dark'
+        # Workmode supplies presentation defaults; the theme can be customized.
+        self.workmode = 'calm'
+        self.current_theme = self.WORKMODES[self.workmode]['theme']
 
         # Menu page
         self.menu_page = 0            # 0-based page of command menu
@@ -426,6 +451,10 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         cfg = _cfg.load_config()
         if not cfg:
             return
+        mode = cfg.get('workmode')
+        if isinstance(mode, str) and mode.lower() in self.WORKMODES:
+            self.apply_workmode(mode, notify=False)
+        # Explicit settings take precedence over the mode's defaults.
         th = cfg.get('theme')
         if isinstance(th, str) and th.lower() in self.THEMES:
             self.current_theme = th.lower()
@@ -530,7 +559,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self.current_theme = theme_name
         theme = self.THEMES.get(self.current_theme, self.THEMES['dark'])
         if curses.COLORS < 256:
-            return  # Can't apply 256-color themes on 8-color terminals
+            self._apply_basic_colors()
+            return
 
         # Entering an index-based theme releases any palette slots a hex
         # theme redefined (they alias grayscale-ramp indices).
@@ -571,6 +601,31 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.current_theme = order[(idx + 1) % len(order)]
         self.apply_theme()
 
+    def apply_workmode(self, name, notify=True):
+        """Apply presentation defaults without changing signals or navigation."""
+        name = name.strip().lower() if isinstance(name, str) else ''
+        mode = self.WORKMODES.get(name)
+        if mode is None:
+            if notify:
+                self._show_message('Workmodes: calm, classic, minimal')
+            return False
+        self.workmode = name
+        self.current_theme = mode['theme']
+        self.show_menu_bar = mode['menu_bar']
+        self.show_module_sep = mode['scope_separators']
+        self.signal_spacing = 0
+        self.menu_page = 0
+        self.apply_theme()
+        focused_row = self.sig_offset + self.focus_idx
+        self.update_layout()
+        self.focus_idx = min(self.focus_idx, self.visible_signals - 1)
+        self.sig_offset = max(0, focused_row - self.focus_idx)
+        self._needs_layout = True
+        self._dirty = True
+        if notify:
+            self._show_message(f"Workmode: {mode['name']}  ·  F3 cycles  ·  ;session saves")
+        return True
+
     def load_theme_file(self, path):
         """Load a custom theme from JSON file."""
         try:
@@ -596,11 +651,16 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     def _init_colors(self):
         curses.start_color()
         curses.use_default_colors()
-        has_256 = curses.COLORS >= 256
+        self.apply_theme()
 
-        if has_256:
-            # Use the same palette on startup and after cycling themes.
-            self.apply_theme()
+    def _apply_basic_colors(self):
+        """Keep monochrome modes monochrome on an eight-color terminal too."""
+        if self.current_theme in ('minimal', 'mono'):
+            inverse = {self.C_CURSOR, self.C_CURSORB, self.C_SELECT, self.C_PROMPT}
+            for pair in range(self.C_HIGH, self.C_DIFF_ED + 1):
+                fg, bg = ((curses.COLOR_BLACK, curses.COLOR_WHITE) if pair in inverse
+                          else (curses.COLOR_WHITE, -1))
+                curses.init_pair(pair, fg, bg)
         else:
             # ── Fallback 8-color palette ──
             curses.init_pair(self.C_HIGH,    curses.COLOR_GREEN, -1)
@@ -1543,6 +1603,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             'line_thickness': self.line_thickness,
             'value_label_size': self.value_label_size,
             'theme': self.current_theme,
+            'workmode': getattr(self, 'workmode', 'calm'),
+            'menu_bar': getattr(self, 'show_menu_bar', True),
+            'scope_separators': getattr(self, 'show_module_sep', True),
         }
 
     def save_session(self):
@@ -1612,6 +1675,12 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             self.sig_height = {k: int(v) for k, v in data.get('sig_height', {}).items()
                                if k in valid}
             apply_session_times(self, data)
+            mode = data.get('workmode')
+            if isinstance(mode, str) and mode in self.WORKMODES:
+                self.apply_workmode(mode, notify=False)
+            for key, attr in (('menu_bar', 'show_menu_bar'), ('scope_separators', 'show_module_sep')):
+                if isinstance(data.get(key), bool):
+                    setattr(self, attr, data[key])
             if 'name_width' in data:
                 self.name_width = max(8, int(data['name_width']))
                 self._name_width_manual = True

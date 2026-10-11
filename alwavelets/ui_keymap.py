@@ -46,6 +46,12 @@ class KeymapMixin:
         self._needs_layout = True
         self._show_message("Menu bar " + ("shown" if self.show_menu_bar else "hidden"))
 
+    def _kb_cycle_workmode(self):
+        modes = list(self.WORKMODES)
+        current = getattr(self, 'workmode', 'calm')
+        index = modes.index(current) if current in modes else -1
+        self.apply_workmode(modes[(index + 1) % len(modes)])
+
     def _kb_show_colors(self):
         self.show_colors = True
 
@@ -318,6 +324,7 @@ class KeymapMixin:
             ord('?'): self._kb_help,
             K.KEY_F1: self._kb_show_manual,
             K.KEY_F2: self._kb_toggle_menu_bar,
+            K.KEY_F3: self._kb_cycle_workmode,
             ord('C'): self._kb_show_colors,
             K.KEY_RIGHT: self._kb_cursor_right, ord('l'): self._kb_cursor_right,
             K.KEY_LEFT: self._kb_cursor_left, ord('h'): self._kb_cursor_left,

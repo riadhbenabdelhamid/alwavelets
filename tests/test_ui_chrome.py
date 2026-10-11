@@ -62,8 +62,8 @@ def test_every_shortcut_is_reachable_on_rendered_pages(viewer, monkeypatch, widt
     from alwavelets import ui_drawing
     original, captured = ui_drawing.menu_pages, []
 
-    def record(items, room):
-        pages = original(items, room)
+    def record(items, room, gap=3):
+        pages = original(items, room, gap)
         captured[:] = pages
         return pages
 

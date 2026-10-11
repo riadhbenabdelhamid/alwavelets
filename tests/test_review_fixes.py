@@ -196,11 +196,13 @@ def _session_viewer(w, tmp_path, max_time=1000):
     s.name_width, s._name_width_manual = 20, False
     s.signal_spacing, s.show_grid = 0, 0
     s.line_thickness, s.value_label_size = 1, 2
-    s.current_theme, s.THEMES = "dark", {"dark": {}}
+    s.current_theme, s.THEMES = "dark", Alwavelets.THEMES
+    s.WORKMODES = Alwavelets.WORKMODES
+    s.visible_signals = 20
     s.apply_theme = lambda *a: None
     s.update_layout = lambda: None
     for m in ("session_path", "_session_state", "save_session",
-              "restore_session", "clear_session"):
+              "restore_session", "clear_session", "apply_workmode"):
         f = getattr(Alwavelets, m)
         setattr(s, m, f if isinstance(f, staticmethod) else f.__get__(s))
     s.session_path = Alwavelets.session_path

@@ -64,6 +64,22 @@ a subtle A–B measurement region. Sidebar labels truncate at character-cell
 boundaries, and the status bar keeps complete readouts together while giving
 loading, errors, and agent-control activity priority on narrow terminals.
 
+Three selectable **workmodes** combine a palette with presentation defaults:
+
+| Mode | Appearance |
+| --- | --- |
+| `calm` (default) | Muted waveform colors, compact guide, quieter panels, scope separators |
+| `classic` | Vivid waveform colors, dense shortcuts and technical statistics, contiguous signal rows |
+| `minimal` | Monochrome, plain panel bars, no row striping or scope separators, guide hidden |
+
+Press **F3** to cycle modes, or enter `;workmode calm`, `;workmode classic`, or
+`;workmode minimal`. The title shows the active mode even when the guide is
+hidden; **F2** toggles the guide in any mode. Switching modes reapplies the
+palette, guide, scope-separator, and zero-spacing defaults while keeping the
+displayed signals, zoom, cursors, and per-signal settings. `;theme` and `\`
+still change only the palette. `;session` saves the mode and any subsequent
+appearance adjustments for that trace.
+
 ## Requirements
 
 - Python 3.8+ with the standard library `curses` module (Unix/Linux/macOS;
@@ -96,6 +112,7 @@ Flags:
 | `--memory-mib N` | Decoded waveform page-cache budget, default 256 MiB |
 | `--loadunchecked` | Start with no signals shown (pick them in the `B` tree browser) |
 | `--expanded` | Start with all scope modules expanded |
+| `--workmode calm\|classic\|minimal` | Choose UI presentation, overriding config and saved appearance |
 | `--demo` | Generate and view a demo trace (written under a per-user temp directory) |
 | `--mcp` | Run as an MCP server (stdio) instead of the viewer |
 | `--no-cache` | Disable persistent waveform and instruction caches |
@@ -512,6 +529,7 @@ ignored. `keys` maps an action name to a single character.
 
 ```json
 {
+  "workmode": "calm",
   "theme": "phosphor",
   "radix": "hex",
   "wave_style": 2,
@@ -520,6 +538,15 @@ ignored. `keys` maps an action name to a single character.
   "name_width": 28,
   "keys": { "quit": "Q", "zoom_in": "=", "toggle_cursor": " " }
 }
+```
+
+`workmode` sets the starting presentation. Explicit `theme` and `menu_bar`
+settings override its defaults (the example uses Calm's layout with Phosphor
+colors). A saved session restores its own appearance; `--workmode` takes
+precedence over both. For example:
+
+```sh
+alwavelets trace.fst --workmode minimal
 ```
 
 ## MCP server (agentic workflows)

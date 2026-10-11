@@ -240,17 +240,27 @@ class DrawingMixin:
         """A quiet title bar and a width-aware shortcut strip."""
         w = self.width
         room = max(0, w - 1)
-        store = getattr(self.vcd, '_store', None)
-        total = store.total_changes if store is not None else sum(s.num_changes() for s in self.vcd.signals.values())
-        brand = elide(" Alwavelets ", room)
+        mode = getattr(self, 'workmode', 'calm')
+        mode_label = elide(f" F3 {mode.title()} " if room >= 40 else f" {mode.title()} ", room)
+        mode_col = room - text_width(mode_label)
+        brand = elide(" Alwavelets " if room >= 40 else " ", mode_col)
         filename = os.path.basename(self.vcd._filename)
-        details = [f"{len(self.display_order):,} signals", f"{total:,} changes",
-                   f"{self.vcd.timescale}/tick"]
+        details = []
+        if mode != 'minimal':
+            store = getattr(self.vcd, '_store', None)
+            total = store.total_changes if store is not None else sum(s.num_changes() for s in self.vcd.signals.values())
+            if mode == 'classic':
+                details = [f"Sig:{len(self.display_order):,}", f"Chg:{total:,}",
+                           f"TS:{self.vcd.timescale}", f"T:{self.vcd.max_time:,}"]
+            else:
+                details = [f"{len(self.display_order):,} signals", f"{total:,} changes",
+                           f"{self.vcd.timescale}/tick"]
+        joiner = ' ' if mode == 'classic' else ' · '
         # Keep room for the filename before adding lower-priority metadata.
-        while details and text_width(' · '.join(details)) + len(brand) + 20 > room:
+        while details and text_width(joiner.join(details)) + len(brand) + 20 > mode_col:
             details.pop()
-        stats = ' · '.join(details)
-        stats_col = room - text_width(stats) - 1 if stats else room
+        stats = joiner.join(details)
+        stats_col = mode_col - text_width(stats) - 1 if stats else mode_col
         filename_room = max(0, stats_col - text_width(brand) - 3)
         title_attr = curses.color_pair(self.C_HEADER)
         try:
@@ -261,6 +271,8 @@ class DrawingMixin:
                 self.stdscr.addstr(0, text_width(brand) + 2, elide(filename, filename_room), title_attr)
             if stats:
                 self.stdscr.addstr(0, stats_col, stats, title_attr | curses.A_DIM)
+            if mode_label:
+                self.stdscr.addstr(0, mode_col, mode_label, title_attr | curses.A_BOLD)
         except curses.error:
             pass
         if not self.show_menu_bar:
@@ -268,6 +280,7 @@ class DrawingMixin:
         # Each entry: (key_label, description)
         all_menu_items = [
             ("?", "Help"),
+            ("F3", "Mode"),
             ("/", "Find"),
             ("+/-", "Zoom"),
             ("Z", "Fit"),
@@ -353,7 +366,8 @@ class DrawingMixin:
         # Every shortcut appears on a page, including unusually long entries.
         nav_width = len(f" 0/9 {len(all_menu_items)}/{len(all_menu_items)} ") if room >= 24 else 0
         menu_width = max(1, room - nav_width - 2)
-        pages = menu_pages(all_menu_items, menu_width)
+        separator = ' ' if mode == 'classic' else ' · '
+        pages = menu_pages(all_menu_items, menu_width, gap=len(separator))
         self.menu_page %= len(pages)
         col = 1
         row = self.menu_row
@@ -366,8 +380,8 @@ class DrawingMixin:
             key = elide(key, available)
             try:
                 if col > 1:
-                    self.stdscr.addstr(row, col, ' · ', curses.color_pair(self.C_MENUSEP))
-                    col += 3
+                    self.stdscr.addstr(row, col, separator, curses.color_pair(self.C_MENUSEP))
+                    col += len(separator)
                 self.stdscr.addstr(row, col, key, curses.color_pair(self.C_MENUKEY) | curses.A_BOLD)
                 col += text_width(key)
                 desc = elide(' ' + desc, max(0, room - nav_width - col - 1))
@@ -610,7 +624,7 @@ class DrawingMixin:
             has_diff = sig_id in self.diff_ranges and self.diff_ranges[sig_id]
 
             # ── Alternating row background (across the signal's rows) ──
-            if is_alt_row:
+            if is_alt_row and getattr(self, 'workmode', 'calm') != 'minimal':
                 for rr in range(row, row + sig_rows):
                     try:
                         self.stdscr.addstr(rr, 0, ' ' * (self.width - 1), curses.color_pair(self.C_ROWALT))
@@ -1020,6 +1034,7 @@ class DrawingMixin:
     def draw_status_bar(self):
         row = self.height - 1
         w = self.width
+        minimal = getattr(self, 'workmode', 'calm') == 'minimal'
 
         # Active flash message takes over the status row until it expires
         # (set by the non-blocking _show_message; cleared on an idle tick).
@@ -1065,7 +1080,7 @@ class DrawingMixin:
             delta_str = self.format_ruler_time(self.cursor_delta)
             _put(delta_str, curses.color_pair(self.C_DELTA) | curses.A_BOLD)
             delta = self.cursor_delta
-            if delta:
+            if delta and not minimal:
                 _put(f" ({_fmt_freq(1.0 / (delta * self.tick_seconds()))}",
                      curses.color_pair(self.C_HEADER))
                 sid = self.focused_signal_id()
@@ -1163,13 +1178,14 @@ class DrawingMixin:
                 sig_rx = self.get_signal_radix(sid)
                 _put(f"[{sig_rx.value}]", curses.color_pair(self.C_VAL))
             # Frequency info
-            freq = self.get_frequency_info()
-            if freq:
-                _put(f" {freq}", curses.color_pair(self.C_VAL))
-            # Transition count in view
-            tc = self.get_transition_count()
-            if tc is not None and tc > 0:
-                _put(f" Δ{tc}", curses.color_pair(self.C_HEADER) | curses.A_DIM)
+            if not minimal:
+                freq = self.get_frequency_info()
+                if freq:
+                    _put(f" {freq}", curses.color_pair(self.C_VAL))
+                # Transition count in view
+                tc = self.get_transition_count()
+                if tc is not None and tc > 0:
+                    _put(f" Δ{tc}", curses.color_pair(self.C_HEADER) | curses.A_DIM)
             # Collapsed scopes indicator
             if self.collapsed_scopes:
                 _sep()
@@ -1178,15 +1194,16 @@ class DrawingMixin:
         # Fit complete readouts, so narrow terminals never show orphaned
         # separators or half a measurement. Activity precedes optional detail.
         col = 1
+        field_separator = '  ' if minimal else ' │ '
         order = list(reversed(urgent_fields)) + [i for i in range(len(fields)) if i not in urgent_fields]
         for i in order:
             field = fields[i]
             if not field:
                 continue
-            needed = sum(text_width(text) for text, _ in field) + (3 if col > 1 else 0)
+            needed = sum(text_width(text) for text, _ in field) + (len(field_separator) if col > 1 else 0)
             if col + needed > w - 1:
                 if i in urgent_fields:
-                    separator = ' │ ' if col > 1 else ''
+                    separator = field_separator if col > 1 else ''
                     text = elide(''.join(text for text, _ in field), max(0, w - col - len(separator) - 1))
                     if text:
                         try:
@@ -1199,8 +1216,8 @@ class DrawingMixin:
                 continue
             try:
                 if col > 1:
-                    self.stdscr.addstr(row, col, ' │ ', curses.color_pair(self.C_HEADER) | curses.A_DIM)
-                    col += 3
+                    self.stdscr.addstr(row, col, field_separator, curses.color_pair(self.C_HEADER) | curses.A_DIM)
+                    col += len(field_separator)
                 for text, attr in field:
                     self.stdscr.addstr(row, col, text, attr)
                     col += text_width(text)
@@ -1241,7 +1258,7 @@ class DrawingMixin:
                 "r Radix(all) \u00b7 R Radix(sig) \u00b7 v Color \u00b7 H Height",
                 "a Analog \u00b7 t Values \u00b7 T Time \u00b7 D Decode \u00b7 Q Grid",
                 "w Wave style \u00b7 () Name col \u00b7 | Spacing \u00b7 \\ Theme",
-                "C Colors \u00b7 0/9 Menu page",
+                "F3 Workmode \u00b7 F2 Guide \u00b7 C Colors \u00b7 0/9 Menu page",
             ]),
             ("ISA Debug", [
                 "` Trace query \u00b7 p Register panel \u00b7 ;trace Build",
