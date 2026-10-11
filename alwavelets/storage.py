@@ -105,7 +105,7 @@ class PageSequence(Sequence):
             index += len(self)
         if not 0 <= index < len(self):
             raise IndexError(index)
-        page, lo = self.signal.store.page_at(self.signal.key, index)
+        page, lo = self.signal.store.page_at(self.signal.key, index, values=self.values)
         index -= lo
         if not self.values:
             return page._times[index]
@@ -114,9 +114,13 @@ class PageSequence(Sequence):
     def bisect(self, timestamp, right=False):
         return self.signal.store.bisect(self.signal.key, timestamp, right)
 
+    def bisect_values(self, timestamp):
+        """Locate a rendering boundary whose page will also supply values."""
+        return self.signal.store.bisect(self.signal.key, timestamp, values=True)
+
     def iter_range(self, start, end):
         while start < end:
-            page, lo = self.signal.store.page_at(self.signal.key, start)
+            page, lo = self.signal.store.page_at(self.signal.key, start, values=self.values)
             stop = min(end - lo, len(page._times))
             for i in range(start - lo, stop):
                 yield (page._values[i] if self.signal._scalar else page.value_str(i)) if self.values else page._times[i]
@@ -167,8 +171,17 @@ class StoredSignal(VCDSignal):
     def iter_changes(self, start=0, end=None):
         lo = self._times.bisect(start)
         hi = len(self._times) if end is None else self._times.bisect(end, True)
-        values = self._values.iter_range(lo, hi)
-        return zip(self._times.iter_range(lo, hi), map(chr, values) if self._scalar else values)
+        # Paired reads need the complete page immediately. Avoid a timestamp
+        # prefix read followed by an upgrade for every page during exports.
+        def events():
+            index = lo
+            while index < hi:
+                page, base = self.store.page_at(self.key, index)
+                stop = min(hi - base, len(page._times))
+                for i in range(index - base, stop):
+                    yield page._times[i], page.value_str(i)
+                index = base + stop
+        return events()
 
     def numeric_range_in_window(self, start, end):
         low, high = self.store.numeric_range(self, start, end)
@@ -281,6 +294,7 @@ class TraceStore:
         # its memory budget. One recent location per signal, with a fixed cap.
         self.page_hints = OrderedDict()
         self.cache_bytes = self.peak_cache_bytes = self.page_reads = 0
+        self.timestamp_page_reads = 0
         self.counts, self.definitions = {}, {}
         self.generation = 0
         self.total_changes = 0
@@ -340,7 +354,9 @@ class TraceStore:
                 return 'x'
             hint = self._bisect_hint(key, timestamp, n, True)
             if hint is not None:
-                page, _, index = hint
+                page, lo, index = hint
+                if index and page._values is None:
+                    page, _ = self.page_at(key, lo + index - 1)
                 return page.value_str(index - 1) if index else 'x'
             # page_end orders equal end times by event ordinal. Strictly greater
             # skips every page ending at this timestamp, keeping the last delta.
@@ -360,7 +376,7 @@ class TraceStore:
             index = bisect.bisect_right(page._times, timestamp, 0, count)
             return page.value_str(index - 1) if index else 'x'
 
-    def bisect(self, key, timestamp, right=False):
+    def bisect(self, key, timestamp, right=False, *, values=False):
         with self.lock:
             n = self.counts.get(key, 0)
             # SQLite binds integers, not Fraction (used by cross-timescale
@@ -372,6 +388,8 @@ class TraceStore:
                 return 0
             hint = self._bisect_hint(key, timestamp, n, right)
             if hint is not None:
+                if values and hint[2] and hint[0]._values is None:
+                    self.page_at(key, hint[1] + hint[2] - 1)
                 return hint[1] + hint[2]
             short = self.short_page(key)
             if short is not None:
@@ -384,14 +402,16 @@ class TraceStore:
                                   'AND lo<? ORDER BY t1,lo LIMIT 1', (key, bound, n)).fetchone()
             if row is None:
                 return n
-            page, lo = self._page(key, *row)
+            page, lo = self._page(key, *row, values=values)
             count = min(len(page._times), n - lo)
             return lo + (bisect.bisect_right if right else bisect.bisect_left)(page._times, timestamp, 0, count)
 
-    def page_at(self, key, index):
+    def page_at(self, key, index, *, values=True):
         with self.lock:
             hint = self._hint(key)
             if hint is not None and hint[1] <= index < hint[1] + len(hint[0]._times):
+                if values and hint[0]._values is None:
+                    return self._page(key, self.page_hints[key][1], hint[1], len(hint[0]._times))
                 return hint
             # A lookup in the compact SQL index avoids keeping all page
             # offsets in Python for files with millions of blocks.
@@ -404,22 +424,61 @@ class TraceStore:
                 raise IndexError(index)
             if index >= row[1] + row[2]:
                 raise IndexError(index)
-            return self._page(key, *row)
+            return self._page(key, *row, values=values)
 
-    def _page(self, key, pid, lo, count):
+    def _page(self, key, pid, lo, count, *, values=True):
         cached = self.pages.get(pid)
-        if cached is not None:
+        if cached is not None and (not values or cached[0]._values is not None):
             self.pages.move_to_end(pid)
             sig = cached[0]
         else:
-            blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
-            data = zlib.decompress(blob)
-            sig = _decode_page(self.definitions[key], data, count)
-            self.cache_page(pid, sig, data[0])
+            definition = self.definitions[key]
+            if values:
+                blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
+                data = zlib.decompress(blob)
+                sig = _decode_page(definition, data, count)
+                self.cache_page(pid, sig, data[0])
+            else:
+                data = self._timestamp_prefix(pid, count)
+                sig = _signal(definition, metadata_only=True)
+                sig._times = array.array('q')
+                sig._times.frombytes(data[1:])
+                sig._values = None  # Upgrade by replacing this immutable cache entry.
+                self.cache_page(pid, sig, None)
+                self.timestamp_page_reads += 1
         self._remember_page(key, pid, lo)
         return sig, lo
 
+    def _timestamp_prefix(self, pid, count):
+        """Inflate only the existing kind/timestamp prefix, with bounded reads.
+
+        Do not retain compressed tails or decompressor state in the cache. A
+        later value read reopens the full page and validates its zlib checksum.
+        """
+        size = 1 + count * 8
+        chunk = min(PAGE_BYTES, max(4096, size + 64))
+        decoder, data, offset = zlib.decompressobj(), bytearray(), 1
+        while len(data) < size:
+            if self.cancel.is_set():
+                raise Cancelled('Read cancelled')
+            row = self.db.execute('SELECT substr(data,?,?) FROM pages WHERE id=?', (offset, chunk, pid)).fetchone()
+            if row is None or not row[0]:
+                raise ValueError('Truncated waveform timestamps')
+            raw = row[0]
+            data.extend(decoder.decompress(raw, size - len(data)))
+            offset += len(raw)
+            if decoder.eof and len(data) < size:
+                raise ValueError('Truncated waveform timestamps')
+        if self.cancel.is_set():
+            raise Cancelled('Read cancelled')
+        if data[0] not in (0, 1, 2):
+            raise ValueError('Invalid waveform page kind')
+        return data
+
     def cache_page(self, pid, sig, kind):
+        previous = self.pages.pop(pid, None)
+        if previous is not None:
+            self.cache_bytes -= previous[1]
         size = sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
         if kind == 0:
             size += sum(sys.getsizeof(v) for v in sig._values)

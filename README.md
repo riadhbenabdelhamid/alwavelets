@@ -254,8 +254,16 @@ cache directory starts a new index. Later cache maintenance may evict the idle
 checkpoint under the normal retention policy. For FST, saved histories can cover
 different time ranges per signal while indexing is incomplete.
 
+Time-only queries read just the kind/timestamp prefix of a compressed page,
+without decoding its values. A later value read replaces that cache entry with
+the complete page; both forms share the same bounded cache. Rendering and event
+exports request complete pages when they need values immediately. Small inline
+histories are still read whole. Existing disk indexes need no rebuild, and
+signal selection remains optional. Prefix reads validate the header and timestamp
+length; the full page's zlib checksum is checked when values are read.
+
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
-pages, **not total process memory**: Python, scopes, display edits, SQLite,
+timestamps and values, **not total process memory**: Python, scopes, display edits, SQLite,
 builder buffers, and active query pages need additional memory. A separate cache
 of at most 1,024 recent page locations lets nearby cursor, timestamp and ordinal
 queries reuse a decoded page without repeating SQLite lookups. These locations
@@ -1176,6 +1184,38 @@ python3 tools/stress_queries.py --baseline /path/to/baseline --output queries-bu
 python3 tools/stress_queries.py --kind scalar --baseline /path/to/baseline --output queries-scalar.json
 python3 tools/stress_queries.py --kind real --baseline /path/to/baseline --output queries-real.json
 ```
+
+Timestamp-only page reads extend this path without changing the index format.
+The query benchmark also measures cold timestamp bisections and a sweep of
+1,000 evenly spaced timestamps. It reports timestamp-only and full-page decodes
+separately, plus the cached bytes and pages remaining after each stage. Paired
+local runs against `1466711`, with the same 200,000-event workloads and 8 MiB
+budget, measured:
+
+| Workload | Format | Cold timestamp median before → after | Timestamp sweep total before → after |
+| --- | --- | ---: | ---: |
+| Dense 1,024-bit bus | VCD | 199 → 39.7 µs | 222 → 45.8 ms |
+| Dense 1,024-bit bus | FST | 192 → 44.4 µs | 176 → 41.6 ms |
+| Scalar | VCD | 79.4 → 70.9 µs | 5.75 → 5.53 ms |
+| Scalar | FST | 80.0 → 71.8 µs | 5.72 → 5.51 ms |
+| Real | VCD | 130 → 45.3 µs | 37.2 → 13.2 ms |
+| Real | FST | 103 → 43.4 µs | 35.4 → 15.9 ms |
+
+These timestamp stages decoded no value arrays. At the end of the dense-bus
+sweep, VCD retained 1,000 timestamp pages in 0.84 MiB, versus 129 full pages
+in 8.00 MiB before; FST retained 834 timestamp pages in 1.92 MiB, versus
+131 full pages in 7.97 MiB. Full pages replace timestamp entries when needed
+and stay under the same budget. Wide values benefit most because their value
+payloads dominate page size; scalar timestamp gains are smaller.
+
+Value-heavy rendering still needs complete pages. The dense-bus 30-frame totals
+were 490 → 483 ms for VCD and 296 → 309 ms for FST; scalar totals were about
+32 → 35 ms. This change targets timestamp queries and their cache footprint,
+with no consistent rendering speedup in these runs. All waveform and frame
+digests matched across formats and readers. These are individual local runs,
+with the decoded-page cache cleared before each cold query but SQLite and OS
+caches potentially warm. Checksum validation of the unread value tail is
+deferred until a full-page read.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

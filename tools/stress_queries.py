@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare cold reads, nearby cursor reads and pan/zoom rendering on VCD/FST.
+"""Compare value/time queries and pan/zoom rendering on disk-backed VCD/FST.
 
 Each repository/format runs in a fresh process with a temporary index. Cold
 means an empty decoded-page cache; SQLite and OS caches may remain warm.
@@ -56,24 +56,35 @@ def worker(args):
         store, rng = trace._store, random.Random(0)
         random_ticks = [rng.randrange(args.events) for _ in range(args.samples)]
         nearby_ticks = [min(args.events - 1, args.events // 2 + i % 256) for i in range(args.samples * 4)]
+        sweep_ticks = [i * (args.events - 1) // (args.samples - 1) if args.samples > 1 else 0
+                       for i in range(args.samples)]
+        def page_counts(reads, timestamps):
+            total = store.page_reads - reads
+            partial = getattr(store, 'timestamp_page_reads', 0) - timestamps
+            return dict(pages_decoded=total, timestamp_pages_decoded=partial, full_pages_decoded=total - partial,
+                        cached_bytes=store.cache_bytes, cached_pages=len(store.pages))
         queries = {}
-        for name, ticks in [('cold_random', random_ticks), ('nearby_cursor', nearby_ticks)]:
-            expected = [value_at(t, kind, args.width, args.pattern) for t in ticks]
+        for name, ticks in [('cold_random', random_ticks), ('nearby_cursor', nearby_ticks),
+                            ('cold_time_lookup', random_ticks), ('time_sweep', sweep_ticks)]:
+            times_only = name in ('cold_time_lookup', 'time_sweep')
+            expected = ticks if times_only else [value_at(t, kind, args.width, args.pattern) for t in ticks]
             clear_pages(store)
             samples, reads = [], store.page_reads
+            timestamps = getattr(store, 'timestamp_page_reads', 0)
             for j, (tick, want) in enumerate(zip(ticks, expected)):
-                if name == 'cold_random':
+                if name.startswith('cold_'):
                     clear_pages(store)
                 # Alternate the signal and its alias to check shared locality.
                 target = alias if j % 2 else signal
                 before = time.perf_counter()
-                got = target.value_at(tick)
+                got = target._times.bisect(tick) if times_only else target.value_at(tick)
                 samples.append((time.perf_counter() - before) * 1000)
                 assert got == want
-            queries[name] = dict(summary(samples), pages_decoded=store.page_reads - reads)
+            queries[name] = dict(summary(samples), **page_counts(reads, timestamps))
         frames, samples = hashlib.sha256(), []
         clear_pages(store)
         reads = store.page_reads
+        timestamps = getattr(store, 'timestamp_page_reads', 0)
         renderer = draw_analog_culled if kind == 'real' else draw_single_bit_culled if args.width == 1 else draw_bus_culled
         extra = (Radix.HEX,) if renderer is draw_bus_culled else ()
         for span in (32, 320, 3200, 32000, args.events - 1):
@@ -84,7 +95,7 @@ def worker(args):
                 frame = renderer(signal, start, start + span, 160, *extra)
                 samples.append((time.perf_counter() - before) * 1000)
                 frames.update(json.dumps(frame, sort_keys=True).encode() + b'\n')
-        queries['pan_zoom'] = dict(summary(samples), pages_decoded=store.page_reads - reads)
+        queries['pan_zoom'] = dict(summary(samples), **page_counts(reads, timestamps))
         result.update(queries=queries, frames_sha256=frames.hexdigest(), peak_rss_mib=peak_rss(),
                       page_cache_peak_bytes=store.peak_cache_bytes)
         assert store.peak_cache_bytes <= store.memory_bytes
