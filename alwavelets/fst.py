@@ -917,44 +917,75 @@ class FSTReader:
         width, is_real = self._width(h)
         scalar = width == 1 and not is_real
         count = min(PAGE_EVENTS, max(1, PAGE_BYTES // (17 if scalar else (96 if is_real else width + 64))))
-        timestamps = array.array('q')
-        values = bytearray() if scalar else []
         state = self._chain_state if self._checkpoint is not None else None
-        for t, value in self._chain_events(h, mu, times, scalar_bytes=scalar, state=state):
-            timestamps.append(t)
-            values.append(value)
-            if len(timestamps) == count:
+        cursor, tidx = state if state is not None else (Cursor(mu, self._cancel), 0)
+        rv, read = cursor.varint, cursor.read
+        end, ntimes = len(mu), len(times)
+        page, page_start, page_end = (), 0, 0
+        nbytes = (width + 7) >> 3
+        packed_format = '0%db' % (nbytes * 8)
+        real = struct.Struct(self._real_fmt).unpack
+        while cursor.pos < end:
+            self._check()
+            timestamps = array.array('q')
+            values = bytearray() if scalar else []
+            for _ in range(count):
+                if cursor.pos >= end:
+                    break
+                vli = rv()
+                if scalar:
+                    if vli & 1:
+                        next_tidx = tidx + (vli >> 4)
+                        value = b'xzxxxxxx'[(vli >> 1) & 7]
+                    else:
+                        next_tidx = tidx + (vli >> 2)
+                        value = 48 + ((vli >> 1) & 1)
+                else:
+                    next_tidx = tidx + (vli >> 1)
+                    if is_real:
+                        value = repr(real(read(8))[0])
+                    elif vli & 1:
+                        value = read(width).decode('ascii', 'replace')
+                    else:
+                        value = format(int.from_bytes(read(nbytes), 'big'), packed_format)[:width]
+                if next_tidx >= ntimes:
+                    end = cursor.pos
+                    break
+                tidx = next_tidx
+                if not page_start <= tidx < page_end:
+                    page_start = tidx
+                    page = times.uint64_page(tidx)
+                    page_end = tidx + len(page)
+                timestamps.append(page[tidx - page_start])
+                values.append(value)
+            if timestamps:
+                # Publish the cursor only at a complete batch boundary. The
+                # checkpoint records the next byte and last event's time index,
+                # including repeated timestamps and multi-byte time deltas.
+                if state is not None:
+                    state[1] = tidx
                 self._check()
                 yield timestamps, values
-                timestamps = array.array('q')
-                values = bytearray() if scalar else []
-        if timestamps:
-            self._check()
-            yield timestamps, values
 
-    def _chain_events(self, h, mu, times, scalar_bytes=False, state=None):
-        # The optional shared cursor/time index advances before each yield, so
-        # a completed batch can save the exact next event, including zero deltas.
-        cursor, tidx = state if state is not None else (Cursor(mu, self._cancel), 0)
+    def _chain_events(self, h, mu, times):
+        """Decode text events for the eager reader, including FST logic states."""
+        cursor, tidx = Cursor(mu, self._cancel), 0
         width, is_real = self._width(h)
         ntimes = len(times)
         rv = cursor.varint
         if width == 1 and not is_real:
-            rcv = b'xzxxxxxx' if scalar_bytes else _RCV
             while cursor:
                 if cursor.pos % 4096 == 0:
                     self._check()
                 vli = rv()
                 if vli & 1:
                     tidx += vli >> 4
-                    val = rcv[(vli >> 1) & 7]
+                    val = _RCV[(vli >> 1) & 7]
                 else:
                     tidx += vli >> 2
-                    val = (48 + ((vli >> 1) & 1)) if scalar_bytes else ('1' if (vli >> 1) & 1 else '0')
+                    val = '1' if (vli >> 1) & 1 else '0'
                 if tidx >= ntimes:
                     break
-                if state is not None:
-                    state[1] = tidx
                 yield times[tidx], val
             return
         nbytes = (width + 7) >> 3
@@ -974,8 +1005,6 @@ class FSTReader:
                 val = format(int.from_bytes(raw, 'big'), '0%db' % (nbytes * 8))[:width]
             if tidx >= ntimes:
                 break
-            if state is not None:
-                state[1] = tidx
             yield times[tidx], val
 
     # ── blackouts ────────────────────────────────────────────────────

@@ -185,6 +185,22 @@ class Records(Sequence):
             index += len(self)
         self.buffer.replace(index * self.record.size, self.record.pack(*value if isinstance(value, tuple) else (value,)))
 
+    def uint64_page(self, start):
+        """Copy at most one page of timestamps into a native numeric array.
+
+        Decoders can reuse this bounded snapshot without unpacking a record
+        and checking the spill buffer for every event.
+        """
+        if self.record.format != '<Q':
+            raise ValueError('Expected an unsigned 64-bit table')
+        if not 0 <= start < len(self):
+            raise IndexError(start)
+        values = array.array('Q')
+        values.frombytes(self.buffer.read(start * 8, min(CHUNK, (len(self) - start) * 8)))
+        if sys.byteorder != 'little':
+            values.byteswap()
+        return values
+
     def close(self):
         self.buffer.close()
 
@@ -275,25 +291,40 @@ class Output:
         self.buffer, self.expected = buffer, expected
         self.progress_cb, self.reported = progress_cb, 0
         self.history = bytearray()
+        self.size, self.pending = 0, 0
 
     def write(self, data):
-        if self.expected is not None and len(self.buffer) + len(data) > self.expected:
+        size = len(data)
+        if self.expected is not None and self.size + size > self.expected:
             raise ValueError('FST decompressed size exceeds declaration')
-        self.buffer.write(data)
-        if self.progress_cb is not None and len(self.buffer) - self.reported >= CHUNK:
-            self.reported = len(self.buffer)
-            self.progress_cb(self.reported, self.expected)
         self.history.extend(data)
+        self.size += size
+        self.pending += size
+        # LZ4/FastLZ often emit just a few bytes per literal or match. Reuse
+        # their bounded history as the write buffer instead of spilling each
+        # tiny piece separately. Never trim bytes that have not been flushed.
+        if self.pending >= CHUNK:
+            self.flush()
         if len(self.history) > HISTORY * 2:
             del self.history[:-HISTORY]
+
+    def flush(self):
+        if self.pending:
+            self.buffer.write(self.history[-self.pending:])
+            self.pending = 0
+        if self.progress_cb is not None and self.size - self.reported >= CHUNK:
+            self.reported = self.size
+            self.progress_cb(self.reported, self.expected)
 
     def match(self, distance, size):
         if not 0 < distance <= min(len(self.history), HISTORY):
             raise ValueError('FST compressed block has invalid match distance')
         while size:
             count = min(size, CHUNK)
-            seed = bytes(self.history[-distance:][:min(distance, count)])
-            block = (seed * ((count + len(seed) - 1) // len(seed)))[:count]
+            start = len(self.history) - distance
+            block = self.history[start:start + min(distance, count)]
+            if count > distance:
+                block = (block * ((count + distance - 1) // distance))[:count]
             self.write(block)
             size -= count
 
@@ -372,6 +403,7 @@ def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=1
                 control = source.byte()
         else:
             raise ValueError('Unknown FST compression: ' + codec)
+        output.flush()
         if expected is not None and len(result) != expected:
             raise ValueError('FST decompressed size mismatch (%d != %d)' % (len(result), expected))
         check_cancel(cancel)

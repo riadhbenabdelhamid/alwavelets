@@ -882,27 +882,50 @@ the timings. The converter is only a benchmark-generation dependency.
 ```sh
 python3 tools/stress_formats.py --signals 128 --ticks 10000 --mixed --output formats.json
 python3 tools/stress_formats.py --signals 128 --ticks 10000 --mixed --codec Z --output formats-zlib.json
+python3 tools/stress_formats.py --signals 128 --ticks 32768 --mixed --baseline /path/to/old-checkout --output formats-long.json
 ```
 
 With 1.28M events across 128 scalar, 16/128-bit bus and real signals, plus an
-alias, LZ4 FST and VCD produced identical waveform digests:
+alias, a local comparison against `4f78e81` produced identical waveform digests:
 
-| Measurement | VCD | FST |
-| --- | ---: | ---: |
-| Source size | 55.61 MB | 3.47 MB |
-| Metadata ready | 77 ms | 79 ms |
-| First readable value | 358 ms | 344 ms |
-| Full indexing | 2.64 s | 3.51 s |
-| Process CPU | 2.30 s | 3.22 s |
-| Peak RSS | 30.3 MiB | 27.5 MiB |
-| Cached reopen | 2.8 ms | 3.0 ms |
+| Measurement | VCD | Previous LZ4 FST | Batched LZ4 FST |
+| --- | ---: | ---: | ---: |
+| Source size | 55.61 MB | 3.47 MB | 3.47 MB |
+| Metadata ready | 58 ms | 60 ms | 61 ms |
+| First readable value | 337 ms | 329 ms | 331 ms |
+| Full indexing | 2.58 s | 3.43 s | 2.60 s |
+| Process CPU | 2.34 s | 3.15 s | 2.36 s |
+| Peak RSS | 30.8 MiB | 27.7 MiB | 27.7 MiB |
+| Cached reopen | 2.8 ms | 2.9 ms | 2.9 ms |
 
 These single local runs use an 8 MiB page budget and exclude terminal rendering.
-FST's smaller input does not yet make this full-indexing workload faster in our
-Python decoder. The older decoder fails shared-chain waveform verification on
-this workload, so its long-history timings are not compared. Regression fixtures
-generated with LZ4, FastLZ and zlib cover that shared-chain correction, including
-memory/disk loading, cache invalidation and checkpoint resume.
+FST disk decoding now fills event batches directly and reads timestamps from
+bounded 64 KiB numeric pages, avoiding per-event generator yields and general
+record lookups. LZ4/FastLZ output reuses the bounded decompression history to
+combine tiny writes, and short matches copy only the referenced bytes. Large
+blocks and timestamp tables still spill to disk; signal selection stays optional.
+Existing cache and checkpoint formats are unchanged.
+
+The mixed workload takes about 24% less FST indexing time, reaching roughly VCD
+parity. A separate 1.28M-event scalar comparison measured 0.96 → 0.51 s for FST
+versus 1.10 s for VCD, at 26.7 MiB FST peak RSS. Those scalar signals deliberately
+share identical histories, exercising shared compressed chains as well as a
+declaration alias. Profiling the mixed trace found less than 1 ms spent repeating
+shared-chain decompression, so no extra chain cache was added.
+
+Increasing the mixed trace to 4.19M events (182.59 MB VCD / 11.38 MB FST) measured
+11.17 → 8.28 s FST indexing versus 8.49 s VCD, again with identical waveform
+digests. FST peak RSS remained 28.2 MiB, with the same 8 MiB page budget.
+A separate 20M-event scalar chain, including a 160 MB timestamp table that
+spills to disk, indexed in 17.50 → 8.95 s at 26.5 MiB peak RSS. Its first readable
+waveform arrived in 3.05 → 2.94 s; timestamp-table preparation still precedes
+chain decoding. That stress check verifies sampled values and unchanged event
+counts, while the matched-format runs verify every event.
+
+Regression coverage includes LZ4, FastLZ and zlib; memory/disk loading; page jumps,
+same-timestamp changes, wide and real values; cancellation and exact checkpoint
+resume. Decoders before the shared-chain correction in `4f78e81` fail waveform
+verification on these workloads and cannot serve as timing baselines.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
@@ -1004,7 +1027,8 @@ resume position, index size, elapsed/CPU time, and peak RSS. As with the VCD
 benchmark, source generation and validation are outside the timed region, disk
 writes are included, and the OS page cache is not flushed.
 
-A local 20M-event scalar FST run with an 8 MiB page cache took 16.0 seconds
+A local 20M-event scalar FST run before the decoding optimizations above,
+with an 8 MiB page cache, took 16.0 seconds
 from scratch. Interrupting around 60% preserved 11.1M events; reopening finished
 in 8.6 seconds, with about 25 MiB peak RSS in each phase. In a separate paired
 10M-event cold-load check, `93a1ae1` took 8.02 seconds and the resumable reader
