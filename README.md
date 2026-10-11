@@ -262,6 +262,16 @@ histories are still read whole. Existing disk indexes need no rebuild, and
 signal selection remains optional. Prefix reads validate the header and timestamp
 length; the full page's zlib checksum is checked when values are read.
 
+Zoomed-out digital rendering samples shared column boundaries once: a 160-column
+row needs 161 boundaries, or 321 at subcell resolution. Disk queries combine
+each boundary's event ordinal and preceding value, reuse the active page, and
+avoid decoding a following page for queries in a gap. Expanded bus bits extract
+only sampled values, including for in-memory traces. Duplicate timestamps,
+half-open column edges, labels and glyphs retain their existing behavior.
+Boundary batches use one published history and check cancellation between
+samples. Temporary sample counts scale with screen width; their values and
+labels still require space proportional to signal width.
+
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 timestamps and values, **not total process memory**: Python, scopes, display edits, SQLite,
 builder buffers, and active query pages need additional memory. A separate cache
@@ -1216,6 +1226,43 @@ digests matched across formats and readers. These are individual local runs,
 with the decoded-page cache cleared before each cold query but SQLite and OS
 caches potentially warm. Checksum validation of the unread value tail is
 deferred until a full-page read.
+
+Shared viewport boundaries now reduce repeated searches during digital
+rendering. Disk-backed batches return each boundary's ordinal and preceding
+value together; in-memory expanded bits also avoid extracting every visible
+bus event. `tools/stress_queries.py` can render several independent signals
+and expanded bit lanes in each frame, using `--signals`, `--expanded-bits`, and
+`--subcell`. Event verification and frame hashing remain outside timed regions.
+
+Paired local runs against `bd468d3` used an 8 MiB page-cache budget, 160 columns,
+five zoom levels and six pan positions. The following times cover 30 frames;
+each frame renders every row in its workload:
+
+| Workload | Format | Frame median before → after | Frame p95 before → after | 30-frame total before → after |
+| --- | --- | ---: | ---: | ---: |
+| Four scalars, 50k events each (4 rows) | VCD | 3.59 → 1.05 ms | 7.86 → 3.69 ms | 115 → 37.8 ms |
+| Four scalars, 50k events each (4 rows) | FST | 3.83 → 1.13 ms | 8.31 → 3.81 ms | 118 → 37.4 ms |
+| Four 1,024-bit buses + two bits each, 50k events each (12 rows) | VCD | 301 → 71.7 ms | 1,204 → 607 ms | 16.2 → 7.58 s |
+| Four 1,024-bit buses + two bits each, 50k events each (12 rows) | FST | 189 → 17.1 ms | 989 → 558 ms | 12.1 → 6.27 s |
+| Two 256-bit buses + four subcell bits each, 20k events each (10 rows) | VCD | 380 → 10.2 ms | 610 → 72.1 ms | 9.91 → 0.973 s |
+| Two 256-bit buses + four subcell bits each, 20k events each (10 rows) | FST | 242 → 11.2 ms | 432 → 13.9 ms | 6.75 → 0.301 s |
+
+Expanded bits benefit most from removing repeated searches over page-backed
+window views. Full-page decoding can still dominate wide-bus rows: a separate
+single-bus run took 611 → 642 ms for VCD and 427 → 371 ms for FST across 30
+frames. Benefits depend on layout, cache reuse and signal width. Decoded pages
+stayed within budget; the 12-row run used about 35 MiB peak process RSS.
+All complete waveform and frame digests matched across formats and readers.
+An additional comparison preserved 4,608 rendered views covering aliases,
+expanded bits, exact time scaling, large timestamps, both bit styles and all
+bus radixes. Existing indexes remain compatible and signal selection stays
+optional. These are individual local measurements; terminal output is excluded.
+
+```sh
+python3 tools/stress_queries.py --kind scalar --events 50000 --signals 4 --baseline /path/to/baseline --output viewport-scalars.json
+python3 tools/stress_queries.py --events 50000 --signals 4 --expanded-bits 2 --baseline /path/to/baseline --output viewport-bits.json
+python3 tools/stress_queries.py --events 20000 --signals 2 --width 256 --expanded-bits 4 --subcell --baseline /path/to/baseline --output viewport-subcell.json
+```
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

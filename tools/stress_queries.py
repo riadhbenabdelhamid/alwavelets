@@ -29,8 +29,9 @@ def summary(samples):
 
 def worker(args):
     sys.path.insert(0, str(args.repo))
-    from alwavelets.core import Radix
-    from alwavelets.rendering import draw_analog_culled, draw_bus_culled, draw_single_bit_culled
+    from alwavelets.core import Radix, VirtualBitSignal
+    from alwavelets.rendering import (draw_analog_culled, draw_bus_culled,
+                                     draw_single_bit_culled, draw_single_bit_subcell)
     from alwavelets.storage import open_trace
     from tools.stress_fst_chains import value_at
     from tools.stress_workflows import peak_rss
@@ -44,14 +45,18 @@ def worker(args):
     with open_trace(args.source, use_cache=False, memory_mib=args.memory_mib) as trace:
         result = dict(load_s=time.perf_counter() - started, index_bytes=Path(trace._store.path).stat().st_size,
                       indexing_peak_rss_mib=peak_rss())
-        signal, alias = trace.signals.values()
-        assert signal.num_changes() == alias.num_changes() == args.events
+        declared = list(trace.signals.values())
+        signals, alias = declared[:args.signals], declared[-1]
+        signal = signals[0]
+        assert len(declared) == args.signals + 1 and alias.num_changes() == args.events
         digest = hashlib.sha256()
         # Verify the entire history outside the timed queries.
-        for i, (timestamp, value) in enumerate(signal.iter_changes()):
-            assert timestamp == i and value == value_at(i, kind, args.width, args.pattern)
-            digest.update(str(timestamp).encode() + b':' + value.encode() + b'\n')
-        assert i + 1 == args.events
+        for number, target in enumerate(signals):
+            assert target.num_changes() == args.events
+            for i, (timestamp, value) in enumerate(target.iter_changes()):
+                assert timestamp == i and value == value_at(i + number * args.events, kind, args.width, args.pattern)
+                digest.update(str(timestamp).encode() + b':' + value.encode() + b'\n')
+            assert i + 1 == args.events
         result['waveform_sha256'] = digest.hexdigest()
         store, rng = trace._store, random.Random(0)
         random_ticks = [rng.randrange(args.events) for _ in range(args.samples)]
@@ -85,19 +90,25 @@ def worker(args):
         clear_pages(store)
         reads = store.page_reads
         timestamps = getattr(store, 'timestamp_page_reads', 0)
-        renderer = draw_analog_culled if kind == 'real' else draw_single_bit_culled if args.width == 1 else draw_bus_culled
+        bit_renderer = draw_single_bit_subcell if args.subcell else draw_single_bit_culled
+        renderer = draw_analog_culled if kind == 'real' else bit_renderer if args.width == 1 else draw_bus_culled
         extra = (Radix.HEX,) if renderer is draw_bus_culled else ()
+        rows = []
+        for target in signals:
+            rows.append((target, renderer, extra))
+            rows.extend((VirtualBitSignal(target, bit), bit_renderer, ()) for bit in range(args.expanded_bits))
         for span in (32, 320, 3200, 32000, args.events - 1):
             span = min(span, args.events - 1)
             for pan in range(6):
                 start = max(0, min(args.events - 1 - span, args.events // 3 + pan * max(1, span // 8)))
                 before = time.perf_counter()
-                frame = renderer(signal, start, start + span, 160, *extra)
+                rendered = [draw(target, start, start + span, 160, *options) for target, draw, options in rows]
                 samples.append((time.perf_counter() - before) * 1000)
-                frames.update(json.dumps(frame, sort_keys=True).encode() + b'\n')
+                for frame in rendered:
+                    frames.update(json.dumps(frame, sort_keys=True).encode() + b'\n')
         queries['pan_zoom'] = dict(summary(samples), **page_counts(reads, timestamps))
         result.update(queries=queries, frames_sha256=frames.hexdigest(), peak_rss_mib=peak_rss(),
-                      page_cache_peak_bytes=store.peak_cache_bytes)
+                      page_cache_peak_bytes=store.peak_cache_bytes, rendered_rows=len(rows))
         assert store.peak_cache_bytes <= store.memory_bytes
         return result
 
@@ -106,6 +117,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--events', type=int, default=200000)
     parser.add_argument('--samples', type=int, default=1000)
+    parser.add_argument('--signals', type=int, default=1, help='Independent signals rendered in each frame')
+    parser.add_argument('--expanded-bits', type=int, default=0, help='Low bus bits rendered below each signal')
+    parser.add_argument('--subcell', action='store_true', help='Use 2x horizontal resolution for bit lanes')
     parser.add_argument('--kind', choices=('bus', 'scalar', 'real'), default='bus')
     parser.add_argument('--width', type=int, default=1024)
     parser.add_argument('--pattern', choices=('counter', 'dense'), default='dense')
@@ -118,23 +132,40 @@ def main():
     args = parser.parse_args()
     if args.kind != 'bus':
         args.width = 64 if args.kind == 'real' else 1
-    if args.events < 2 or min(args.samples, args.width, args.memory_mib) <= 0:
-        parser.error('events must be at least two; sample count, width and memory must be positive')
+    if args.events < 2 or min(args.samples, args.width, args.memory_mib, args.signals) <= 0:
+        parser.error('events must be at least two; samples, width, memory and signal count must be positive')
+    if not 0 <= args.expanded_bits <= args.width or (args.expanded_bits and args.kind != 'bus'):
+        parser.error('expanded bits must be between zero and the bus width, and require --kind bus')
     if args.source:
         print(json.dumps(worker(args)))
         return
     sys.path.insert(0, str(ROOT))
-    from tools.stress_fst_chains import create_vcd
+    from tools.stress_fst_chains import create_vcd, value_at
     formats = ('vcd', 'fst') if args.format == 'both' else (args.format,)
     converter = shutil.which('vcd2fst')
     if 'fst' in formats and converter is None:
         parser.error('vcd2fst is required to generate FST benchmark inputs')
     results = dict(events=args.events, kind=args.kind, width=args.width, pattern=args.pattern,
-                   memory_mib=args.memory_mib, repositories={})
+                   memory_mib=args.memory_mib, signals=args.signals, expanded_bits=args.expanded_bits,
+                   subcell=args.subcell, repositories={})
     signature = None
     with tempfile.TemporaryDirectory(prefix='alwavelets-queries-') as directory:
         vcd, fst = (Path(directory) / ('trace.' + fmt) for fmt in ('vcd', 'fst'))
-        create_vcd(vcd, args.events, 'real' if args.kind == 'real' else 'bus', args.width, args.pattern)
+        kind = 'real' if args.kind == 'real' else 'bus'
+        if args.signals == 1:
+            create_vcd(vcd, args.events, kind, args.width, args.pattern)
+        else:
+            with vcd.open('w') as output:
+                output.write('$timescale 1ns $end\n$scope module top $end\n')
+                for i in range(args.signals):
+                    output.write(f'$var {"real" if kind == "real" else "wire"} {args.width} s{i} value{i} $end\n')
+                output.write(f'$var {"real" if kind == "real" else "wire"} {args.width} s0 alias $end\n')
+                output.write('$upscope $end\n$enddefinitions $end\n')
+                for tick in range(args.events):
+                    output.write(f'#{tick}\n')
+                    for i in range(args.signals):
+                        value = value_at(tick + i * args.events, kind, args.width, args.pattern)
+                        output.write(f'{"r" if kind == "real" else "b"}{value} s{i}\n')
         if 'fst' in formats:
             subprocess.run([converter, '-4', str(vcd), str(fst)], check=True, capture_output=True, timeout=300)
         repositories = [('baseline', args.baseline)] if args.baseline else []
@@ -144,7 +175,10 @@ def main():
                 command = [sys.executable, str(Path(__file__).resolve()), '--source', str(vcd if fmt == 'vcd' else fst),
                            '--repo', str(repo), '--events', str(args.events), '--samples', str(args.samples),
                            '--kind', args.kind, '--width', str(args.width), '--pattern', args.pattern,
-                           '--memory-mib', str(args.memory_mib)]
+                           '--memory-mib', str(args.memory_mib), '--signals', str(args.signals),
+                           '--expanded-bits', str(args.expanded_bits)]
+                if args.subcell:
+                    command.append('--subcell')
                 env = dict(os.environ, ALWAVELETS_CACHE_DIR=str(Path(directory) / label / fmt))
                 completed = subprocess.run(command, env=env, capture_output=True, text=True, timeout=300)
                 if completed.returncode:

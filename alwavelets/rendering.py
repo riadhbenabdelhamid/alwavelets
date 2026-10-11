@@ -1,9 +1,7 @@
 """Waveform rendering — pure functions that turn signal data into
 character/attribute arrays (single-bit, bus, analog). No curses.
 """
-from .core import time_bisect_left
-
-from .core import _B2S, format_typed_value
+from .core import time_bisect_left, time_bisect_right, VirtualBitSignal, format_typed_value
 
 
 # ══════════════════════════════════════════════════════════════
@@ -61,11 +59,47 @@ def _bit_char(val):
     return ' ', 5
 
 
-def _value_bisect_left(times, timestamp):
-    # Column boundaries are followed by a value read. Disk-backed signals can
-    # load both together rather than inflating a timestamp prefix and upgrading.
-    lookup = getattr(times, 'bisect_values', None)
-    return lookup(timestamp) if lookup else time_bisect_left(times, timestamp)
+def _column_samples(times, value_str, start, end, width, transform=None, lo=0, hi=None):
+    # Adjacent columns share a half-open boundary. Sample each boundary once,
+    # keeping the original float arithmetic so glyphs and labels stay exact.
+    step = (end - start) / width
+    boundaries = [start + i * step for i in range(width + 1)]
+    sample = getattr(times, 'sample_boundaries', None)
+    if sample is not None:
+        result = sample(boundaries, lo, hi, transform)
+        if result is not None:
+            return result
+    result = []
+    last_index, value = None, None
+    stop = len(times) if hi is None else hi
+    for timestamp in boundaries:
+        index = max(lo, min(stop, time_bisect_left(times, timestamp)))
+        if index != last_index:
+            value = value_str(index - 1) if index > lo else None
+        result.append((index - lo, value))
+        last_index = index
+    return result
+
+
+def _bit_lod_samples(sig, start, end, columns):
+    times = sig._times
+    lo, hi = 0, None
+    if getattr(sig, '_scalar', False):
+        if sig.transition_count_in_window(start, end) <= columns:
+            return None
+    elif isinstance(sig, VirtualBitSignal):
+        # Match the generic window's baseline and inclusive end, but extract
+        # only sampled bits instead of materializing the full bus window.
+        lo = max(0, time_bisect_left(times, start) - 1)
+        hi = time_bisect_right(times, end)
+        if hi - lo <= columns:
+            return None
+    else:
+        return None
+    samples = _column_samples(times, sig.value_str, start, end, columns,
+                              getattr(sig, '_extract_bit', None), lo, hi)
+    first = sig.value_at(start) if samples[0][0] == 0 else samples[0][1]
+    return samples, first
 
 
 def draw_single_bit_culled(sig, t_start, t_end, width):
@@ -76,34 +110,22 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
     if span <= 0:
         return chars, attrs
 
-    # ── LOD fast path: per-column binary search when transitions approach
-    # pixel count. Chosen by a bisect-only transition count so a dense scalar
-    # never materializes the whole window's value list (which would cost
-    # O(window) per frame at full zoom-out).
-    if getattr(sig, '_scalar', False) and \
-            sig.transition_count_in_window(t_start, t_end) > width:
-        _bisect_left = _value_bisect_left
-        inv_width = span / width  # float division for consistent column widths
-        # Packed-scalar storage: read byte codes from the full arrays and
-        # decode via _B2S.
-        all_times = sig._times
-        all_values = sig._values
+    # LOD samples shared boundaries for scalars and expanded bits, without
+    # materializing the visible event history at full zoom-out.
+    sampled = _bit_lod_samples(sig, t_start, t_end, width)
+    if sampled is not None:
+        samples, first_val = sampled
         for col in range(width):
             # Half-open [start, end) float boundaries so every transition
             # belongs to exactly one column. int() truncation used to overlap
             # adjacent columns and double-count boundary edges, making a
             # periodic signal's columns bunch unevenly (e.g. 1,1,1,1,1,4).
-            col_t_start = t_start + col * inv_width
-            col_t_end = t_start + (col + 1) * inv_width
-            lo = _bisect_left(all_times, col_t_start)
-            hi = _bisect_left(all_times, col_t_end)
-
-            # Value at column start (before any transitions in this column)
-            val_before_idx = lo - 1
-            val_before = _B2S[all_values[val_before_idx]] if val_before_idx >= 0 else sig.value_at(t_start)
+            lo, val_before = samples[col]
+            hi, last_val = samples[col + 1]
+            if lo == 0:
+                val_before = first_val
 
             if hi > lo:
-                last_val = _B2S[all_values[hi - 1]]
                 n_trans = hi - lo
                 if n_trans > 1:
                     # Aliased: several transitions fall in one column. A solid
@@ -126,22 +148,17 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
             chars[c], attrs[c] = ch, at
         return chars, attrs
 
-    # ── LOD generic path: non-packed single-bit signals — e.g. expanded-bus
-    # bit lanes (VirtualBitSignal), whose _values are the parent's raw bus
-    # values (so the byte-code fast path above would misread them). Bucket
-    # over the already bit-extracted windowed (times, values).
+    # Generic non-scalar signals provide decoded values through their window.
     if len(times) > width:
-        _bisect_left = _value_bisect_left
-        inv_width = span / width
         start_val = sig.value_at(t_start)
+        samples = _column_samples(times, values.__getitem__, t_start, t_end, width,
+                                  getattr(sig, '_extract_bit', None))
         for col in range(width):
-            col_t_start = t_start + col * inv_width
-            col_t_end = t_start + (col + 1) * inv_width
-            lo = _bisect_left(times, col_t_start)
-            hi = _bisect_left(times, col_t_end)
-            val_before = values[lo - 1] if lo - 1 >= 0 else start_val
+            lo, val_before = samples[col]
+            hi, last_val = samples[col + 1]
+            if lo == 0:
+                val_before = start_val
             if hi > lo:
-                last_val = values[hi - 1]
                 n_trans = hi - lo
                 if n_trans > 1:
                     chars[col], attrs[col] = CH_BUSY, 1
@@ -219,26 +236,18 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
     lev = [None] * n
     busy = [False] * n
 
-    # LOD fast path first: a bisect-only transition count picks it, so a
-    # dense scalar never materializes the whole window's value list (see
-    # draw_single_bit_culled).
-    if getattr(sig, '_scalar', False) and \
-            sig.transition_count_in_window(t_start, t_end) > n:
-        # Per sub-column binary search, half-open [start, end) float bounds;
-        # packed-scalar byte codes decoded via _B2S.
-        _bl = _value_bisect_left
-        inv = span / n
-        first_val = sig.value_at(t_start)
-        all_t = sig._times
-        all_v = sig._values
+    # Shared boundary samples also cover expanded bus bits at 2x resolution.
+    sampled = _bit_lod_samples(sig, t_start, t_end, n)
+    if sampled is not None:
+        samples, first_val = sampled
         for s in range(n):
-            lo = _bl(all_t, t_start + s * inv)
-            hi = _bl(all_t, t_start + (s + 1) * inv)
+            lo, before = samples[s]
+            hi, last = samples[s + 1]
             if hi > lo:
-                lev[s] = _B2S[all_v[hi - 1]]
+                lev[s] = last
                 busy[s] = (hi - lo) > 1
             else:
-                lev[s] = _B2S[all_v[lo - 1]] if lo > 0 else first_val
+                lev[s] = before if lo > 0 else first_val
         for c in range(width):
             chars[c], attrs[c] = _pack_subcell(
                 lev[2 * c], lev[2 * c + 1], busy[2 * c] or busy[2 * c + 1])
@@ -253,20 +262,18 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
         return chars, attrs
 
     if len(times) > n:
-        # LOD generic path: non-packed single-bit signals (expanded-bus
-        # VirtualBitSignal) — bucket over the already bit-extracted windowed
-        # (times, values), which are strings, not byte codes.
-        _bl = _value_bisect_left
-        inv = span / n
+        # Generic non-scalar signals use decoded window values.
         first_val = sig.value_at(t_start)
+        samples = _column_samples(times, values.__getitem__, t_start, t_end, n,
+                                  getattr(sig, '_extract_bit', None))
         for s in range(n):
-            lo = _bl(times, t_start + s * inv)
-            hi = _bl(times, t_start + (s + 1) * inv)
+            lo, before = samples[s]
+            hi, last = samples[s + 1]
             if hi > lo:
-                lev[s] = values[hi - 1]
+                lev[s] = last
                 busy[s] = (hi - lo) > 1
             else:
-                lev[s] = values[lo - 1] if lo > 0 else first_val
+                lev[s] = before if lo > 0 else first_val
     else:
         # Standard: map each transition to a sub-column (round half-up).
         scale = n / span
@@ -303,19 +310,15 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
 
     # ── LOD path (activate when transitions > pixels for symmetry) ──
     if n_changes > width:
-        _bl = _value_bisect_left
         at = sig._times
-        vstr = sig.value_str            # decodes packed bus storage
         prev = sig.value_at(t_start)
         labels[0] = format_typed_value(sig, prev, radix)
-        inv_w = span / width
+        samples = _column_samples(at, sig.value_str, t_start, t_end, width)
         for col in range(width):
             # Half-open [start, end) float boundaries — see draw_single_bit_culled.
-            ct0 = t_start + col * inv_w
-            ct1 = t_start + (col + 1) * inv_w
-            lo = _bl(at, ct0); hi = _bl(at, ct1)
+            lo = samples[col][0]
+            hi, last = samples[col + 1]
             if hi > lo:
-                last = vstr(hi - 1)
                 if hi - lo > 1 or last != prev:
                     chars[col], attrs[col] = CH_BUS_T, 1
                     if col + 1 < width:
