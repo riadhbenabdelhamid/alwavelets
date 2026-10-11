@@ -9,6 +9,7 @@ from .parsers import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .hierarchy import scope_signal_ids, scope_all_selected, scope_ranges
 from .display_order import DisplayOrder
+from .ui_chrome import elide, text_width
 
 
 class TreePanelMixin:
@@ -201,19 +202,26 @@ class TreePanelMixin:
 
     def draw_panel_tree(self):
         """Draw the tree panel on the left side."""
-        tw = self.panel_tree_width
+        tw = min(self.panel_tree_width, self.width // 2)
         h = self.height
         has_focus = (self.panel_focus == 0)
 
         # Use cached tree (rebuilt on toggle, not on draw)
 
         # ── Tree panel header ──
-        hdr = " Modules" if has_focus else " Modules"
-        hdr_attr = curses.color_pair(self.C_HEADER) | (curses.A_BOLD if has_focus else curses.A_DIM)
+        hdr = " ▸ Modules" if has_focus else "   Modules"
+        if tw >= 22:
+            hdr = hdr.ljust(tw - 5) + ' Tab '
+        hdr_attr = curses.color_pair(self.C_MENUKEY if has_focus else self.C_MENU)
+        if has_focus:
+            hdr_attr |= curses.A_BOLD
         # Anchor the panel to the waveform view's rows so it sits below the
-        # title/menu/separator header instead of covering the help bar.
+        # title and shortcut guide instead of covering the help bar.
         top = self.ruler_row          # panel header aligns with the ruler row
         try:
+            # Clear the entire pane, including any unused row above the footer.
+            for row in range(top, h - 1):
+                self.stdscr.addstr(row, 0, ' ' * tw, curses.A_NORMAL)
             self.stdscr.addstr(top, 0, hdr[:tw].ljust(tw), hdr_attr)
         except curses.error:
             pass
@@ -246,7 +254,7 @@ class TreePanelMixin:
                 icon = "▼" if flag else "▶"
                 scope_checked = self._tree_scope_all_checked(item)
                 scope_mark = "✓" if scope_checked else " "
-                label = f"{indent}{icon}{scope_mark}{item.name}/"
+                label = f"{indent}{icon} {scope_mark} {item.name}/"
                 is_selected_scope = (self.panel_selected_scope and 
                                     item.full_path == self.panel_selected_scope)
                 if is_cursor:
@@ -262,25 +270,26 @@ class TreePanelMixin:
                 if is_cursor:
                     attr = curses.color_pair(self.C_SELECT) | curses.A_BOLD
                 elif flag:
-                    attr = curses.color_pair(self.C_HIGH)
+                    attr = curses.A_NORMAL
                 else:
                     attr = curses.A_DIM
 
             try:
-                line = label[:tw-1].ljust(tw-1)
+                line = elide(label, tw)
+                line += ' ' * (tw - text_width(line))
                 self.stdscr.addstr(row, 0, line, attr)
-                self.stdscr.addch(row, tw-1, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
         # ── Separator between tree and signal list ──
         sep_row = self.wave_top + tree_rows
         if sep_row < h - 1:
-            sep_label = f"─ Signals "
+            sep_label = " Signals"
             try:
-                sep_line = sep_label[:tw-1].ljust(tw-1, '─')
-                self.stdscr.addstr(sep_row, 0, sep_line, curses.color_pair(self.C_HEADER))
-                self.stdscr.addch(sep_row, tw-1, '│', curses.color_pair(self.C_MENUSEP))
+                sep_line = sep_label[:tw].ljust(tw)
+                self.stdscr.addstr(sep_row, 0, sep_line, curses.color_pair(self.C_MENU))
+                self.stdscr.addch(sep_row, tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
@@ -303,22 +312,23 @@ class TreePanelMixin:
                 check = "✓" if in_view else " "
                 type_ch = '═' if sig.size > 1 else '─'
                 label = f"  {check} {type_ch} {sig.name} [{sig.size}]"
-                attr = curses.color_pair(self.C_HIGH) if in_view else curses.A_DIM
+                attr = curses.A_NORMAL if in_view else curses.A_DIM
             else:
                 label = ""
                 attr = curses.A_NORMAL
 
             try:
-                line = label[:tw-1].ljust(tw-1)
+                line = elide(label, tw)
+                line += ' ' * (tw - text_width(line))
                 self.stdscr.addstr(row, 0, line, attr)
-                self.stdscr.addch(row, tw-1, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
         # ── Vertical separator ──
         for row in range(self.ruler_row, h - 1):
             try:
-                self.stdscr.addch(row, tw - 1, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 

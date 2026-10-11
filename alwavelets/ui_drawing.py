@@ -15,6 +15,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .streaming import read_cancellation
+from .ui_chrome import elide, menu_pages, text_width
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -235,53 +236,47 @@ class DrawingMixin:
             pass
 
 
-    def _draw_separator(self, row):
-        """Thin horizontal rule across the width (divides header regions)."""
-        if not (0 <= row < self.height):
-            return
-        try:
-            self.stdscr.addstr(row, 0, '─' * (self.width - 1),
-                               curses.color_pair(self.C_MENUSEP) | curses.A_DIM)
-        except curses.error:
-            pass
-
     def draw_header(self):
-        """Row 0: title bar · row 1: separator · row 2: menu bar · row 3: separator."""
+        """A quiet title bar and a width-aware shortcut strip."""
         w = self.width
-
-        # ── Row 0: Title bar ──
+        room = max(0, w - 1)
         store = getattr(self.vcd, '_store', None)
         total = store.total_changes if store is not None else sum(s.num_changes() for s in self.vcd.signals.values())
-        parts = [
-            " ◆ Alwavelets",
-            os.path.basename(self.vcd._filename),
-            f"TS:{self.vcd.timescale}",
-            f"Sig:{len(self.display_order)}",
-            f"Chg:{total:,}",
-            f"T:{self.vcd.max_time:,}",
-        ]
-        title = " │ ".join(parts)
-        title = title[:w - 1].ljust(w - 1)
+        brand = elide(" Alwavelets ", room)
+        filename = os.path.basename(self.vcd._filename)
+        details = [f"{len(self.display_order):,} signals", f"{total:,} changes",
+                   f"{self.vcd.timescale}/tick"]
+        # Keep room for the filename before adding lower-priority metadata.
+        while details and text_width(' · '.join(details)) + len(brand) + 20 > room:
+            details.pop()
+        stats = ' · '.join(details)
+        stats_col = room - text_width(stats) - 1 if stats else room
+        filename_room = max(0, stats_col - text_width(brand) - 3)
+        title_attr = curses.color_pair(self.C_HEADER)
         try:
-            self.stdscr.addstr(0, 0, title, curses.color_pair(self.C_HEADER) | curses.A_BOLD)
+            self.stdscr.addstr(0, 0, ' ' * room, title_attr)
+            self.stdscr.addstr(0, 0, brand, title_attr | curses.A_BOLD)
+            if filename_room:
+                self.stdscr.addstr(0, text_width(brand), '│ ', title_attr | curses.A_DIM)
+                self.stdscr.addstr(0, text_width(brand) + 2, elide(filename, filename_room), title_attr)
+            if stats:
+                self.stdscr.addstr(0, stats_col, stats, title_attr | curses.A_DIM)
         except curses.error:
             pass
-
-        # ── Row 1: separator under the title bar ──
-        self._draw_separator(1)
-
-        # ── Row 2: Menu bar with command guide (F2 hides it for more rows) ──
         if not self.show_menu_bar:
             return
         # Each entry: (key_label, description)
         all_menu_items = [
-            ("?", "Quick help"),
-            ("F1", "Full manual"),
-            ("F2", "Hide this bar"),
+            ("?", "Help"),
+            ("/", "Find"),
+            ("+/-", "Zoom"),
+            ("Z", "Fit"),
+            ("Tab", "Focus / fold"),
+            ("s", "Panels"),
+            ("F1", "Manual"),
+            ("F2", "Hide guide"),
             # ── Navigation ──
             ("←→", "Scroll time"),
-            ("+/-", "Zoom in/out"),
-            ("Z", "Fit all"),
             ("W", "Fit A↔B"),
             ("↑↓", "Navigate signals"),
             ("Home", "Start of file"),
@@ -306,15 +301,11 @@ class DrawingMixin:
             ("][", "Next/prev edge"),
             ("f", "Find value"),
             ("P", "Pattern trigger"),
-            ("/", "Fuzzy find signal"),
             ("n", "Next result"),
             # ── Signal Management ──
-            ("s", "Panel mode (split)"),
             ("B", "Scope tree (fullscreen)"),
-            ("Tab", "Switch panel focus"),
             ("x", "Expand bus bits"),
             ("F", "Float decode (IEEE754)"),
-            ("Tab", "Fold/unfold group header"),
             ("{", "Collapse all modules"),
             ("}", "Expand all modules"),
             ("J/K", "Reorder signals"),
@@ -358,50 +349,38 @@ class DrawingMixin:
             ("q", "Quit"),
         ]
 
-        # Paginate: show items that fit in menu bar width
-        items_per_page = max(1, (w - 10) // 12)  # ~12 chars per item
-        total_pages = max(1, (len(all_menu_items) + items_per_page - 1) // items_per_page)
-        self.menu_page = self.menu_page % total_pages
-        page_start = self.menu_page * items_per_page
-        page_end = min(page_start + items_per_page, len(all_menu_items))
-        menu_items = all_menu_items[page_start:page_end]
-
-        col = 0
+        # Reserve a fixed-width page control, then pack by actual cell width.
+        # Every shortcut appears on a page, including unusually long entries.
+        nav_width = len(f" 0/9 {len(all_menu_items)}/{len(all_menu_items)} ") if room >= 24 else 0
+        menu_width = max(1, room - nav_width - 2)
+        pages = menu_pages(all_menu_items, menu_width)
+        self.menu_page %= len(pages)
+        col = 1
         row = self.menu_row
         try:
-            # Fill background
-            self.stdscr.addstr(row, 0, ' ' * (w - 1), curses.color_pair(self.C_MENU))
+            self.stdscr.addstr(row, 0, ' ' * room, curses.color_pair(self.C_MENU))
         except curses.error:
             pass
-
-        # Page indicator at start
-        if total_pages > 1:
-            page_ind = f"◀{self.menu_page+1}/{total_pages}▶"
+        for key, desc in pages[self.menu_page]:
+            available = max(0, room - nav_width - col - 1)
+            key = elide(key, available)
             try:
-                self.stdscr.addstr(row, col, page_ind, curses.color_pair(self.C_HEADER) | curses.A_DIM)
-                col += len(page_ind)
+                if col > 1:
+                    self.stdscr.addstr(row, col, ' · ', curses.color_pair(self.C_MENUSEP))
+                    col += 3
+                self.stdscr.addstr(row, col, key, curses.color_pair(self.C_MENUKEY) | curses.A_BOLD)
+                col += text_width(key)
+                desc = elide(' ' + desc, max(0, room - nav_width - col - 1))
+                self.stdscr.addstr(row, col, desc, curses.color_pair(self.C_MENU))
+                col += text_width(desc)
             except curses.error:
                 pass
-
-        for key, desc in menu_items:
-            entry = f" {key}"
-            entry_desc = f":{desc}"
-            if col + len(entry) + len(entry_desc) >= w - 1:
-                break
+        if nav_width:
+            nav = f"0/9 {self.menu_page + 1}/{len(pages)} "
             try:
-                self.stdscr.addstr(row, col, entry, curses.color_pair(self.C_MENUKEY) | curses.A_BOLD)
-                col += len(entry)
-                self.stdscr.addstr(row, col, entry_desc, curses.color_pair(self.C_MENU))
-                col += len(entry_desc)
-                # Separator dot
-                if col + 2 < w:
-                    self.stdscr.addstr(row, col, " ·", curses.color_pair(self.C_MENUSEP))
-                    col += 2
+                self.stdscr.addstr(row, room - len(nav), nav, curses.color_pair(self.C_MENU) | curses.A_DIM)
             except curses.error:
                 pass
-
-        # ── Row 3: separator under the menu bar, dividing it from the ruler ──
-        self._draw_separator(self.ruler_row - 1)
 
     def _nice_tick_interval(self, span, n_ticks=8):
         """Compute a human-friendly tick interval for the given span."""
@@ -430,7 +409,13 @@ class DrawingMixin:
             span = 1
 
         # Compute aligned ticks at round time intervals
-        tick_interval = self._nice_tick_interval(span)
+        label_width = max(text_width(self.format_ruler_time(self.time_start)),
+                          text_width(self.format_ruler_time(self.time_end)))
+        n_ticks = max(1, min(8, self.wave_width // (label_width + 3)))
+        tick_interval = self._nice_tick_interval(span, n_ticks)
+        while n_ticks > 1 and tick_interval * self.wave_width < span * (label_width + 3):
+            n_ticks -= 1
+            tick_interval = self._nice_tick_interval(span, n_ticks)
         first_tick = ((self.time_start + tick_interval - 1) // tick_interval) * tick_interval
         if first_tick > self.time_start + span:
             first_tick = self.time_start
@@ -442,17 +427,19 @@ class DrawingMixin:
                 ruler[c] = '┬'
                 label = self.format_ruler_time(t)
                 start = c + 1
-                if start + len(label) < self.wave_width:
+                if start + len(label) <= self.wave_width:
                     for j, ch in enumerate(label):
                         if start + j < self.wave_width:
                             ruler[start + j] = ch
             t += tick_interval
 
-        name_header = "Signal".center(self.name_width)
+        name_header = elide(" Signals", self.name_width).ljust(self.name_width)
+        if self.show_values and self.cursor_on and self.name_width >= 18:
+            name_header = " Signals".ljust(self.name_width - 7) + " Value "
         try:
-            self.stdscr.addstr(row, 0, name_header, curses.color_pair(self.C_HEADER))
-            self.stdscr.addstr(row, self.name_width, '│', curses.color_pair(self.C_HEADER))
-            self.stdscr.addstr(row, self.name_width + 1, ''.join(ruler)[:self.wave_width], curses.A_DIM)
+            self.stdscr.addstr(row, 0, name_header, curses.color_pair(self.C_MENU))
+            self.stdscr.addstr(row, self.name_width, '│', curses.color_pair(self.C_MENUSEP))
+            self.stdscr.addstr(row, self.name_width + 1, ''.join(ruler)[:self.wave_width], curses.color_pair(self.C_MENU))
         except curses.error:
             pass
 
@@ -1050,27 +1037,22 @@ class DrawingMixin:
         except curses.error:
             pass
 
-        col = 1
+        fields = [[]]
+        urgent_fields = []
         def _put(text, attr):
-            nonlocal col
-            if col + len(text) >= w:
-                return
-            try:
-                self.stdscr.addstr(row, col, text, attr)
-                col += len(text)
-            except curses.error:
-                pass
+            fields[-1].append((text, attr))
 
-        def _sep():
-            _put(" │ ", curses.color_pair(self.C_HEADER) | curses.A_DIM)
+        def _sep(urgent=False):
+            fields.append([])
+            if urgent:
+                urgent_fields.append(len(fields) - 1)
 
         # Active cursor
         if self.cursor_on:
             cur_lbl = "A" if self.active_cursor == 'a' else "B"
-            _put(f"Cur", curses.color_pair(self.C_HEADER))
             attr = curses.color_pair(self.C_CURSOR) if self.active_cursor == 'a' else curses.color_pair(self.C_CURSORB)
-            _put(cur_lbl, attr | curses.A_BOLD)
-            _put(f" t=", curses.color_pair(self.C_HEADER))
+            _put(f" {cur_lbl} ", attr | curses.A_BOLD)
+            _put(" ", curses.color_pair(self.C_HEADER))
             ct_str = self.format_ruler_time(self.cursor_time)
             _put(ct_str, curses.color_pair(self.C_HEADER) | curses.A_BOLD)
 
@@ -1079,7 +1061,7 @@ class DrawingMixin:
         # count inside [A, B].
         if self.cursor_b_on:
             _sep()
-            _put("ΔAB=", curses.color_pair(self.C_HEADER))
+            _put("Δ ", curses.color_pair(self.C_HEADER))
             delta_str = self.format_ruler_time(self.cursor_delta)
             _put(delta_str, curses.color_pair(self.C_DELTA) | curses.A_BOLD)
             delta = self.cursor_delta
@@ -1100,33 +1082,33 @@ class DrawingMixin:
         span = self.time_end - self.time_start
         ts_str = self.format_ruler_time(self.time_start)
         te_str = self.format_ruler_time(self.time_end)
-        _put(f"[{ts_str}‥{te_str}]", curses.color_pair(self.C_HEADER))
+        _put(f"{ts_str} – {te_str}", curses.color_pair(self.C_HEADER))
 
         # Signal range
         _sep()
         ts = len(self.display_order)
         end = min(self.sig_offset + self.visible_signals, ts)
-        _put(f"Sig {self.sig_offset+1}-{end}/{ts}", curses.color_pair(self.C_HEADER))
+        _put(f"Rows {min(self.sig_offset+1, ts)}–{end}/{ts}", curses.color_pair(self.C_HEADER))
 
         # Loading progress
         job = getattr(self, '_analysis_job', None)
         if job is not None:
-            _sep()
+            _sep(urgent=True)
             pct = ('%d%%' % min(100, job.progress[0] * 100 // job.progress[1])) if job.progress and job.progress[1] else '…'
             label = getattr(job, 'label', 'Search')
-            _put(f"{label} {pct} · cancel", curses.color_pair(self.C_PROMPT))
+            _put(f"{label} {pct} · cancel", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
         if self.vcd.is_loading:
-            _sep()
+            _sep(urgent=True)
             pct = self.vcd.load_progress
             chg = self.vcd.load_changes
             if getattr(self.vcd, '_resume_offset', 0):
-                _put(f"⟳ Resuming {pct}% ({chg:,})", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
+                _put(f"⟳ Resuming {pct}% ({chg:,})", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
             elif self.vcd._lazy_mode or pct < 1:
-                _put(f"⟳ Indexing {pct}%", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
+                _put(f"⟳ Indexing {pct}%", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
             else:
-                _put(f"⟳ Loading {pct}% ({chg:,})", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
+                _put(f"⟳ Loading {pct}% ({chg:,})", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
         elif self.vcd._load_error:
-            _sep()
+            _sep(urgent=True)
             _put(f"⚠ {self.vcd._load_error[:20]}", curses.color_pair(self.C_PROMPT))
         elif self.vcd._lazy_mode:
             _sep()
@@ -1143,7 +1125,7 @@ class DrawingMixin:
         if self.panel_mode:
             _sep()
             focus_name = "Tree" if self.panel_focus == 0 else "Wave"
-            _put(f"Panel:{focus_name}", curses.color_pair(self.C_PROMPT) | curses.A_BOLD)
+            _put(f"▸ {focus_name}", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
 
         # Spacing indicator
         if self.signal_spacing > 0:
@@ -1159,7 +1141,7 @@ class DrawingMixin:
         # Agent control: the user must always be able to see that something
         # else can drive this view, and when it last did.
         if self.control is not None:
-            _sep()
+            _sep(urgent=True)
             n = self.control.clients
             recent = (time.monotonic() - self.control.last_activity) < 2.0
             if recent:
@@ -1192,6 +1174,38 @@ class DrawingMixin:
             if self.collapsed_scopes:
                 _sep()
                 _put(f"Fld:{len(self.collapsed_scopes)}", curses.color_pair(self.C_HEADER) | curses.A_DIM)
+
+        # Fit complete readouts, so narrow terminals never show orphaned
+        # separators or half a measurement. Activity precedes optional detail.
+        col = 1
+        order = list(reversed(urgent_fields)) + [i for i in range(len(fields)) if i not in urgent_fields]
+        for i in order:
+            field = fields[i]
+            if not field:
+                continue
+            needed = sum(text_width(text) for text, _ in field) + (3 if col > 1 else 0)
+            if col + needed > w - 1:
+                if i in urgent_fields:
+                    separator = ' │ ' if col > 1 else ''
+                    text = elide(''.join(text for text, _ in field), max(0, w - col - len(separator) - 1))
+                    if text:
+                        try:
+                            if separator:
+                                self.stdscr.addstr(row, col, separator, curses.color_pair(self.C_HEADER) | curses.A_DIM)
+                            self.stdscr.addstr(row, col + len(separator), text, field[0][1])
+                        except curses.error:
+                            pass
+                    break
+                continue
+            try:
+                if col > 1:
+                    self.stdscr.addstr(row, col, ' │ ', curses.color_pair(self.C_HEADER) | curses.A_DIM)
+                    col += 3
+                for text, attr in field:
+                    self.stdscr.addstr(row, col, text, attr)
+                    col += text_width(text)
+            except curses.error:
+                pass
 
     def draw_help_overlay(self):
         """Draw a centered quick-help overlay.

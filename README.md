@@ -57,6 +57,13 @@ stdlib, original artwork, no third-party assets.
   the normal character-cell rendering, everywhere else — never hinders portability).
 - **Scripting:** a small TCL-like command engine and an in-app command line.
 
+The compact title and shortcut bars leave more room for waveforms. The guide
+fits shortcuts to the terminal width; `0` / `9` page through them, `F2` hides
+the guide, and `?` opens quick help. The dark theme uses quiet panel colors and
+a subtle A–B measurement region. Sidebar labels truncate at character-cell
+boundaries, and the status bar keeps complete readouts together while giving
+loading, errors, and agent-control activity priority on narrow terminals.
+
 ## Requirements
 
 - Python 3.8+ with the standard library `curses` module (Unix/Linux/macOS;

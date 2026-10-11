@@ -117,9 +117,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             'BUSLBL': (255, 236), 'ANALOG': (87, -1),
             'ANHI': (196, -1), 'ANMID': (220, -1), 'ANLO': (45, -1),
             'CURSOR': (255, 25), 'CURSORB': (255, 90), 'MARKER': (213, -1),
-            'DELTA': (228, 25), 'HEADER': (255, 236), 'MENU': (252, 234),
-            'MENUKEY': (82, 234), 'MENUSEP': (240, 234), 'PROMPT': (255, 124),
-            'HELP': (255, 24), 'SELECT': (16, 114), 'FOCUS': (255, 238),
+            'DELTA': (187, 236), 'HEADER': (253, 235), 'MENU': (248, 234),
+            'MENUKEY': (110, 234), 'MENUSEP': (240, 234), 'PROMPT': (255, 124),
+            'HELP': (253, 235), 'SELECT': (255, 24), 'FOCUS': (255, 237),
             'VAL': (117, -1), 'SCOPE': (245, -1), 'ROWALT': (-1, 233),
             'BUSNAME': (111, -1), 'DIFF_BG': (255, 52), 'DIFF_ED': (209, -1),
         },
@@ -599,47 +599,8 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         has_256 = curses.COLORS >= 256
 
         if has_256:
-            # ── Rich 256-color palette ──
-            # Waveform signal levels
-            curses.init_pair(self.C_HIGH,    47, -1)    # bright green on default
-            curses.init_pair(self.C_LOW,     34, -1)    # dim green on default
-            curses.init_pair(self.C_EDGE,    203, -1)   # warm red/orange
-            curses.init_pair(self.C_UNDEF,   220, -1)   # golden yellow
-            curses.init_pair(self.C_HIZ,     75, -1)    # steel blue
-
-            # Bus
-            curses.init_pair(self.C_BUS,     111, -1)   # light blue for bus body
-            curses.init_pair(self.C_BUSLBL,  255, 236)  # white on dark gray
-
-            # Analog gradient
-            curses.init_pair(self.C_ANALOG,  87, -1)    # bright cyan
-            curses.init_pair(self.C_ANHI,    196, -1)   # red (hot)
-            curses.init_pair(self.C_ANMID,   220, -1)   # yellow (warm)
-            curses.init_pair(self.C_ANLO,    45, -1)    # teal (cool)
-
-            # Cursors & markers
-            curses.init_pair(self.C_CURSOR,  255, 25)   # white on blue
-            curses.init_pair(self.C_CURSORB, 255, 90)   # white on magenta
-            curses.init_pair(self.C_MARKER,  213, -1)   # pink/magenta
-            curses.init_pair(self.C_DELTA,   228, 25)   # yellow on blue
-
-            # UI chrome
-            curses.init_pair(self.C_HEADER,  255, 236)  # white on dark gray
-            curses.init_pair(self.C_MENU,    252, 234)  # light gray on very dark
-            curses.init_pair(self.C_MENUKEY, 82, 234)   # bright green key on dark
-            curses.init_pair(self.C_MENUSEP, 240, 234)  # dim separator
-            curses.init_pair(self.C_PROMPT,  255, 124)  # white on dark red
-            curses.init_pair(self.C_HELP,    255, 24)   # white on blue
-            curses.init_pair(self.C_SELECT,  16, 114)   # black on teal
-            curses.init_pair(self.C_FOCUS,   255, 238)  # white on subtle dark
-            curses.init_pair(self.C_VAL,     117, -1)   # light blue value text
-            curses.init_pair(self.C_SCOPE,   245, -1)   # dim gray scope prefix
-            curses.init_pair(self.C_ROWALT,  -1, 233)   # very subtle dark row stripe
-
-            # Bus name & diff
-            curses.init_pair(self.C_BUSNAME, 111, -1)   # light blue for bus signal names
-            curses.init_pair(self.C_DIFF_BG, 255, 52)   # white on dark red (diff background)
-            curses.init_pair(self.C_DIFF_ED, 209, -1)   # orange for diff edges
+            # Use the same palette on startup and after cycling themes.
+            self.apply_theme()
         else:
             # ── Fallback 8-color palette ──
             curses.init_pair(self.C_HIGH,    curses.COLOR_GREEN, -1)
@@ -719,13 +680,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         # Clamp to terminal width
         self.name_width = min(self.name_width, self.width // 2)
         self.wave_width = max(1, self.width - self.name_width - 1)
-        # Row 0: title bar; a separator rule; the menu bar (if shown) + its own
-        # separator; then the ruler; signals; status. Hiding the menu bar
-        # reclaims its row and separator for waveforms.
-        #   menu shown:  0 title · 1 ─── · 2 menu · 3 ─── · 4 ruler · 5+ signals
-        #   menu hidden: 0 title · 1 ─── · 2 ruler · 3+ signals
-        self.menu_row = 2
-        self.ruler_row = 4 if self.show_menu_bar else 2
+        # Color separates the bars, leaving the vertical space for waveforms.
+        #   menu shown:  0 title · 1 menu · 2 ruler · 3+ signals
+        #   menu hidden: 0 title · 1 ruler · 2+ signals
+        self.menu_row = 1
+        self.ruler_row = 2 if self.show_menu_bar else 1
         self.wave_top = self.ruler_row + 1
         # Each signal takes (1 + spacing) rows, plus extra for diff pairs
         rows_for_signals = max(1, self.height - self.wave_top - 1)
