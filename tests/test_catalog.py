@@ -339,7 +339,7 @@ def test_header_uses_published_count_without_loading_declarations(tmp_path, monk
         v = SimpleNamespace(vcd=trace, width=160, display_order=trace.signal_order,
                             C_HEADER=0, stdscr=screen, show_menu_bar=False)
         DrawingMixin.draw_header(v)
-        assert any('1,000 changes' in text for (row, _), text in screen.lines.items() if row == 0)
+        assert any('Chg:1,000' in text for (row, _), text in screen.lines.items() if row == 0)
 
 
 def test_scope_iteration_uses_index_without_sorting_the_entire_scope(tmp_path):

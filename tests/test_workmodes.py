@@ -20,13 +20,16 @@ def colors(monkeypatch):
 
 
 def test_cycle_and_commands_preserve_trace_state(viewer, colors):
+    assert viewer.workmode == viewer.current_theme == 'classic'
+    assert viewer.show_menu_bar is True
+    assert viewer.show_module_sep is False
     viewer.cursor_a, viewer.cursor_b = 30, 70
     viewer.time_start, viewer.time_end = 20, 80
     viewer.sig_height = {'!': 3}
     viewer.sig_color = {'!': viewer.C_MARKER}
     viewer.selected_signals = {'!'}
     order = viewer.display_order
-    for name in ('classic', 'minimal', 'calm'):
+    for name in ('minimal', 'calm', 'classic'):
         viewer.keymap[curses.KEY_F3]()
         assert viewer.workmode == viewer.current_theme == name
         assert viewer.show_menu_bar == (name != 'minimal')

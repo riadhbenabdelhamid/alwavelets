@@ -384,8 +384,8 @@ def snapshot_state(v):
                    for g in v.groups],
         "markers": [{"time": m.time, "label": m.label} for m in v.markers],
         "radix": v.radix.value,
-        "workmode": getattr(v, 'workmode', 'calm'),
-        "theme": getattr(v, 'current_theme', 'calm'),
+        "workmode": getattr(v, 'workmode', 'classic'),
+        "theme": getattr(v, 'current_theme', 'classic'),
         "message": v._message or "",
     }
 

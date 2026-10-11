@@ -240,7 +240,7 @@ class DrawingMixin:
         """A quiet title bar and a width-aware shortcut strip."""
         w = self.width
         room = max(0, w - 1)
-        mode = getattr(self, 'workmode', 'calm')
+        mode = getattr(self, 'workmode', 'classic')
         mode_label = elide(f" F3 {mode.title()} " if room >= 40 else f" {mode.title()} ", room)
         mode_col = room - text_width(mode_label)
         brand = elide(" Alwavelets " if room >= 40 else " ", mode_col)
@@ -624,7 +624,7 @@ class DrawingMixin:
             has_diff = sig_id in self.diff_ranges and self.diff_ranges[sig_id]
 
             # ── Alternating row background (across the signal's rows) ──
-            if is_alt_row and getattr(self, 'workmode', 'calm') != 'minimal':
+            if is_alt_row and getattr(self, 'workmode', 'classic') != 'minimal':
                 for rr in range(row, row + sig_rows):
                     try:
                         self.stdscr.addstr(rr, 0, ' ' * (self.width - 1), curses.color_pair(self.C_ROWALT))
@@ -1034,7 +1034,7 @@ class DrawingMixin:
     def draw_status_bar(self):
         row = self.height - 1
         w = self.width
-        minimal = getattr(self, 'workmode', 'calm') == 'minimal'
+        minimal = getattr(self, 'workmode', 'classic') == 'minimal'
 
         # Active flash message takes over the status row until it expires
         # (set by the non-blocking _show_message; cleared on an idle tick).

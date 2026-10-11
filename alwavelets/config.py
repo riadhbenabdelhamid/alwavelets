@@ -5,7 +5,7 @@ is optional; unknown keys are ignored and any error falls back to built-in
 defaults, so a malformed config never blocks startup. Example:
 
     {
-      "workmode": "calm",
+      "workmode": "classic",
       "theme": "phosphor",
       "radix": "hex",
       "wave_style": 2,
@@ -16,7 +16,7 @@ defaults, so a malformed config never blocks startup. Example:
     }
 
 The workmode supplies presentation defaults; explicit theme/menu settings
-override them. `workmode` accepts "calm", "classic", or "minimal".
+override them. `workmode` accepts "calm", "classic" (default), or "minimal".
 
 `keys` maps an action name (the keymap handler name, e.g. "quit", "zoom_in",
 "next_edge") to a single character that should trigger it.

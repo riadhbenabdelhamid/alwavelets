@@ -68,8 +68,8 @@ Three selectable **workmodes** combine a palette with presentation defaults:
 
 | Mode | Appearance |
 | --- | --- |
-| `calm` (default) | Muted waveform colors, compact guide, quieter panels, scope separators |
-| `classic` | Vivid waveform colors, dense shortcuts and technical statistics, contiguous signal rows |
+| `calm` | Muted waveform colors, compact guide, quieter panels, scope separators |
+| `classic` (default) | Vivid waveform colors, dense shortcuts and technical statistics, contiguous signal rows |
 | `minimal` | Monochrome, plain panel bars, no row striping or scope separators, guide hidden |
 
 Press **F3** to cycle modes, or enter `;workmode calm`, `;workmode classic`, or
@@ -529,7 +529,7 @@ ignored. `keys` maps an action name to a single character.
 
 ```json
 {
-  "workmode": "calm",
+  "workmode": "classic",
   "theme": "phosphor",
   "radix": "hex",
   "wave_style": 2,
@@ -541,7 +541,7 @@ ignored. `keys` maps an action name to a single character.
 ```
 
 `workmode` sets the starting presentation. Explicit `theme` and `menu_bar`
-settings override its defaults (the example uses Calm's layout with Phosphor
+settings override its defaults (the example uses Classic's layout with Phosphor
 colors). A saved session restores its own appearance; `--workmode` takes
 precedence over both. For example:
 

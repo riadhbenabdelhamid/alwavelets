@@ -270,7 +270,7 @@ class TreePanelMixin:
                 if is_cursor:
                     attr = curses.color_pair(self.C_SELECT) | curses.A_BOLD
                 elif flag:
-                    attr = curses.color_pair(self.C_HIGH) if getattr(self, 'workmode', 'calm') == 'classic' else curses.A_NORMAL
+                    attr = curses.color_pair(self.C_HIGH) if getattr(self, 'workmode', 'classic') == 'classic' else curses.A_NORMAL
                 else:
                     attr = curses.A_DIM
 
@@ -312,7 +312,7 @@ class TreePanelMixin:
                 check = "✓" if in_view else " "
                 type_ch = '═' if sig.size > 1 else '─'
                 label = f"  {check} {type_ch} {sig.name} [{sig.size}]"
-                attr = (curses.color_pair(self.C_HIGH) if getattr(self, 'workmode', 'calm') == 'classic'
+                attr = (curses.color_pair(self.C_HIGH) if getattr(self, 'workmode', 'classic') == 'classic'
                         else curses.A_NORMAL) if in_view else curses.A_DIM
             else:
                 label = ""

@@ -273,9 +273,6 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.signal_spacing = 0       # spacing index into SPACING_VALUES
 
 
-        # Module separation
-        self.show_module_sep = True
-
         # Signal name display
         self.show_full_names = False
 
@@ -326,12 +323,14 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.show_grid = 0
 
         # Workmode supplies presentation defaults; the theme can be customized.
-        self.workmode = 'calm'
-        self.current_theme = self.WORKMODES[self.workmode]['theme']
+        self.workmode = 'classic'
+        mode = self.WORKMODES[self.workmode]
+        self.current_theme = mode['theme']
+        self.show_module_sep = mode['scope_separators']
 
         # Menu page
         self.menu_page = 0            # 0-based page of command menu
-        self.show_menu_bar = True     # row 1 command guide (F2 toggles)
+        self.show_menu_bar = mode['menu_bar']  # row 1 command guide (F2 toggles)
         self.ruler_row = 2            # recomputed in update_layout
         self.wave_top = 3             # first signal row (recomputed)
 
@@ -1603,9 +1602,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             'line_thickness': self.line_thickness,
             'value_label_size': self.value_label_size,
             'theme': self.current_theme,
-            'workmode': getattr(self, 'workmode', 'calm'),
+            'workmode': getattr(self, 'workmode', 'classic'),
             'menu_bar': getattr(self, 'show_menu_bar', True),
-            'scope_separators': getattr(self, 'show_module_sep', True),
+            'scope_separators': getattr(self, 'show_module_sep', False),
         }
 
     def save_session(self):

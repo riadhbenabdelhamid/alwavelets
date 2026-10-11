@@ -48,7 +48,7 @@ class KeymapMixin:
 
     def _kb_cycle_workmode(self):
         modes = list(self.WORKMODES)
-        current = getattr(self, 'workmode', 'calm')
+        current = getattr(self, 'workmode', 'classic')
         index = modes.index(current) if current in modes else -1
         self.apply_workmode(modes[(index + 1) % len(modes)])
 
