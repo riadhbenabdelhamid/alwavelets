@@ -146,6 +146,13 @@ metadata fields together. A read-through cache holds at most 1,024 stored
 positions; it does not write metadata on eviction. Checkpoints still flush all
 buffered state before committing, and existing complete and partial indexes
 remain compatible.
+
+FST timestamp deltas expand in bounded pages as signal chains request them, so
+the first waveform batches can publish before the whole timestamp table has
+been converted. Expanded pages are retained for later signals and spill to disk
+under the same memory budget. Every declared timestamp is still validated
+before its block completes, including timestamps unused by any signal.
+
 The first available histories publish promptly. Completed pages and progress
 normally publish every quarter second; later partial pages can accumulate for
 about a second, or until page/memory limits require a flush. Finishing a load
@@ -187,7 +194,9 @@ five seconds of indexing or 64 MiB of decoded chain data, checked at completed
 batches; declaration, initial-frame, and final-sort boundaries are saved too.
 Reopening skips completed chains and reuses the declaration catalog. The current
 chain and its timestamp/offset tables are decompressed again, but saved events
-are not decoded or written again. Gzip-wrapped FSTs must also be unwrapped again.
+are not decoded or written again. Timestamp expansion rebuilds the prefix needed
+at the saved position and then proceeds on demand. Gzip-wrapped FSTs must also
+be unwrapped again.
 An interrupted blackout block or final sort is replayed from its preceding
 checkpoint. This reduces repeated work after interruption; it does not remove
 the first-load scan or guarantee a checkpoint during a long decompression step.
@@ -916,11 +925,34 @@ shared-chain decompression, so no extra chain cache was added.
 Increasing the mixed trace to 4.19M events (182.59 MB VCD / 11.38 MB FST) measured
 11.17 → 8.28 s FST indexing versus 8.49 s VCD, again with identical waveform
 digests. FST peak RSS remained 28.2 MiB, with the same 8 MiB page budget.
-A separate 20M-event scalar chain, including a 160 MB timestamp table that
-spills to disk, indexed in 17.50 → 8.95 s at 26.5 MiB peak RSS. Its first readable
-waveform arrived in 3.05 → 2.94 s; timestamp-table preparation still precedes
+A separate 20M-event scalar chain at `3213fc1`, including a 160 MB timestamp
+table that spills to disk, indexed in 17.50 → 8.95 s at 26.5 MiB peak RSS. Its first readable
+waveform arrived in 3.05 → 2.94 s; full timestamp-table expansion still preceded
 chain decoding. That stress check verifies sampled values and unchanged event
 counts, while the matched-format runs verify every event.
+
+Incremental timestamp expansion now removes that initial conversion delay. A
+paired background run against `3213fc1` on the same 20M-event scalar FST, using
+an 8 MiB page budget, measured:
+
+| Measurement | Previous | Incremental timestamps |
+| --- | ---: | ---: |
+| First readable waveform | 2.97 s | 0.30 s |
+| Full indexing | 9.08 s | 8.67 s |
+| Peak RSS | 29.6 MiB | 26.7 MiB |
+| Index size | 32.66 MB | 32.66 MB |
+
+Timestamp deltas expand in chunks of at most 8,192 entries, and subsequent
+signals reuse the numeric pages. The decompressed delta buffer remains open
+until the block finishes; both it and the expanded table can spill to disk.
+Raw timestamp data and individual value chains are still decompressed before
+use. Sparse jumps and resume positions require expanding the preceding deltas.
+Existing cache and checkpoint formats remain compatible.
+
+The matched 1.28M-event mixed workload still indexed in roughly 2.6 s at
+27.5 MiB peak RSS, with identical complete waveform digests across VCD, FST,
+baseline/current readers and cached opens. These are individual local runs;
+the startup gain depends on timestamp-table size and signal activity.
 
 Regression coverage includes LZ4, FastLZ and zlib; memory/disk loading; page jumps,
 same-timestamp changes, wide and real values; cancellation and exact checkpoint
@@ -1017,8 +1049,8 @@ For the equivalent FST check, including a single chain large enough to require
 checkpoints within it:
 
 ```bash
-python3 tools/stress_fst_resume.py --events 20000000 --output fst-resume.json
-python3 tools/stress_fst_resume.py --events 20000000 --wrapped --output fst-wrapped-resume.json
+python3 tools/stress_fst_resume.py --events 20000000 --stop-fraction 0.8 --output fst-resume.json
+python3 tools/stress_fst_resume.py --events 20000000 --stop-fraction 0.8 --wrapped --output fst-wrapped-resume.json
 ```
 
 The tool validates event counts and sampled values in fresh processes, with
@@ -1026,6 +1058,12 @@ isolated caches and the production checkpoint cadence. It reports saved events,
 resume position, index size, elapsed/CPU time, and peak RSS. As with the VCD
 benchmark, source generation and validation are outside the timed region, disk
 writes are included, and the OS page cache is not flushed.
+
+With incremental timestamps, a 20M-event run took 8.25 s from scratch.
+Interrupting at 80% preserved 12.36M events, and reopening completed in 4.61 s,
+at about 26 MiB peak RSS. The later interruption allows the normal five-second
+checkpoint to occur; a 60% interruption in a faster run can leave no saved
+events. Check the tool's `saved_events` result when interpreting resume timings.
 
 A local 20M-event scalar FST run before the decoding optimizations above,
 with an 8 MiB page cache, took 16.0 seconds

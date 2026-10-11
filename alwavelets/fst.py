@@ -40,7 +40,7 @@ import struct
 import zlib
 
 from .core import VCDSignal, AliasSignal, split_reference
-from .fst_stream import CHUNK, Cursor, FileSlice, Records, decompress
+from .fst_stream import CHUNK, Cursor, FileSlice, Records, TimeTable, decompress
 from .streaming import check_cancel
 
 # ── small decompressors ─────────────────────────────────────────────
@@ -748,18 +748,9 @@ class FSTReader:
         tsec_start = block_end - 24 - tsec_clen
         if tsec_start < vc_start + 8:
             raise ValueError('Invalid FST time table range')
-        times = self._records(resources=resources)
-        with self._decompress(FileSlice(f, tsec_start, tsec_clen),
-                              'raw' if tsec_clen == tsec_uclen else 'zlib', tsec_uclen) as data:
-            cursor, tv = Cursor(data, self._cancel), 0
-            batch = array.array('Q')
-            for _ in range(tsec_nitems):
-                tv += cursor.varint()
-                batch.append(tv)
-                if len(batch) == CHUNK // 8:
-                    times.extend(batch)
-                    batch = array.array('Q')
-            times.extend(batch)
+        time_data = resources.enter_context(self._decompress(
+            FileSlice(f, tsec_start, tsec_clen), 'raw' if tsec_clen == tsec_uclen else 'zlib', tsec_uclen))
+        times = resources.enter_context(TimeTable(time_data, tsec_nitems, limit=self._limit, cancel=self._cancel))
         f.seek(tsec_start - 8)
         chain_clen = self._read_u64(f)
         chain_pos = tsec_start - 8 - chain_clen
@@ -802,6 +793,10 @@ class FSTReader:
                 self._decode_chain(h, chain, times, beg_time)
             self._save(checkpoint_state(block=self._block_ordinal, handle=h + 1),
                        bpos + bslen * h // self._block_handles)
+        # Chains may use only an early portion of the table, or no timestamps
+        # at all. Validate the remaining deltas before checkpointing this block
+        # as complete; cancellation closes both the delta and numeric spills.
+        times.finish()
 
     def _decode_chain_table(self, btype, chainbuf, end_offset, resources=None):
         """Return (offsets, lengths) indexed by handle (index 0 unused)."""

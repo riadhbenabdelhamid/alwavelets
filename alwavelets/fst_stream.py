@@ -286,6 +286,68 @@ class Cursor:
         raise ValueError('Oversized FST varint')
 
 
+class TimeTable(Sequence):
+    """Expand delta timestamps on demand, retaining bounded pages on disk.
+
+    The caller owns the decompressed delta buffer. This table owns only its
+    numeric records; len() reports the declared count without decoding. Call
+    finish() before accepting a block, including timestamps no chain used.
+    """
+    def __init__(self, data, count, *, limit=1024 * 1024, cancel=None):
+        if not 0 <= count <= len(data):  # Every timestamp uses at least one byte.
+            raise ValueError('Invalid FST timestamp count')
+        self.count, self.cancel = count, cancel
+        self.cursor = Cursor(data, cancel)
+        self.records = Records(limit=limit, cancel=cancel)
+        self.time = 0
+        self.page, self.page_start = (), 0
+
+    def __len__(self):
+        return self.count
+
+    def _ensure(self, stop):
+        decoded = len(self.records)
+        rv, timestamp = self.cursor.varint, self.time
+        while decoded < stop:
+            check_cancel(self.cancel)
+            batch = array.array('Q')
+            for _ in range(min(CHUNK // 8, self.count - decoded)):
+                timestamp += rv()
+                batch.append(timestamp)
+            self.records.extend(batch)
+            decoded += len(batch)
+            self.time = timestamp
+
+    def __getitem__(self, index):
+        if index < 0:
+            index += self.count
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        if not self.page_start <= index < self.page_start + len(self.page):
+            self.page = self.uint64_page(index)
+            self.page_start = index
+        return self.page[index - self.page_start]
+
+    def uint64_page(self, start):
+        if not 0 <= start < self.count:
+            raise IndexError(start)
+        self._ensure(min(self.count, start + CHUNK // 8))
+        return self.records.uint64_page(start)
+
+    def finish(self):
+        self._ensure(self.count)
+
+    def close(self):
+        self.records.close()
+        self.page = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 class Output:
     def __init__(self, buffer, expected, progress_cb=None):
         self.buffer, self.expected = buffer, expected
