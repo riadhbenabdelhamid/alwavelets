@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from alwavelets.fst import FSTReader
-from alwavelets.fst_stream import Buffer, CHUNK, Cursor, HISTORY, Records, decompress
+from alwavelets.fst_stream import Buffer, CHUNK, HISTORY, Records, decompress
 from alwavelets.streaming import OperationCancelled
 from tools.stress_fst import varint
 
@@ -62,25 +62,23 @@ def test_direct_batches_resume_across_timestamp_pages_and_zero_deltas(width, rea
     with Buffer(limit=0) as chain, Records(limit=0) as times:
         chain.write(raw)
         times.extend(array.array('Q', (i * 11 + (1 << 40) for i in range(previous + 1))))
-        reader._chain_state = [Cursor(chain), 0]
+        reader._chain_state = [0, 0]
         batches = reader._chain_batches(1, chain, times)
         actual, consumed = [], 0
         for _ in range(2):
             timestamps, values = next(batches)
             consumed += len(timestamps)
             actual.extend(zip(timestamps, map(chr, values) if width == 1 else values))
-            assert reader._chain_state[0].pos == offsets[consumed]
+            assert reader._chain_state[0] == offsets[consumed]
             assert reader._chain_state[1] == indices[consumed - 1]
         batches.close()
-        # A fresh cursor has no buffered bytes: it must restart at the exact
-        # next event, even when that event repeats the previous timestamp.
-        cursor = Cursor(chain)
-        cursor.pos = offsets[consumed]
-        reader._chain_state = [cursor, indices[consumed - 1]]
+        # A fresh decoder must restart at the exact next event, even when
+        # that event repeats the previous timestamp.
+        reader._chain_state = [offsets[consumed], indices[consumed - 1]]
         for timestamps, values in reader._chain_batches(1, chain, times):
             consumed += len(timestamps)
             actual.extend(zip(timestamps, map(chr, values) if width == 1 else values))
-            assert cursor.pos == offsets[consumed]
+            assert reader._chain_state[0] == offsets[consumed]
             assert reader._chain_state[1] == indices[consumed - 1]
         assert actual == expected
 

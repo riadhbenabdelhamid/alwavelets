@@ -1089,6 +1089,50 @@ maximum distances after history trimming, compare overlapping copies with a
 byte-at-a-time oracle, reject truncated prefixes and incorrect sizes, and check
 cancellation during long length extensions and immediately after a yield.
 
+FST bus batches now size pages by their packed stride plus timestamps and
+allocation slack. A 1,024-bit bus holds up to 240 events per batch instead of
+60 under the previous text estimate. If an uncommon state requires strings,
+the decoder emits the packed prefix first, then uses a smaller text budget
+that also accounts for non-ASCII replacement characters. A checkpoint before
+that split saves the next uncommitted event's position, even if its bytes have
+already been read. Page/event limits, cancellation and optional signal selection
+are preserved; a single value larger than a page remains the size exception.
+Existing indexes and checkpoint formats remain compatible.
+
+Paired local runs against `83917ad`, using LZ4, an 8 MiB page budget, one bus
+and its alias, measured:
+
+| Workload | Full indexing before → after | Pages before → after | Index before → after | Cold-page lookup median before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 1M events, 256-bit counter | 1.80 → 1.65 s | 4,903 → 1,222 | 7.43 → 5.87 MB | 0.061 → 0.085 ms |
+| 1M events, 1,024-bit counter | 2.63 → 2.32 s | 16,668 → 4,171 | 9.80 → 9.17 MB | 0.058 → 0.078 ms |
+| 200k events, 1,024-bit dense | 1.17 → 0.99 s | 3,334 → 834 | 34.28 → 31.40 MB | 0.094 → 0.220 ms |
+
+Every event matched, including X/Z values and aliases. Current peak RSS was
+28.2–28.7 MiB, first waveforms appeared in about 0.28 seconds, and decompression
+spill-write counts were unchanged. Larger pages reduce ingestion overhead but
+increase the work for a cold single-value lookup, especially on dense data;
+the dense run's lookup p95 rose from 0.149 to 0.384 ms. The benchmark performs
+1,000 deterministic random lookups with the decoded-page cache cleared before
+each query; SQLite and OS caches may remain warm. Loading measurements exclude
+generation, conversion, verification and these queries. These individual local
+runs are workload-specific, not universal speedups.
+
+```sh
+python3 tools/stress_fst_chains.py --events 1000000 --width 256 --baseline /path/to/baseline --output batches-256.json
+python3 tools/stress_fst_chains.py --events 1000000 --width 1024 --baseline /path/to/baseline --output batches-1024.json
+python3 tools/stress_fst_chains.py --events 200000 --width 1024 --pattern dense --baseline /path/to/baseline --output batches-dense.json
+```
+
+Regression tests cover packed capacity, fallback memory bounds, oversized
+individual values, cancellation after a packed prefix, exact restart at every
+batch boundary, repeated timestamps, multi-byte deltas and cached reopening.
+
+The separate 1.28M-event mixed scalar/bus/real workload was essentially unchanged
+in indexing time (1.51 → 1.49 s), while its FST index shrank from 6.28 to 6.01 MB.
+VCD loading remained about 2.55 seconds, and cached reopening about 3 ms. Complete
+waveform digests matched across both formats, readers and cached opens.
+
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
 

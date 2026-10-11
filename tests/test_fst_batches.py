@@ -127,7 +127,8 @@ def test_batches_preserve_frames_aliases_deltas_and_extrema(tmp_path, monkeypatc
     def track(self, key, timestamps, values):
         batches.append(len(timestamps))
         assert len(timestamps) <= PAGE_EVENTS
-        assert len(timestamps) * (96 if real else width + 64) <= PAGE_BYTES or width == 1
+        cost = 17 if width == 1 else (96 if real else (width + 3) // 4 + 16)
+        assert len(timestamps) * cost <= PAGE_BYTES
         return original(self, key, timestamps, values)
     monkeypatch.setattr(PageWriter, 'add_batch', track)
     with open_trace(path, use_cache=False, memory_mib=0.1) as trace:

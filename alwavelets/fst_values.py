@@ -53,7 +53,8 @@ class LogicBatch:
             packed = (int.from_bytes(packed, 'big') >> (self.padding * 2)).to_bytes(self.stride, 'big')
         self.data.extend(packed)
 
-    def append_text(self, raw):
+    def append_text(self, raw, *, allow_fallback=True):
+        """Return False, without mutation, if a new text fallback is disallowed."""
         if self.strings is None and not raw.translate(None, b'01xz'):
             self.data.extend(int(raw.translate(_LOGIC_DIGITS), 4).to_bytes(self.stride, 'big'))
             # Unknown/high-impedance values have no numeric extrema.
@@ -61,8 +62,11 @@ class LogicBatch:
                 self._number(int(raw, 2))
         else:
             if self.strings is None:
+                if not allow_fallback:
+                    return False
                 self.strings = list(self)
                 self.data.clear()
             value = raw.decode('ascii', 'replace')
             self.strings.append(value)
             self._number(numeric_value(value))
+        return True

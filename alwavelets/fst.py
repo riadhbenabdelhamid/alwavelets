@@ -785,11 +785,12 @@ class FSTReader:
             size -= start - (vc_start + off)
             data = FileSlice(f, start, size)
             with ChainStream(data, codec if unpacked_size else 'raw', unpacked_size or size, cancel=self._cancel) as chain:
-                cursor, tidx = Cursor(chain, self._cancel), 0
+                position, tidx = 0, 0
                 if resuming and h == first_handle:
-                    cursor.pos, tidx = state['position'], state['time_index']
-                self._chain_state = [cursor, tidx]
-                if cursor.pos > len(chain) or (cursor.pos and tidx >= len(times)):
+                    position, tidx = state['position'], state['time_index']
+                # Published event boundary, independent of decoder lookahead.
+                self._chain_state = [position, tidx]
+                if position > len(chain) or (position and tidx >= len(times)):
                     raise ValueError('Invalid FST checkpoint chain position')
                 self._decode_chain(h, chain, times, beg_time)
                 # A decoder can stop early (or resume at the last byte). The
@@ -884,7 +885,7 @@ class FSTReader:
             if info is None:
                 return
             key = info['hid']
-            previous = self._chain_state[0].pos
+            previous = self._chain_state[0]
             for timestamps, values in self._chain_batches(h, mu, times):
                 self._check()
                 if self._frame0 and not writer.has_values(key):
@@ -895,8 +896,7 @@ class FSTReader:
                 writer.add_batch(key, timestamps, values)
                 writer.publish()
                 if self._checkpoint is not None:
-                    cursor, tidx = self._chain_state
-                    position = cursor.pos
+                    position, tidx = self._chain_state
                     bpos, bslen = self._block_range
                     done = bpos + bslen * ((h - 1) * len(mu) + position) // (self._block_handles * max(1, len(mu)))
                     self._save(checkpoint_state(block=self._block_ordinal, handle=h, position=position, time_index=tidx),
@@ -916,9 +916,15 @@ class FSTReader:
         from .storage import PAGE_BYTES, PAGE_EVENTS
         width, is_real = self._width(h)
         scalar = width == 1 and not is_real
-        count = min(PAGE_EVENTS, max(1, PAGE_BYTES // (17 if scalar else (96 if is_real else width + 64))))
+        # Include timestamps and allocation slack alongside the packed stride.
+        cost = 17 if scalar else (96 if is_real else (width + 3) // 4 + 16)
+        count = min(PAGE_EVENTS, max(1, PAGE_BYTES // cost))
+        # Invalid ASCII is preserved as replacement characters, which can make
+        # a Python string use two bytes per character. Budget that fallback too.
+        text_count = max(1, PAGE_BYTES // (2 * width + 96))
         state = self._chain_state if self._checkpoint is not None else None
-        cursor, tidx = state if state is not None else (Cursor(mu, self._cancel), 0)
+        cursor = Cursor(mu, self._cancel)
+        cursor.pos, tidx = state if state is not None else (0, 0)
         rv, read = cursor.varint, cursor.read
         end, ntimes = len(mu), len(times)
         page, page_start, page_end = (), 0, 0
@@ -931,6 +937,7 @@ class FSTReader:
             for _ in range(count):
                 if cursor.pos >= end:
                     break
+                event_start = cursor.pos
                 vli = rv()
                 if scalar:
                     if vli & 1:
@@ -950,24 +957,35 @@ class FSTReader:
                 if next_tidx >= ntimes:
                     end = cursor.pos
                     break
+                if scalar or is_real:
+                    values.append(value)
+                elif vli & 1:
+                    if not values.append_text(value, allow_fallback=not timestamps):
+                        # Keep a packed prefix packed. The pending text event
+                        # has been read, but is not part of this checkpoint.
+                        if state is not None:
+                            state[:] = event_start, tidx
+                        self._check()
+                        yield timestamps, values
+                        self._check()
+                        timestamps, values = array.array('q'), LogicBatch(width)
+                        values.append_text(value)
+                else:
+                    values.append_binary(value)
                 tidx = next_tidx
                 if not page_start <= tidx < page_end:
                     page_start = tidx
                     page = times.uint64_page(tidx)
                     page_end = tidx + len(page)
                 timestamps.append(page[tidx - page_start])
-                if scalar or is_real:
-                    values.append(value)
-                elif vli & 1:
-                    values.append_text(value)
-                else:
-                    values.append_binary(value)
+                if not scalar and not is_real and values.strings is not None and len(timestamps) >= text_count:
+                    break
             if timestamps:
                 # Publish the cursor only at a complete batch boundary. The
                 # checkpoint records the next byte and last event's time index,
                 # including repeated timestamps and multi-byte time deltas.
                 if state is not None:
-                    state[1] = tidx
+                    state[:] = cursor.pos, tidx
                 self._check()
                 yield timestamps, values
 

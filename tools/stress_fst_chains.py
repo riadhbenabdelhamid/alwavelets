@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 import struct
 import subprocess
@@ -80,6 +81,9 @@ def worker(args):
                       load_s=elapsed, cpu_s=time.process_time() - cpu, peak_rss_mib=peak_rss(),
                       input_bytes=args.source.stat().st_size, index_bytes=Path(trace._store.path).stat().st_size,
                       **stats)
+        pages, page_events = trace._store.db.execute('SELECT count(*),coalesce(sum(n),0) FROM pages').fetchone()
+        result.update(pages=pages, events_per_page=page_events / pages if pages else 0,
+                      summary_rows=trace._store.db.execute('SELECT count(*) FROM summaries').fetchone()[0])
         assert len(trace.signals) == 2 and trace.max_time == args.events - 1
         digest = hashlib.sha256()
         verify_started = time.perf_counter()
@@ -93,6 +97,21 @@ def worker(args):
             assert count == args.events
         result['waveform_sha256'] = digest.hexdigest()
         result['verification_s'] = time.perf_counter() - verify_started
+        # Clear only the decoded-page cache: SQLite and the OS may retain data.
+        # Time value_at itself, excluding expected-value generation and checks.
+        rng, samples = random.Random(0), []
+        for _ in range(1000):
+            tick = rng.randrange(args.events)
+            expected = value_at(tick, args.kind, args.width, args.pattern)
+            trace._store.pages.clear()
+            trace._store.cache_bytes = 0
+            before = time.perf_counter()
+            actual = signal.value_at(tick)
+            samples.append((time.perf_counter() - before) * 1000)
+            assert actual == expected
+        samples.sort()
+        result['cold_page_value_at_ms'] = dict(samples=len(samples), median=samples[len(samples) // 2],
+                                              p95=samples[int(len(samples) * 0.95)])
         return result
 
 
