@@ -193,10 +193,11 @@ waveform pages, counts, and unfinished summaries. Checkpoints follow roughly
 five seconds of indexing or 64 MiB of decoded chain data, checked at completed
 batches; declaration, initial-frame, and final-sort boundaries are saved too.
 Reopening skips completed chains and reuses the declaration catalog. The current
-chain and its timestamp/offset tables are decompressed again, but saved events
-are not decoded or written again. Timestamp expansion rebuilds the prefix needed
-at the saved position and then proceeds on demand. Gzip-wrapped FSTs must also
-be unwrapped again.
+chain rebuilds its decompression history up to the saved byte position, then
+continues streaming; saved events are not decoded or written again. Its
+timestamp/offset tables are decompressed again, and timestamp expansion rebuilds
+the prefix needed at the saved position before proceeding on demand.
+Gzip-wrapped FSTs must also be unwrapped again.
 An interrupted blackout block or final sort is replayed from its preceding
 checkpoint. This reduces repeated work after interruption; it does not remove
 the first-load scan or guarantee a checkpoint during a long decompression step.
@@ -247,10 +248,12 @@ different time ranges per signal while indexing is incomplete.
 
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 pages, **not total process memory**: Python, scopes, display edits, SQLite,
-builder buffers, and active query pages need additional memory. FST chains,
-frames, hierarchies, handle geometry, block/chain indexes, and timestamp tables use bounded buffers that
-spill to temporary files. zlib, LZ4, FastLZ, and outer gzip decompression process
-small chunks and check cancellation. A single declaration name or signal value
+builder buffers, and active query pages need additional memory. FST value chains
+stream through bounded decompression history and read buffers without a separate
+decompressed-chain file. Frames, hierarchies, handle geometry, block/chain indexes,
+and timestamp tables use bounded buffers that spill to temporary files.
+zlib, LZ4, FastLZ, and outer gzip decompression process small chunks and check
+cancellation. A single declaration name or signal value
 can still exceed the working-buffer budget. There is no new native dependency. Disk mode
 trades a slower first scan and disk space for low memory use and quick subsequent
 opens. `--no-cache` still uses temporary disk storage, removed on close.
@@ -562,7 +565,7 @@ whenever an agent is connected and acting.
 | `parsers` | VCD parsing (sync / background / lazy / follow), scope tree, `parse_file` dispatcher |
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
-| `fst_stream` | Bounded FST decompression and temporary storage for blocks and numeric tables |
+| `fst_stream` | Forward FST chain decompression and bounded storage for blocks and numeric tables |
 | `hierarchy`, `scope_store` | Paged scope metadata, compact folds, and virtual browser rows |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
@@ -912,7 +915,7 @@ FST disk decoding now fills event batches directly and reads timestamps from
 bounded 64 KiB numeric pages, avoiding per-event generator yields and general
 record lookups. LZ4/FastLZ output reuses the bounded decompression history to
 combine tiny writes, and short matches copy only the referenced bytes. Large
-blocks and timestamp tables still spill to disk; signal selection stays optional.
+metadata blocks and timestamp tables still spill to disk; signal selection stays optional.
 Existing cache and checkpoint formats are unchanged.
 
 The mixed workload takes about 24% less FST indexing time, reaching roughly VCD
@@ -945,8 +948,8 @@ an 8 MiB page budget, measured:
 Timestamp deltas expand in chunks of at most 8,192 entries, and subsequent
 signals reuse the numeric pages. The decompressed delta buffer remains open
 until the block finishes; both it and the expanded table can spill to disk.
-Raw timestamp data and individual value chains are still decompressed before
-use. Sparse jumps and resume positions require expanding the preceding deltas.
+Raw timestamp data is still decompressed before use. Sparse jumps and resume
+positions require expanding the preceding deltas.
 Existing cache and checkpoint formats remain compatible.
 
 The matched 1.28M-event mixed workload still indexed in roughly 2.6 s at
@@ -958,6 +961,44 @@ Regression coverage includes LZ4, FastLZ and zlib; memory/disk loading; page jum
 same-timestamp changes, wide and real values; cancellation and exact checkpoint
 resume. Decoders before the shared-chain correction in `4f78e81` fail waveform
 verification on these workloads and cannot serve as timing baselines.
+
+Value-chain decompression now also advances on demand, so long bus and real
+histories can publish their first waveform before the entire chain is expanded.
+The same raw, zlib, LZ4 and FastLZ decoders serve both forward chain reads and
+buffered metadata reads. Completed chains must pass tail, size and checksum
+validation before a checkpoint can skip them, including when resumed at the
+last event or when event decoding stops early.
+
+```sh
+python3 tools/stress_fst_chains.py --events 1000000 --baseline /path/to/baseline --output chains-bus.json
+python3 tools/stress_fst_chains.py --events 1000000 --kind real --baseline /path/to/baseline --output chains-real.json
+```
+
+Paired local runs against `5818f66`, with LZ4 compression and an 8 MiB page budget,
+verified every event in a million-event signal and its alias:
+
+| Measurement | 256-bit bus before → after | Real before → after |
+| --- | ---: | ---: |
+| First readable waveform | 0.80 → 0.29 s | 1.39 → 0.29 s |
+| Full indexing | 3.84 → 3.84 s | 2.85 → 2.91 s |
+| Temporary-buffer writes | 54.18 → 8.00 MB | 18.00 → 9.00 MB |
+| Peak RSS | 30.6 → 29.0 MiB | 26.4 → 26.9 MiB |
+
+The largest individual chains were 23.75 MB and 9.00 MB respectively.
+Temporary-buffer writes count bytes passed to decompression/table spill files,
+including their initial buffered prefix; they exclude waveform-index writes and
+do not measure physical storage traffic. Inputs, index sizes and complete
+waveform digests matched. Generation, conversion, verification and terminal
+rendering are outside the timed region.
+
+These single runs show earlier first waveforms and less temporary storage work,
+with roughly unchanged total indexing time. Compression history and unconsumed
+output remain bounded; an individual very wide value can still require a larger
+read. Metadata and timestamp preparation still precede chain decoding, and a
+resume still has to decompress the chain prefix. Signal selection remains
+optional, with existing cache and checkpoint formats unchanged. Regression
+tests cover publication before decompression completes, cancellation, corruption
+after a readable prefix, and exact resume across all supported chain codecs.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:

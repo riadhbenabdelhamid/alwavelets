@@ -40,7 +40,7 @@ import struct
 import zlib
 
 from .core import VCDSignal, AliasSignal, split_reference
-from .fst_stream import CHUNK, Cursor, FileSlice, Records, TimeTable, decompress
+from .fst_stream import CHUNK, ChainStream, Cursor, FileSlice, Records, TimeTable, decompress
 from .streaming import check_cancel
 
 # ── small decompressors ─────────────────────────────────────────────
@@ -783,7 +783,7 @@ class FSTReader:
             start = f.tell()
             size -= start - (vc_start + off)
             data = FileSlice(f, start, size)
-            with self._decompress(data, codec if unpacked_size else 'raw', unpacked_size or size) as chain:
+            with ChainStream(data, codec if unpacked_size else 'raw', unpacked_size or size, cancel=self._cancel) as chain:
                 cursor, tidx = Cursor(chain, self._cancel), 0
                 if resuming and h == first_handle:
                     cursor.pos, tidx = state['position'], state['time_index']
@@ -791,6 +791,10 @@ class FSTReader:
                 if cursor.pos > len(chain) or (cursor.pos and tidx >= len(times)):
                     raise ValueError('Invalid FST checkpoint chain position')
                 self._decode_chain(h, chain, times, beg_time)
+                # A decoder can stop early (or resume at the last byte). The
+                # compressed tail must still pass size/checksum validation
+                # before a checkpoint skips this chain on a later reopen.
+                chain.finish()
             self._save(checkpoint_state(block=self._block_ordinal, handle=h + 1),
                        bpos + bslen * h // self._block_handles)
         # Chains may use only an early portion of the table, or no timestamps

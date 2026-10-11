@@ -349,9 +349,9 @@ class TimeTable(Sequence):
 
 
 class Output:
-    def __init__(self, buffer, expected, progress_cb=None):
-        self.buffer, self.expected = buffer, expected
-        self.progress_cb, self.reported = progress_cb, 0
+    """Bounded compression history, emitting complete chunks to either reader."""
+    def __init__(self, expected, cancel=None):
+        self.expected, self.cancel = expected, cancel
         self.history = bytearray()
         self.size, self.pending = 0, 0
 
@@ -362,116 +362,209 @@ class Output:
         self.history.extend(data)
         self.size += size
         self.pending += size
-        # LZ4/FastLZ often emit just a few bytes per literal or match. Reuse
-        # their bounded history as the write buffer instead of spilling each
-        # tiny piece separately. Never trim bytes that have not been flushed.
-        if self.pending >= CHUNK:
-            self.flush()
+        chunk = self.flush() if self.pending >= CHUNK else None
         if len(self.history) > HISTORY * 2:
             del self.history[:-HISTORY]
+        return chunk
 
     def flush(self):
+        check_cancel(self.cancel)
         if self.pending:
-            self.buffer.write(self.history[-self.pending:])
+            chunk = self.history[-self.pending:]
             self.pending = 0
-        if self.progress_cb is not None and self.size - self.reported >= CHUNK:
-            self.reported = self.size
-            self.progress_cb(self.reported, self.expected)
+            return chunk
+        return None
 
     def match(self, distance, size):
+        # The decoder splits large matches so it can yield and cancel between
+        # chunks. Retaining history across those yields handles overlap too.
         if not 0 < distance <= min(len(self.history), HISTORY):
             raise ValueError('FST compressed block has invalid match distance')
-        while size:
-            count = min(size, CHUNK)
-            start = len(self.history) - distance
-            block = self.history[start:start + min(distance, count)]
-            if count > distance:
-                block = (block * ((count + distance - 1) // distance))[:count]
-            self.write(block)
-            size -= count
+        start = len(self.history) - distance
+        block = self.history[start:start + min(distance, size)]
+        if size > distance:
+            block = (block * ((size + distance - 1) // distance))[:size]
+        return self.write(block)
 
 
-def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=15, progress_cb=None):
-    """Decode to a closeable buffer; working memory is independent of block size."""
-    result = Buffer(limit, cancel)
-    output = Output(result, expected, progress_cb)
-    source = Cursor(data, cancel)
-    try:
-        check_cancel(cancel)
-        if progress_cb is not None:
-            progress_cb(0, expected)
-        if codec == 'raw':
-            while source:
-                output.write(source.read(min(CHUNK, len(data) - source.pos)))
-        elif codec == 'zlib':
-            decoder = zlib.decompressobj(wbits)
-            while source:
-                chunk = source.read(min(CHUNK, len(data) - source.pos))
-                while chunk:
-                    output.write(decoder.decompress(chunk, CHUNK))
-                    if decoder.unused_data:
-                        raise ValueError('Trailing data in compressed FST block')
-                    chunk = decoder.unconsumed_tail
-            if not decoder.eof:
-                raise ValueError('Truncated compressed FST block')
-        elif codec == 'lz4':
-            while source:
-                token = source.byte()
-                literal = token >> 4
-                if literal == 15:
-                    while True:
-                        extra = source.byte()
-                        literal += extra
-                        if extra != 255:
-                            break
-                while literal:
-                    count = min(literal, CHUNK)
-                    output.write(source.read(count))
-                    literal -= count
-                if not source:
-                    break
-                distance = source.byte() | (source.byte() << 8)
-                size = token & 15
-                if size == 15:
+def iter_decompress(data, codec, expected, *, cancel=None, wbits=15):
+    """Yield bounded chunks; exhaust the iterator to validate the entire block."""
+    output, source = Output(expected, cancel), Cursor(data, cancel)
+    check_cancel(cancel)
+    if codec == 'raw':
+        while source:
+            chunk = output.write(source.read(min(CHUNK, len(data) - source.pos)))
+            if chunk:
+                yield chunk
+    elif codec == 'zlib':
+        decoder = zlib.decompressobj(wbits)
+        while source:
+            compressed = source.read(min(CHUNK, len(data) - source.pos))
+            while compressed:
+                chunk = output.write(decoder.decompress(compressed, CHUNK))
+                if decoder.unused_data:
+                    raise ValueError('Trailing data in compressed FST block')
+                if chunk:
+                    yield chunk
+                compressed = decoder.unconsumed_tail
+        if not decoder.eof:
+            raise ValueError('Truncated compressed FST block')
+    elif codec == 'lz4':
+        while source:
+            token = source.byte()
+            literal = token >> 4
+            if literal == 15:
+                while True:
+                    extra = source.byte()
+                    literal += extra
+                    if extra != 255:
+                        break
+            while literal:
+                count = min(literal, CHUNK)
+                chunk = output.write(source.read(count))
+                if chunk:
+                    yield chunk
+                literal -= count
+            if not source:
+                break
+            distance = source.byte() | (source.byte() << 8)
+            size = token & 15
+            if size == 15:
+                while True:
+                    extra = source.byte()
+                    size += extra
+                    if extra != 255:
+                        break
+            size += 4
+            while size:
+                count = min(size, CHUNK)
+                chunk = output.match(distance, count)
+                if chunk:
+                    yield chunk
+                size -= count
+    elif codec == 'fastlz':
+        first = source.byte()
+        level, control = (first >> 5) + 1, first & 31
+        if level not in (1, 2):
+            raise ValueError('Invalid FastLZ level')
+        while True:
+            if control < 32:
+                chunk = output.write(source.read(control + 1))
+                if chunk:
+                    yield chunk
+            else:
+                size, offset = (control >> 5) - 1, (control & 31) << 8
+                if size == 6:
                     while True:
                         extra = source.byte()
                         size += extra
-                        if extra != 255:
+                        if level == 1 or extra != 255:
                             break
-                output.match(distance, size + 4)
-        elif codec == 'fastlz':
-            first = source.byte()
-            level, control = (first >> 5) + 1, first & 31
-            if level not in (1, 2):
-                raise ValueError('Invalid FastLZ level')
-            while True:
-                if control < 32:
-                    output.write(source.read(control + 1))
-                else:
-                    size, offset = (control >> 5) - 1, (control & 31) << 8
-                    if size == 6:
-                        while True:
-                            extra = source.byte()
-                            size += extra
-                            if level == 1 or extra != 255:
-                                break
-                    code = source.byte()
-                    distance = offset + code + 1
-                    if level == 2 and code == 255 and offset == 31 << 8:
-                        distance = (source.byte() << 8 | source.byte()) + 8192
-                    output.match(distance, size + 3)
-                if not source:
-                    break
-                control = source.byte()
-        else:
-            raise ValueError('Unknown FST compression: ' + codec)
-        output.flush()
-        if expected is not None and len(result) != expected:
-            raise ValueError('FST decompressed size mismatch (%d != %d)' % (len(result), expected))
+                code = source.byte()
+                distance = offset + code + 1
+                if level == 2 and code == 255 and offset == 31 << 8:
+                    distance = (source.byte() << 8 | source.byte()) + 8192
+                size += 3
+                while size:
+                    count = min(size, CHUNK)
+                    chunk = output.match(distance, count)
+                    if chunk:
+                        yield chunk
+                    size -= count
+            if not source:
+                break
+            control = source.byte()
+    else:
+        raise ValueError('Unknown FST compression: ' + codec)
+    chunk = output.flush()
+    if chunk:
+        yield chunk
+    if expected is not None and output.size != expected:
+        raise ValueError('FST decompressed size mismatch (%d != %d)' % (output.size, expected))
+    check_cancel(cancel)
+
+
+class ChainStream:
+    """Forward slices of a value chain without materializing its full history.
+
+    Cursor may reread the unconsumed tail of its last chunk or skip forward to
+    a checkpoint. Only that tail and bounded decompressor chunks are retained.
+    A single unusually wide value may request a larger slice. finish() validates
+    any unread tail; close() abandons it when loading is cancelled or fails.
+    """
+    def __init__(self, data, codec, expected, *, cancel=None):
+        if expected < 0:
+            raise ValueError('Invalid FST chain size')
+        self.size, self.cancel = expected, cancel
+        self.chunks = iter_decompress(data, codec, expected, cancel=cancel)
+        self.buffer, self.start = bytearray(), 0
+        self.finished = False
+
+    def __len__(self):
+        return self.size
+
+    def _next(self):
+        check_cancel(self.cancel)
+        chunk = next(self.chunks, None)
+        if chunk is None:
+            self.finished = True
+            return bytearray()
+        return chunk
+
+    def __getitem__(self, key):
+        start, end, step = key.indices(self.size)
+        if step != 1 or start < self.start:
+            raise ValueError('FST chains require forward contiguous reads')
+        if end <= start:
+            return b''
+        # Skip old output without accumulating the prefix on resume.
+        while start > self.start + len(self.buffer) and not self.finished:
+            self.start += len(self.buffer)
+            self.buffer = self._next()
+        del self.buffer[:start - self.start]
+        self.start = start
+        while len(self.buffer) < end - start and not self.finished:
+            self.buffer.extend(self._next())
+        if len(self.buffer) < end - start:
+            raise ValueError('Truncated compressed FST chain')
+        return bytes(self.buffer[:end - start])
+
+    def finish(self):
+        while not self.finished:
+            self._next()
+        self.buffer = bytearray()
+
+    def close(self):
+        self.chunks.close()
+        self.buffer = bytearray()
+        self.finished = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def decompress(data, codec, expected, *, limit=1024 * 1024, cancel=None, wbits=15, progress_cb=None):
+    """Decode to a closeable buffer for callers that need random access."""
+    result = Buffer(limit, cancel)
+    chunks = iter_decompress(data, codec, expected, cancel=cancel, wbits=wbits)
+    try:
         check_cancel(cancel)
+        reported = 0
+        if progress_cb is not None:
+            progress_cb(0, expected)
+        for chunk in chunks:
+            result.write(chunk)
+            if progress_cb is not None and len(result) - reported >= CHUNK:
+                reported = len(result)
+                progress_cb(reported, expected)
         if progress_cb is not None:
             progress_cb(len(result), expected)
         return result
     except BaseException:
         result.close()
         raise
+    finally:
+        chunks.close()
