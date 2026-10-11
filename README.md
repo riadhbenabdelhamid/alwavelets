@@ -1049,6 +1049,46 @@ The separate 1.28M-event mixed scalar/bus/real workload indexed in 2.53 → 2.05
 with 27.4 → 27.3 MiB peak RSS. Cached reopening took about 3 ms, and complete
 waveform digests matched across VCD/FST, both readers and cached opens.
 
+LZ4/FastLZ token decoding now keeps its input cursor, output counters and copy
+history local to the decoder loop. Small literals and matches no longer call
+the general byte cursor and output writer for each operation. Input refills
+remain at most 64 KiB, and long literals, matches and length extensions retain
+bounded work between cancellation checks. Streaming, decompressed-size checks,
+tail validation, cache formats and exact checkpoint positions are preserved.
+No native dependency is added, and signal selection remains optional.
+
+On the same 200,000-event, 1,024-bit counter trace, profiling recorded 10.57M →
+4.52M function calls. Separate, unprofiled runs against `7078534` measured:
+
+| Workload | Codec | Full indexing before → after | CPU before → after |
+| --- | --- | ---: | ---: |
+| 1M counter events | LZ4 | 3.70 → 2.60 s | 3.51 → 2.52 s |
+| 1M counter events | FastLZ | 3.82 → 2.72 s | 3.75 → 2.64 s |
+| 1M counter events | zlib | 2.21 → 2.23 s | 2.13 → 2.17 s |
+| 200k dense events | LZ4 | 1.17 → 1.13 s | 1.10 → 1.06 s |
+| 200k dense events | FastLZ | 1.54 → 1.29 s | 1.46 → 1.21 s |
+| 200k dense events | zlib | 1.23 → 1.23 s | 1.16 → 1.17 s |
+
+All six cases used a 1,024-bit bus, an alias, X/Z events and an 8 MiB page budget.
+Every event matched, and index sizes and decompression spill-write counts stayed
+identical. Current peak RSS ranged from 27.5 to 28.5 MiB, with first waveforms in
+about 0.28 seconds. These single paired runs show larger gains on the counter
+trace than on dense data; zlib remains a largely unchanged control. Generation,
+conversion, complete waveform verification and terminal rendering are excluded
+from indexing times.
+
+```sh
+python3 tools/stress_fst_chains.py --events 1000000 --width 1024 --codec 4 --baseline /path/to/baseline --output decode-lz4.json
+python3 tools/stress_fst_chains.py --events 1000000 --width 1024 --codec F --baseline /path/to/baseline --output decode-fastlz.json
+python3 tools/stress_fst_chains.py --events 1000000 --width 1024 --codec Z --baseline /path/to/baseline --output decode-zlib.json
+```
+
+Use `--events 200000 --pattern dense` for the dense cases. Additional regression
+tests force tiny input windows, cross every token field through refills, exercise
+maximum distances after history trimming, compare overlapping copies with a
+byte-at-a-time oracle, reject truncated prefixes and incorrect sizes, and check
+cancellation during long length extensions and immediately after a yield.
+
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
 

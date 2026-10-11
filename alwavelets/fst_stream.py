@@ -375,22 +375,156 @@ class Output:
             return chunk
         return None
 
-    def match(self, distance, size):
-        # The decoder splits large matches so it can yield and cancel between
-        # chunks. Retaining history across those yields handles overlap too.
-        if not 0 < distance <= min(len(self.history), HISTORY):
+
+def _iter_lz(data, lz4, expected, cancel):
+    """Decode LZ tokens with local cursors and bounded input/output windows.
+
+    Tiny literals and matches stay in this loop; refills and yields perform
+    cancellation checks. Long literals, matches and length extensions still
+    advance in bounded chunks. Both codecs share the overlap-copy rules.
+    """
+    length, offset = len(data), 0
+
+    def refill(consumed, need=1):
+        nonlocal offset
+        check_cancel(cancel)
+        offset += consumed
+        if offset + need > length:
+            raise ValueError('Truncated compressed FST block')
+        block = data[offset:offset + CHUNK]
+        if len(block) < need:
+            raise ValueError('Truncated compressed FST block')
+        return block, len(block), 0
+
+    block, end, pos = b'', 0, 0
+    history = bytearray()
+    history_size = pending = produced = level = 0
+    if not lz4 and not length:
+        raise ValueError('Truncated compressed FST block')
+    while offset + pos < length:
+        if pos == end:
+            block, end, pos = refill(pos)
+        control = block[pos]
+        pos += 1
+        if lz4:
+            literal = control >> 4
+            if literal == 15:
+                while True:
+                    if pos == end:
+                        block, end, pos = refill(pos)
+                    extra = block[pos]
+                    pos += 1
+                    literal += extra
+                    if extra != 255:
+                        break
+        else:
+            if not level:
+                level = (control >> 5) + 1
+                if level not in (1, 2):
+                    raise ValueError('Invalid FastLZ level')
+                control &= 31
+            literal = control + 1 if control < 32 else 0
+        produced += literal
+        if expected is not None and produced > expected:
+            raise ValueError('FST decompressed size exceeds declaration')
+        while literal:
+            count = literal if literal < CHUNK else CHUNK
+            if pos + count > end:
+                block, end, pos = refill(pos, count)
+            history.extend(block[pos:pos + count])
+            pos += count
+            history_size += count
+            pending += count
+            literal -= count
+            if pending >= CHUNK:
+                check_cancel(cancel)
+                yield history[-pending:]
+                check_cancel(cancel)
+                pending = 0
+                if history_size > HISTORY * 2:
+                    del history[:-HISTORY]
+                    history_size = HISTORY
+        if lz4:
+            if offset + pos == length:  # The final LZ4 sequence is literals only.
+                break
+            if pos + 2 > end:
+                block, end, pos = refill(pos, 2)
+            distance = block[pos] | (block[pos + 1] << 8)
+            pos += 2
+            size = control & 15
+            if size == 15:
+                while True:
+                    if pos == end:
+                        block, end, pos = refill(pos)
+                    extra = block[pos]
+                    pos += 1
+                    size += extra
+                    if extra != 255:
+                        break
+            size += 4
+        else:
+            if control < 32:
+                continue
+            size, high = (control >> 5) - 1, (control & 31) << 8
+            if size == 6:
+                while True:
+                    if pos == end:
+                        block, end, pos = refill(pos)
+                    extra = block[pos]
+                    pos += 1
+                    size += extra
+                    if level == 1 or extra != 255:
+                        break
+            if pos == end:
+                block, end, pos = refill(pos)
+            code = block[pos]
+            pos += 1
+            distance = high + code + 1
+            if level == 2 and code == 255 and high == 31 << 8:
+                if pos + 2 > end:
+                    block, end, pos = refill(pos, 2)
+                distance = (block[pos] << 8 | block[pos + 1]) + 8192
+                pos += 2
+            size += 3
+        if distance <= 0 or distance > history_size or distance > HISTORY:
             raise ValueError('FST compressed block has invalid match distance')
-        start = len(self.history) - distance
-        block = self.history[start:start + min(distance, size)]
-        if size > distance:
-            block = (block * ((size + distance - 1) // distance))[:size]
-        return self.write(block)
+        produced += size
+        if expected is not None and produced > expected:
+            raise ValueError('FST decompressed size exceeds declaration')
+        while size:
+            count = size if size < CHUNK else CHUNK
+            start = history_size - distance
+            if count <= distance:
+                history.extend(history[start:start + count])
+            else:
+                pattern = history[start:]
+                history.extend((pattern * ((count + distance - 1) // distance))[:count])
+            history_size += count
+            pending += count
+            size -= count
+            if pending >= CHUNK:
+                check_cancel(cancel)
+                yield history[-pending:]
+                check_cancel(cancel)
+                pending = 0
+                if history_size > HISTORY * 2:
+                    del history[:-HISTORY]
+                    history_size = HISTORY
+    check_cancel(cancel)
+    if pending:
+        yield history[-pending:]
+    if expected is not None and produced != expected:
+        raise ValueError('FST decompressed size mismatch (%d != %d)' % (produced, expected))
+    check_cancel(cancel)
 
 
 def iter_decompress(data, codec, expected, *, cancel=None, wbits=15):
     """Yield bounded chunks; exhaust the iterator to validate the entire block."""
-    output, source = Output(expected, cancel), Cursor(data, cancel)
     check_cancel(cancel)
+    if codec in ('lz4', 'fastlz'):
+        yield from _iter_lz(data, codec == 'lz4', expected, cancel)
+        return
+    output, source = Output(expected, cancel), Cursor(data, cancel)
     if codec == 'raw':
         while source:
             chunk = output.write(source.read(min(CHUNK, len(data) - source.pos)))
@@ -409,71 +543,6 @@ def iter_decompress(data, codec, expected, *, cancel=None, wbits=15):
                 compressed = decoder.unconsumed_tail
         if not decoder.eof:
             raise ValueError('Truncated compressed FST block')
-    elif codec == 'lz4':
-        while source:
-            token = source.byte()
-            literal = token >> 4
-            if literal == 15:
-                while True:
-                    extra = source.byte()
-                    literal += extra
-                    if extra != 255:
-                        break
-            while literal:
-                count = min(literal, CHUNK)
-                chunk = output.write(source.read(count))
-                if chunk:
-                    yield chunk
-                literal -= count
-            if not source:
-                break
-            distance = source.byte() | (source.byte() << 8)
-            size = token & 15
-            if size == 15:
-                while True:
-                    extra = source.byte()
-                    size += extra
-                    if extra != 255:
-                        break
-            size += 4
-            while size:
-                count = min(size, CHUNK)
-                chunk = output.match(distance, count)
-                if chunk:
-                    yield chunk
-                size -= count
-    elif codec == 'fastlz':
-        first = source.byte()
-        level, control = (first >> 5) + 1, first & 31
-        if level not in (1, 2):
-            raise ValueError('Invalid FastLZ level')
-        while True:
-            if control < 32:
-                chunk = output.write(source.read(control + 1))
-                if chunk:
-                    yield chunk
-            else:
-                size, offset = (control >> 5) - 1, (control & 31) << 8
-                if size == 6:
-                    while True:
-                        extra = source.byte()
-                        size += extra
-                        if level == 1 or extra != 255:
-                            break
-                code = source.byte()
-                distance = offset + code + 1
-                if level == 2 and code == 255 and offset == 31 << 8:
-                    distance = (source.byte() << 8 | source.byte()) + 8192
-                size += 3
-                while size:
-                    count = min(size, CHUNK)
-                    chunk = output.match(distance, count)
-                    if chunk:
-                        yield chunk
-                    size -= count
-            if not source:
-                break
-            control = source.byte()
     else:
         raise ValueError('Unknown FST compression: ' + codec)
     chunk = output.flush()
