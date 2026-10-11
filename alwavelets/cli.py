@@ -241,6 +241,14 @@ def _open_native_curses(stdscr, args):
 
 
 def main():
+    """Treat Ctrl-C as an exit request after trace and terminal cleanup."""
+    try:
+        return _main()
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+
+
+def _main():
     parser = argparse.ArgumentParser(
         description='Alwavelets — Terminal Waveform Viewer',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -356,7 +364,7 @@ def main():
             from .streaming import OperationCancelled
             try:
                 curses.wrapper(_open_native_curses, args)
-            except (OperationCancelled, KeyboardInterrupt):
+            except OperationCancelled:
                 print('Opening cancelled.')
             except (OSError, ValueError, sqlite3.Error) as exc:
                 print(f'Error: {exc}', file=sys.stderr)

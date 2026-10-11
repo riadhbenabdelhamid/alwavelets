@@ -419,3 +419,54 @@ def test_cli_native_startup_preserves_layout_options_and_optional_filter(tmp_pat
     monkeypatch.setattr(cli, 'main_curses', viewer)
     cli.main()
     assert len(calls) == 1 and calls[0]._store.closed
+
+
+@pytest.mark.parametrize('options', [['--demo'], ['--sync'], []])
+@pytest.mark.parametrize('error', [KeyboardInterrupt, RuntimeError])
+def test_cli_interrupt_waits_for_trace_and_terminal_cleanup(tmp_path, monkeypatch, capsys, options, error):
+    source = source_file(tmp_path, 'vcd', 3)
+    screen, traces, closed, terminal_cleanup = Screen(), [], [], []
+    monkeypatch.setattr(sys, 'argv', ['alwavelets', str(source), '--storage', 'disk', *options])
+    monkeypatch.setattr(cli, '_demo_path', lambda: str(tmp_path / 'demo.vcd'))
+    original_close = VCDFile.close
+
+    def close(trace):
+        original_close(trace)
+        closed.append(trace)
+
+    def wrapper(callback, *args, **kwargs):
+        try:
+            return callback(screen, *args, **kwargs)
+        finally:
+            terminal_cleanup.append(True)
+
+    def viewer(stdscr, trace, **kwargs):
+        traces.append(trace)
+        raise error()
+
+    monkeypatch.setattr(VCDFile, 'close', close)
+    monkeypatch.setattr(curses, 'wrapper', wrapper)
+    monkeypatch.setattr(cli, 'main_curses', viewer)
+    with pytest.raises(SystemExit if error is KeyboardInterrupt else RuntimeError) as caught:
+        cli.main()
+    if error is KeyboardInterrupt:
+        assert caught.value.code == 130
+    assert terminal_cleanup == [True]
+    assert len(traces) == 1 and traces[0] in closed
+    if getattr(traces[0], '_store', None) is not None:
+        assert traces[0]._store.closed
+    output = capsys.readouterr()
+    assert not output.err and 'Opening cancelled' not in output.out
+
+
+def test_cli_ctrl_c_during_demo_generation_is_a_quiet_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['alwavelets', '--demo'])
+    monkeypatch.setattr(cli, '_demo_path', lambda: str(tmp_path / 'demo.vcd'))
+
+    def interrupt_generation(filename):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, 'generate_demo_vcd', interrupt_generation)
+    with pytest.raises(SystemExit) as caught:
+        cli.main()
+    assert caught.value.code == 130
