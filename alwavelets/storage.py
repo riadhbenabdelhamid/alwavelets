@@ -22,10 +22,11 @@ import time
 import zlib
 
 from .core import VCDSignal, numeric_value, clear_pack_memos
+from .fst_values import LogicBatch
 from .value_stream import ValueState
 
 VERSION = 6  # inline short histories and batched declarations/initial values
-FST_VERSION = 7  # correct one-based dynamic chain alias targets
+FST_VERSION = 8  # packed bus pages at arbitrary widths; can also read version 7
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 SHORT_EVENTS = 8
@@ -254,6 +255,8 @@ def _decode_page(definition, data, count):
     raw = data[1 + count * 8:]
     if data[0] in (1, 2):
         sig._values = bytearray(raw)
+        if data[0] == 2:
+            sig._packed, sig._stride = True, (sig.size + 3) // 4
     else:
         sig._packed = False
         sig._values = json.loads(raw)
@@ -700,7 +703,8 @@ class PageWriter:
 
         The decoder limits batches to PAGE_EVENTS and PAGE_BYTES (except an
         individual wide value), and supplies ordered timestamps and normalized
-        scalar bytes. Arrays belong to the batch and are not mutated afterward.
+        scalar bytes or packed logic batches. Arrays belong to the batch and
+        are not mutated afterward.
         """
         if self.store.cancel.is_set():
             raise Cancelled('Indexing cancelled')
@@ -717,13 +721,25 @@ class PageWriter:
         sig = _signal(_definition(metadata))
         sig._memo = None
         sig._times = timestamps
+        extrema = None
+        if isinstance(values, LogicBatch):
+            if values.width != sig.size or sig._scalar or sig.signal_type in ('real', 'realtime'):
+                raise ValueError('Invalid packed waveform batch')
+            extrema = (values.minimum, values.maximum)
+            if values.strings is None:
+                sig._packed, sig._stride = True, values.stride
+                sig._values = values.data
+                self._write_page(key, sig, written, extrema=extrema)
+                self.changes += len(timestamps)
+                return
+            values = values.strings
         if sig._scalar:
             sig._values = values
         else:
             packed = sig._encode_values(values) if sig._packed else None
             sig._packed = packed is not None
             sig._values = packed if sig._packed else values
-        self._write_page(key, sig, written)
+        self._write_page(key, sig, written, extrema=extrema)
         self.changes += len(timestamps)
 
     def add_initial_values(self, timestamp, values):
@@ -784,16 +800,18 @@ class PageWriter:
         for key, value in large:
             self.add(key, timestamp, value)
 
-    def _write_page(self, key, sig, lo=None):
+    def _write_page(self, key, sig, lo=None, *, extrema=None):
         """Queue immutable pages with bounded memory; ordinals include the queue."""
         if lo is None:
             lo = self._position(key)[0]
         raw = _encode_page(sig)
-        self.pending_pages.append((key, sig, lo, raw))
+        self.pending_pages.append((key, sig, lo, raw, extrema))
         # Include both the encoded payload and the retained signal arrays.
         size = len(raw) + sys.getsizeof(sig._times) + sys.getsizeof(sig._values) + 256
         if type(sig._values) is list:
             size += sum(sys.getsizeof(value) for value in sig._values)
+        if extrema is not None:
+            size += sys.getsizeof(extrema) + sum(sys.getsizeof(value) for value in extrema)
         if key not in self.pending_positions:
             size += 192  # dictionary entry, position tuple and its integers
         self.pending_bytes += size
@@ -806,12 +824,12 @@ class PageWriter:
             return
         store = self.store
         pages, summaries, updates = [], [], {}
-        keys = list(dict.fromkeys(key for key, sig, lo, raw in self.pending_pages
+        keys = list(dict.fromkeys(key for key, sig, lo, raw, extrema in self.pending_pages
                                  if lo and lo + len(sig._times) <= SHORT_EVENTS and len(raw) <= SHORT_BYTES))
         with store.lock:
             shorts = {key: (n, raw) for key, n, raw in store.db.execute(
                 'SELECT sid,short_n,short_data FROM signals WHERE sid IN (' + ','.join('?' for _ in keys) + ')', keys)} if keys else {}
-        for key, sig, lo, page_data in self.pending_pages:
+        for key, sig, lo, page_data, extrema in self.pending_pages:
             if store.cancel.is_set():
                 raise Cancelled('Indexing cancelled')
             raw, n = page_data, len(sig._times)
@@ -838,7 +856,9 @@ class PageWriter:
             # An inline prefix stays in place when a signal grows. Every later
             # page starts at its reserved ordinal, including same-tick events.
             minimum = maximum = None
-            if sig._scalar:
+            if extrema is not None:
+                minimum, maximum = extrema
+            elif sig._scalar:
                 zero, one = 48 in sig._values, 49 in sig._values
                 minimum = 0 if zero else (1 if one else None)
                 maximum = 1 if one else (0 if zero else None)
@@ -1061,7 +1081,9 @@ def _restore(store, source, *, allow_partial=False):
     if row is None:
         return None
     meta = json.loads(row[0])
-    if meta['version'] != _source_version(source) or meta['signature'] != _signature(source):
+    version = _source_version(source)
+    compatible = (7, FST_VERSION) if version == FST_VERSION else (version,)
+    if meta['version'] not in compatible or meta['signature'] != _signature(source):
         return None
     if not meta['complete']:
         if not allow_partial:

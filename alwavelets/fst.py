@@ -41,6 +41,7 @@ import zlib
 
 from .core import VCDSignal, AliasSignal, split_reference
 from .fst_stream import CHUNK, ChainStream, Cursor, FileSlice, Records, TimeTable, decompress
+from .fst_values import LogicBatch
 from .streaming import check_cancel
 
 # ── small decompressors ─────────────────────────────────────────────
@@ -911,7 +912,7 @@ class FSTReader:
                 vl.append(value)
 
     def _chain_batches(self, h, mu, times):
-        """Decode bounded pages; scalar values stay bytes throughout ingestion."""
+        """Decode bounded pages without converting ordinary logic values to text."""
         from .storage import PAGE_BYTES, PAGE_EVENTS
         width, is_real = self._width(h)
         scalar = width == 1 and not is_real
@@ -922,12 +923,11 @@ class FSTReader:
         end, ntimes = len(mu), len(times)
         page, page_start, page_end = (), 0, 0
         nbytes = (width + 7) >> 3
-        packed_format = '0%db' % (nbytes * 8)
         real = struct.Struct(self._real_fmt).unpack
         while cursor.pos < end:
             self._check()
             timestamps = array.array('q')
-            values = bytearray() if scalar else []
+            values = bytearray() if scalar else ([] if is_real else LogicBatch(width))
             for _ in range(count):
                 if cursor.pos >= end:
                     break
@@ -944,9 +944,9 @@ class FSTReader:
                     if is_real:
                         value = repr(real(read(8))[0])
                     elif vli & 1:
-                        value = read(width).decode('ascii', 'replace')
+                        value = read(width)
                     else:
-                        value = format(int.from_bytes(read(nbytes), 'big'), packed_format)[:width]
+                        value = read(nbytes)
                 if next_tidx >= ntimes:
                     end = cursor.pos
                     break
@@ -956,7 +956,12 @@ class FSTReader:
                     page = times.uint64_page(tidx)
                     page_end = tidx + len(page)
                 timestamps.append(page[tidx - page_start])
-                values.append(value)
+                if scalar or is_real:
+                    values.append(value)
+                elif vli & 1:
+                    values.append_text(value)
+                else:
+                    values.append_binary(value)
             if timestamps:
                 # Publish the cursor only at a complete batch boundary. The
                 # checkpoint records the next byte and last event's time index,

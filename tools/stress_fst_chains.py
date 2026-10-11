@@ -19,22 +19,25 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def value_at(tick, kind, width):
+def value_at(tick, kind, width, pattern='counter'):
     if kind == 'real':
         return str(tick / 4 - 2)
     if tick % 17 == 0:
         return ('x' if tick % 34 == 0 else 'z') * width
+    if pattern == 'dense':
+        raw = hashlib.shake_256(struct.pack('<Q', tick)).digest((width + 7) // 8)
+        return format(int.from_bytes(raw, 'big'), f'0{len(raw) * 8}b')[:width]
     return format(tick % (1 << width), f'0{width}b')
 
 
-def create_vcd(path, events, kind, width):
+def create_vcd(path, events, kind, width, pattern='counter'):
     with path.open('w') as output:
         output.write('$timescale 1ns $end\n$scope module top $end\n')
         for name in ('value', 'alias'):
             output.write(f'$var {"real" if kind == "real" else "wire"} {width} ! {name} $end\n')
         output.write('$upscope $end\n$enddefinitions $end\n')
         for tick in range(events):
-            output.write(f'#{tick}\n{"r" if kind == "real" else "b"}{value_at(tick, kind, width)} !\n')
+            output.write(f'#{tick}\n{"r" if kind == "real" else "b"}{value_at(tick, kind, width, pattern)} !\n')
 
 
 def worker(args):
@@ -66,7 +69,7 @@ def worker(args):
         signal = trace.signals[trace.signal_order[0]]
         while trace.is_loading:
             if first_s is None and signal.num_changes():
-                assert signal.value_at(0) == value_at(0, args.kind, args.width)
+                assert signal.value_at(0) == value_at(0, args.kind, args.width, args.pattern)
                 first_s = time.perf_counter() - started
             if time.perf_counter() - started > args.timeout:
                 raise TimeoutError('FST indexing exceeded the time limit')
@@ -79,15 +82,17 @@ def worker(args):
                       **stats)
         assert len(trace.signals) == 2 and trace.max_time == args.events - 1
         digest = hashlib.sha256()
+        verify_started = time.perf_counter()
         for sig in trace.signals.values():
             assert sig.num_changes() == args.events and sig.size == args.width
             count = 0
             for tick, (timestamp, value) in enumerate(sig.iter_changes()):
-                assert timestamp == tick and value == value_at(tick, args.kind, args.width)
+                assert timestamp == tick and value == value_at(tick, args.kind, args.width, args.pattern)
                 digest.update(struct.pack('<Q', timestamp) + value.encode() + b'\0')
                 count += 1
             assert count == args.events
         result['waveform_sha256'] = digest.hexdigest()
+        result['verification_s'] = time.perf_counter() - verify_started
         return result
 
 
@@ -96,6 +101,8 @@ def main():
     parser.add_argument('--events', type=int, default=1000000)
     parser.add_argument('--kind', choices=('bus', 'real'), default='bus')
     parser.add_argument('--width', type=int, default=256)
+    parser.add_argument('--pattern', choices=('counter', 'dense'), default='counter',
+                        help='Counter or deterministic high-entropy bits, both with X/Z values')
     parser.add_argument('--codec', choices=('4', 'F', 'Z'), default='4')
     parser.add_argument('--memory-mib', type=float, default=8)
     parser.add_argument('--timeout', type=float, default=300)
@@ -114,18 +121,19 @@ def main():
     converter = shutil.which('vcd2fst')
     if converter is None:
         parser.error('vcd2fst is required to generate benchmark inputs')
-    result = dict(events=args.events, kind=args.kind, width=args.width, codec=args.codec,
+    result = dict(events=args.events, kind=args.kind, width=args.width, pattern=args.pattern, codec=args.codec,
                   memory_mib=args.memory_mib, repositories={})
     signature = None
     with tempfile.TemporaryDirectory(prefix='alwavelets-chains-') as directory:
         vcd, fst = (Path(directory) / ('trace.' + kind) for kind in ('vcd', 'fst'))
-        create_vcd(vcd, args.events, args.kind, args.width)
+        create_vcd(vcd, args.events, args.kind, args.width, args.pattern)
         subprocess.run([converter, '-' + args.codec, str(vcd), str(fst)], check=True, capture_output=True, timeout=args.timeout)
         repositories = [('baseline', args.baseline)] if args.baseline else []
         for label, repo in repositories + [('current', args.repo)]:
             command = [sys.executable, str(Path(__file__).resolve()), '--source', str(fst),
                        '--repo', str(repo), '--events', str(args.events), '--kind', args.kind,
-                       '--width', str(args.width), '--memory-mib', str(args.memory_mib), '--timeout', str(args.timeout)]
+                       '--width', str(args.width), '--pattern', args.pattern,
+                       '--memory-mib', str(args.memory_mib), '--timeout', str(args.timeout)]
             env = dict(os.environ, ALWAVELETS_CACHE_DIR=str(Path(directory) / label))
             completed = subprocess.run(command, env=env, capture_output=True, text=True, timeout=args.timeout * 2)
             if completed.returncode:

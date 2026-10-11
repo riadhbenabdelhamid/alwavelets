@@ -36,12 +36,16 @@ _S2B = {'0': 48, '1': 49, 'x': 120, 'z': 122, 'X': 120, 'Z': 122}
 # or beats sys.intern (see the memo below). Values that can't pack (chars
 # outside 01xz, or wider than the declared size) permanently de-pack the
 # signal back to string storage via _depack().
+# Disk FST pages also use this encoding for wider buses.
 #
 # Lock-free-read note: a signal can de-pack while the UI thread reads it, so
 # readers never trust _packed — they snapshot _values once and decide how to
 # decode from the snapshot's own type (bytearray = packed, list = strings).
 _T4 = str.maketrans('xzXZ', '2323')
 _B4Q = [''.join('01xz'[(b >> s) & 3] for s in (6, 4, 2, 0)) for b in range(256)]
+# Binary-only quads can decode through native hex parsing and formatting.
+# '?' marks a quad containing X/Z, which still needs the four-state lookup.
+_B4HEX = bytes(ord(format(int(s, 2), 'x')) if not set(s) - {'0', '1'} else 63 for s in _B4Q)
 
 # Encode memo, one dict per stride, shared by the signals of that stride.
 # Keys are x/z-extension-normalized value strings, so they are stride-exact.
@@ -267,7 +271,12 @@ class VCDSignal:
         """Decode packed change `i` from the `vals` snapshot to a full-width
         logic string."""
         o = i * self._stride
-        return ''.join(map(_B4Q.__getitem__, vals[o:o + self._stride]))[-self.size:]
+        raw = vals[o:o + self._stride]
+        if self.size > 64:
+            digits = raw.translate(_B4HEX)
+            if 63 not in digits:
+                return format(int(digits, 16), '0%db' % self.size)[-self.size:]
+        return ''.join(map(_B4Q.__getitem__, raw))[-self.size:]
 
     def _decode_slice(self, vals, lo, hi):
         """Decode packed changes [lo, hi) from the `vals` snapshot to a list

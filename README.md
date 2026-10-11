@@ -175,7 +175,15 @@ The index includes signal/time lookups and a hierarchy of exact min/max
 summaries, so overview scaling need not decode the whole history. Reopening an
 unchanged source opens the signal catalog and fetches declarations and values
 on demand, without reconstructing every signal object.
-Changed sources and older index formats rebuild the index.
+Changed sources and incompatible index formats rebuild the index.
+
+FST disk ingestion keeps ordinary bus values packed through page writing,
+including buses wider than 64 bits, and computes numeric ranges while decoding.
+Uncommon logic characters keep their text representation. Public value reads,
+rendering, and exports still return the same logic strings. New FST indexes use
+version 8; complete and resumable version-7 indexes remain readable, and resuming
+one upgrades its version at the next checkpoint. Older readers rebuild version-8
+indexes. Eager parse caches and VCD indexes retain their existing formats.
 
 VCD disk indexing with caching enabled saves a resumable checkpoint after the
 header, then roughly every five seconds or 64 MiB of input. Reopening after a
@@ -566,6 +574,7 @@ whenever an agent is connected and acting.
 | `value_stream` | Shared incremental value, comment, and dump-state decoding |
 | `fst` | Native FST reader with pure-Python LZ4 and FastLZ block decoders |
 | `fst_stream` | Forward FST chain decompression and bounded storage for blocks and numeric tables |
+| `fst_values` | Packed FST bus batches and numeric ranges, with text fallback for uncommon states |
 | `hierarchy`, `scope_store` | Paged scope metadata, compact folds, and virtual browser rows |
 | `cache` | Persistent on-disk parse cache (instant re-open of unchanged traces) |
 | `storage` | Paged VCD/FST storage, LRU decoding cache, persistent summary hierarchy |
@@ -916,7 +925,7 @@ bounded 64 KiB numeric pages, avoiding per-event generator yields and general
 record lookups. LZ4/FastLZ output reuses the bounded decompression history to
 combine tiny writes, and short matches copy only the referenced bytes. Large
 metadata blocks and timestamp tables still spill to disk; signal selection stays optional.
-Existing cache and checkpoint formats are unchanged.
+That batching change preserved existing cache and checkpoint formats.
 
 The mixed workload takes about 24% less FST indexing time, reaching roughly VCD
 parity. A separate 1.28M-event scalar comparison measured 0.96 → 0.51 s for FST
@@ -996,9 +1005,49 @@ with roughly unchanged total indexing time. Compression history and unconsumed
 output remain bounded; an individual very wide value can still require a larger
 read. Metadata and timestamp preparation still precede chain decoding, and a
 resume still has to decompress the chain prefix. Signal selection remains
-optional, with existing cache and checkpoint formats unchanged. Regression
+optional. Those streaming changes preserved cache and checkpoint formats. Regression
 tests cover publication before decompression completes, cancellation, corruption
 after a readable prefix, and exact resume across all supported chain codecs.
+
+Packed bus ingestion subsequently targets total indexing time. Profiling a
+200,000-event, 1,024-bit counter trace at `b75fedf` attributed roughly 20% of
+indexing time to JSON encoding, numeric conversion and page compression. FST
+bus batches now pass two-bit logic digits directly to the page writer, with
+numeric extrema computed during decoding. This removes the intermediate value
+strings, their JSON encoding for wide buses, and the later summary scan. The
+page reader also uses built-in byte translation and formatting for binary-only
+wide values.
+
+```sh
+python3 tools/stress_fst_chains.py --events 1000000 --width 256 --baseline /path/to/baseline --output packed-256.json
+python3 tools/stress_fst_chains.py --events 1000000 --width 1024 --baseline /path/to/baseline --output packed-1024.json
+python3 tools/stress_fst_chains.py --events 200000 --width 1024 --pattern dense --baseline /path/to/baseline --output packed-dense.json
+```
+
+Paired local runs against `b75fedf` used LZ4 FSTs, an 8 MiB page budget, and one
+bus plus an alias. Both patterns include X/Z events; the dense pattern uses
+deterministic high-entropy bits throughout the bus.
+
+| Workload | Full indexing before → after | CPU before → after | Index before → after | Peak RSS before → after |
+| --- | ---: | ---: | ---: | ---: |
+| 1M events, 256-bit counter | 3.99 → 3.02 s | 3.40 → 2.58 s | 7.43 → 7.43 MB | 30.9 → 27.8 MiB |
+| 1M events, 1,024-bit counter | 6.50 → 3.83 s | 5.77 → 3.35 s | 19.31 → 9.80 MB | 28.2 → 27.8 MiB |
+| 200k events, 1,024-bit dense | 2.53 → 1.17 s | 2.32 → 1.12 s | 50.21 → 34.28 MB | 28.1 → 27.6 MiB |
+
+Every event in the signal and alias matched, with identical waveform digests.
+First values remained available in about 0.3 seconds. Timings exclude generation,
+conversion, verification and terminal rendering. The dense run's separate full
+verification, including reads, expected-value generation and hashing, took
+2.46 → 2.36 seconds. These are individual local runs, not universal speedups.
+Uncommon states fall back to text within a batch, so gains depend on the values
+and widths present. Batch limits remain bounded, except for an individual value
+larger than a page. Regression coverage includes unaligned widths, high bits,
+mixed X/Z and uncommon states, same-tick changes, exact resume, version-7 indexes,
+numeric summaries, rendering and CSV exports. Signal selection remains optional.
+
+The separate 1.28M-event mixed scalar/bus/real workload indexed in 2.53 → 2.05 s,
+with 27.4 → 27.3 MiB peak RSS. Cached reopening took about 3 ms, and complete
+waveform digests matched across VCD/FST, both readers and cached opens.
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,
 16/128-bit bus, and real-valued histories in eight nested scopes with an alias:
