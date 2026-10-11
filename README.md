@@ -272,6 +272,16 @@ Boundary batches use one published history and check cancellation between
 samples. Temporary sample counts scale with screen width; their values and
 labels still require space proportional to signal width.
 
+Pan, zoom, resize and waveform-style changes cancel obsolete background rows
+before the UI reads signal metadata. Scrolling removes pending offscreen rows;
+new versions of a row replace its queued work. Requests use a bounded queue
+that releases cancelled closures immediately, and each drawing pass submits
+its rows before starting new worker jobs. Cancellation belongs to the query,
+so file loading and unrelated readers continue. It is cooperative: an ongoing
+SQLite operation or page decompression must return before it can be observed.
+Large individual values can therefore still delay cancellation. Signal
+selection remains optional and existing indexes need no rebuild.
+
 Pages are evicted from a bounded cache while browsing. The budget covers decoded
 timestamps and values, **not total process memory**: Python, scopes, display edits, SQLite,
 builder buffers, and active query pages need additional memory. A separate cache
@@ -1262,6 +1272,46 @@ optional. These are individual local measurements; terminal output is excluded.
 python3 tools/stress_queries.py --kind scalar --events 50000 --signals 4 --baseline /path/to/baseline --output viewport-scalars.json
 python3 tools/stress_queries.py --events 50000 --signals 4 --expanded-bits 2 --baseline /path/to/baseline --output viewport-bits.json
 python3 tools/stress_queries.py --events 20000 --signals 2 --width 256 --expanded-bits 4 --subcell --baseline /path/to/baseline --output viewport-subcell.json
+```
+
+`tools/stress_navigation.py` measures the viewer itself with a recording
+terminal, including cursor reads, background row requests and applying completed
+results. Each round starts with empty decoded-page caches, issues eight pan/zoom
+changes with a 5 ms pause between drawing passes, then waits for the final
+64-tick viewport. A separate uninterrupted viewport measures rendering cost.
+Generation, indexing, physical terminal I/O and the normal input polling delay
+are excluded. SQLite and OS caches may be warm.
+
+Paired local runs against `cd1cb36` used 50,000 events per signal, 160 waveform
+columns, five rounds and an 8 MiB page-cache budget. Submission time includes
+the navigation action and its immediate drawing pass; completion time starts
+at the final input and ends when its rows and cursor values have been applied:
+
+| Workload | Format | Submission median before → after | Final viewport median before → after | Uninterrupted viewport median before → after |
+| --- | --- | ---: | ---: | ---: |
+| Four 1,024-bit buses + two bits each (12 rows) | VCD | 805 → 1.17 ms | 127 → 30.5 ms | 771 → 838 ms |
+| Four 1,024-bit buses + two bits each (12 rows) | FST | 119 → 1.23 ms | 63.2 → 24.7 ms | 202 → 215 ms |
+| Four scalars | VCD | 2.99 → 0.42 ms | 5.37 → 2.12 ms | 11.1 → 10.8 ms |
+| Four scalars | FST | 3.04 → 0.41 ms | 5.31 → 2.12 ms | 11.3 → 10.8 ms |
+| Four real-valued signals | VCD | 4.70 → 0.62 ms | 10.3 → 6.83 ms | 49.9 → 46.4 ms |
+| Four real-valued signals | FST | 4.97 → 0.59 ms | 11.8 → 6.31 ms | 52.6 → 50.4 ms |
+
+Cancelling obsolete rows and deferring new worker jobs until metadata reads
+finish removes the largest submission stalls. The 12-row submission p95 fell
+from 933 to 1.55 ms for VCD and from 152 to 1.56 ms for FST. This is a navigation
+responsiveness improvement: uninterrupted wide-bus rendering was 6–9% slower
+in these runs. Cooperative checks cannot interrupt an active SQLite operation
+or decompression, and these measurements do not establish a worst-case latency.
+The 12-row run stayed below its page-cache budget with about 40 MiB peak process
+RSS. Final glyphs, attributes, raw labels, analog limits and recording-terminal
+digests matched across repositories and formats. Queue tests separately verify
+that cancelled closures are released immediately and that loading and unrelated
+readers remain usable.
+
+```sh
+python3 tools/stress_navigation.py --signals 4 --expanded-bits 2 --baseline /path/to/baseline --output navigation-bus.json
+python3 tools/stress_navigation.py --kind scalar --signals 4 --baseline /path/to/baseline --output navigation-scalar.json
+python3 tools/stress_navigation.py --kind real --signals 4 --baseline /path/to/baseline --output navigation-real.json
 ```
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,

@@ -14,6 +14,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
+from .streaming import read_cancellation, check_read_cancel
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -475,6 +476,19 @@ class DrawingMixin:
                 except curses.error:
                     pass
 
+    def _prepare_row_window(self):
+        wkey = (self.time_start, self.time_end, self.wave_width, self.line_thickness)
+        if wkey != self._row_cache_window:
+            # Cancel before num_changes/catalog reads can wait behind the old
+            # viewport's page lock. Invalidation itself never touches storage.
+            queries = getattr(self, '_queries', None)
+            if queries is not None:
+                queries.invalidate('rows')
+            self._row_cache_window = wkey
+            self._row_cache.clear()
+            self._row_extras = {}
+        return wkey
+
     def _render_row(self, kind, sig, sig_id, extra=None):
         """Memoized wrapper around the pure per-row render functions.
 
@@ -484,12 +498,7 @@ class DrawingMixin:
         redraw straight from cache instead of re-rendering each row.
         sig.num_changes() in the key invalidates a row when a background
         load / live reload / follow appends new data to that signal."""
-        wkey = (self.time_start, self.time_end, self.wave_width,
-                self.line_thickness)
-        if wkey != self._row_cache_window:
-            self._row_cache_window = wkey
-            self._row_cache.clear()
-            self._row_extras = {}
+        wkey = DrawingMixin._prepare_row_window(self)
         key = (kind, sig_id, sig.num_changes(), extra)
         out = self._row_cache.get(key)
         if out is None:
@@ -515,14 +524,19 @@ class DrawingMixin:
                 k = kind.lstrip('d')
                 blank = ([' '] * ww, [0] * ww)
                 placeholder = (*blank, {}) if k == 'bus' else [blank] * extra if k in ('abraille', 'amulti') else blank
-                def compute_disk():
-                    result = compute()
-                    labels = {col: sig.value_at(int(t0 + col / max(ww, 1) * (t1 - t0)))
-                              for col in result[2]} if k == 'bus' else {}
-                    limits = sig.numeric_range_in_window(t0, t1) if k in ('analog', 'abraille', 'amulti') else None
-                    return result, labels, limits
+                def compute_disk(cancel):
+                    with read_cancellation(cancel):
+                        result = compute()
+                        labels = {}
+                        if k == 'bus':
+                            for col in result[2]:
+                                check_read_cancel()
+                                labels[col] = sig.value_at(int(t0 + col / max(ww, 1) * (t1 - t0)))
+                        limits = sig.numeric_range_in_window(t0, t1) if k in ('analog', 'abraille', 'amulti') else None
+                        return result, labels, limits
                 result, labels, limits = self._queries.request(
-                    'rows', (id(self.vcd), wkey), key, compute_disk, (placeholder, {}, None))
+                    'rows', (id(self.vcd), wkey), key, compute_disk, (placeholder, {}, None),
+                    cancellable=True, replace=(kind.startswith('d'), sig_id))
                 if len(self._row_extras) > 512:
                     self._row_extras.clear()
                 self._row_extras[(kind, sig_id)] = labels, limits
@@ -537,6 +551,17 @@ class DrawingMixin:
         return out
 
     def draw_signals(self):
+        self._prepare_row_window()
+        if getattr(self.vcd, '_store', None) is not None:
+            from .background import BackgroundQueries
+            if not hasattr(self, '_queries'):
+                self._queries = BackgroundQueries()
+            with self._queries.batch():
+                self._draw_signals()
+        else:
+            self._draw_signals()
+
+    def _draw_signals(self):
         start_row = self.wave_top
         # Compute row stride: all non-zero spacing adds at least 1 separator row
         if self.signal_spacing > 0 and self.signal_spacing < 1:
@@ -548,6 +573,10 @@ class DrawingMixin:
         frac_spacing = self.signal_spacing if 0 < self.signal_spacing < 1 else 0
         self._rebuild_view_rows()      # refresh the group overlay (cheap, O(rows))
         visible = self.view_rows[self.sig_offset:self.sig_offset + self.visible_signals]
+        queries = getattr(self, '_queries', None)
+        if queries is not None:
+            visible_ids = set(visible)
+            queries.retain('rows', lambda key: key[1] in visible_ids)
 
         # Ensure data for current view window is loaded (lazy mode)
         if self.vcd._lazy_mode:

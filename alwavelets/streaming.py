@@ -1,5 +1,7 @@
 """Bounded traversal helpers shared by exports and decoders."""
 import heapq
+from contextlib import contextmanager
+from contextvars import ContextVar
 from itertools import chain
 
 from .core import time_bisect_left, time_bisect_right
@@ -12,6 +14,29 @@ class OperationCancelled(ValueError):
 def check_cancel(cancel):
     if cancel is not None and cancel.is_set():
         raise OperationCancelled('Operation cancelled')
+
+
+_read_cancel = ContextVar('wavelet_read_cancel', default=None)
+
+
+@contextmanager
+def read_cancellation(cancel):
+    """Scope a query's cancellation to this worker, across signal view layers.
+
+    This never sets a trace's load/close event. A context also covers aliases
+    and comparison signals backed by a different store, and resets on errors.
+    """
+    token = _read_cancel.set(cancel)
+    try:
+        check_cancel(cancel)
+        yield
+        check_cancel(cancel)
+    finally:
+        _read_cancel.reset(token)
+
+
+def check_read_cancel():
+    check_cancel(_read_cancel.get())
 
 
 def iter_window(sig, start, end, *, baseline=True, cancel=None):

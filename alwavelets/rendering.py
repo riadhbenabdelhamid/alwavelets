@@ -2,6 +2,7 @@
 character/attribute arrays (single-bit, bus, analog). No curses.
 """
 from .core import time_bisect_left, time_bisect_right, VirtualBitSignal, format_typed_value
+from .streaming import check_read_cancel
 
 
 # ══════════════════════════════════════════════════════════════
@@ -73,6 +74,7 @@ def _column_samples(times, value_str, start, end, width, transform=None, lo=0, h
     last_index, value = None, None
     stop = len(times) if hi is None else hi
     for timestamp in boundaries:
+        check_read_cancel()
         index = max(lo, min(stop, time_bisect_left(times, timestamp)))
         if index != last_index:
             value = value_str(index - 1) if index > lo else None
@@ -104,6 +106,7 @@ def _bit_lod_samples(sig, start, end, columns):
 
 def draw_single_bit_culled(sig, t_start, t_end, width):
     """Draw single-bit waveform with window culling and level-of-detail."""
+    check_read_cancel()
     chars = [' '] * width
     attrs = [0] * width
     span = t_end - t_start
@@ -226,6 +229,7 @@ def _pack_subcell(left, right, busy):
 def draw_single_bit_subcell(sig, t_start, t_end, width):
     """Single-bit waveform at 2x horizontal resolution using half/quadrant
     blocks. Same (chars, attrs) contract as draw_single_bit_culled."""
+    check_read_cancel()
     chars = [' '] * width
     attrs = [0] * width
     span = t_end - t_start
@@ -297,6 +301,7 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
 
 def draw_bus_culled(sig, t_start, t_end, width, radix):
     """Draw multi-bit bus waveform with window culling and LOD."""
+    check_read_cancel()
     chars = [' '] * width
     attrs = [0] * width
     labels = {}
@@ -316,6 +321,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
         samples = _column_samples(at, sig.value_str, t_start, t_end, width)
         for col in range(width):
             # Half-open [start, end) float boundaries — see draw_single_bit_culled.
+            check_read_cancel()
             lo = samples[col][0]
             hi, last = samples[col + 1]
             if hi > lo:
@@ -372,6 +378,7 @@ def draw_analog_culled(sig, t_start, t_end, width, height_chars=1):
     Returns (chars, attrs) where each char is a block element.
     Attr codes: 9=cool(low), 8=warm(mid), 7=hot(high)
     """
+    check_read_cancel()
     chars = [' '] * width
     attrs = [0] * width
 
@@ -386,6 +393,7 @@ def draw_analog_culled(sig, t_start, t_end, width, height_chars=1):
 
     prev_level = None
     for col in range(width):
+        check_read_cancel()
         t = t_start + col / scale
         nv = sig.numeric_value_at(t)
         if nv is None:
@@ -427,6 +435,7 @@ def draw_analog_braille(sig, t_start, t_end, width, height):
     continuous curve instead of stacked bars. Same contract as
     draw_analog_multi: a list of `height` (chars, attrs) tuples, top first.
     Pure Unicode (U+2800 block) — needs no graphics protocol."""
+    check_read_cancel()
     height = max(1, height)
     rows = [([' '] * width, [0] * width) for _ in range(height)]
     span = t_end - t_start
@@ -442,6 +451,7 @@ def draw_analog_braille(sig, t_start, t_end, width, height):
     heat = [[0] * width for _ in range(height)]      # attr per cell
     prev_y = None
     for s in range(nsub):
+        check_read_cancel()
         nv = sig.numeric_value_at(t_start + int(s * inv))
         col, sub = s >> 1, s & 1
         if nv is None:                       # x/z: mark the whole column
@@ -476,6 +486,7 @@ def draw_analog_multi(sig, t_start, t_end, width, height):
     """Render an analog signal across `height` character rows (top row = high
     values). Returns a list of `height` (chars, attrs) tuples, top first."""
     rows = [([' '] * width, [0] * width) for _ in range(max(1, height))]
+    check_read_cancel()
     vmin, vmax = sig.numeric_range_in_window(t_start, t_end)
     span = t_end - t_start
     if span <= 0:
@@ -487,6 +498,7 @@ def draw_analog_multi(sig, t_start, t_end, width, height):
 
     for col in range(width):
         t = t_start + col / scale
+        check_read_cancel()
         nv = sig.numeric_value_at(t)
         if nv is None:
             for r in range(height):

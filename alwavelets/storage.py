@@ -24,6 +24,7 @@ import zlib
 from .core import VCDSignal, numeric_value, clear_pack_memos
 from .fst_values import LogicBatch
 from .value_stream import ValueState
+from .streaming import check_read_cancel
 
 VERSION = 6  # inline short histories and batched declarations/initial values
 FST_VERSION = 8  # packed bus pages at arbitrary widths; can also read version 7
@@ -135,6 +136,8 @@ class PageSequence(Sequence):
             page, lo = self.signal.store.page_at(self.signal.key, start, values=self.values)
             stop = min(end - lo, len(page._times))
             for i in range(start - lo, stop):
+                if i % 256 == 0:
+                    check_read_cancel()
                 yield (page._values[i] if self.signal._scalar else page.value_str(i)) if self.values else page._times[i]
             start = lo + stop
 
@@ -357,7 +360,9 @@ class TraceStore:
 
     def value_at(self, key, timestamp):
         """Find the containing page once, without decoding a following page."""
+        check_read_cancel()
         with self.lock:
+            check_read_cancel()
             n = self.counts.get(key, 0)
             if not n:
                 return 'x'
@@ -389,7 +394,9 @@ class TraceStore:
             return page.value_str(index - 1) if index else 'x'
 
     def bisect(self, key, timestamp, right=False, *, values=False):
+        check_read_cancel()
         with self.lock:
+            check_read_cancel()
             n = self.counts.get(key, 0)
             # SQLite binds integers, not Fraction (used by cross-timescale
             # comparisons). Round the lookup bound without losing precision.
@@ -419,7 +426,9 @@ class TraceStore:
             return lo + (bisect.bisect_right if right else bisect.bisect_left)(page._times, timestamp, 0, count)
 
     def page_at(self, key, index, *, values=True):
+        check_read_cancel()
         with self.lock:
+            check_read_cancel()
             hint = self._hint(key)
             if hint is not None and hint[1] <= index < hint[1] + len(hint[0]._times):
                 if values and hint[0]._values is None:
@@ -446,6 +455,7 @@ class TraceStore:
         before retaining values. The lock gives all boundaries one published
         history, and cancellation is checked between boundaries.
         """
+        check_read_cancel()
         with self.lock:
             n = self.counts.get(key, 0)
             stop = n if hi is None else min(n, hi)
@@ -455,6 +465,7 @@ class TraceStore:
             short, short_loaded = None, False
             result, last_index, last_value = [], None, None
             for timestamp in timestamps:
+                check_read_cancel()
                 if self.cancel.is_set():
                     raise Cancelled('Read cancelled')
                 bound = math.ceil(timestamp)
@@ -501,9 +512,11 @@ class TraceStore:
                 last_index, last_value = index, value
             if self.cancel.is_set():
                 raise Cancelled('Read cancelled')
+            check_read_cancel()
             return result
 
     def _page(self, key, pid, lo, count, *, values=True):
+        check_read_cancel()
         cached = self.pages.get(pid)
         if cached is not None and (not values or cached[0]._values is not None):
             self.pages.move_to_end(pid)
@@ -513,6 +526,7 @@ class TraceStore:
             if values:
                 blob = self.db.execute('SELECT data FROM pages WHERE id=?', (pid,)).fetchone()[0]
                 data = zlib.decompress(blob)
+                check_read_cancel()
                 sig = _decode_page(definition, data, count)
                 self.cache_page(pid, sig, data[0])
             else:
@@ -536,6 +550,7 @@ class TraceStore:
         chunk = min(PAGE_BYTES, max(4096, size + 64))
         decoder, data, offset = zlib.decompressobj(), bytearray(), 1
         while len(data) < size:
+            check_read_cancel()
             if self.cancel.is_set():
                 raise Cancelled('Read cancelled')
             row = self.db.execute('SELECT substr(data,?,?) FROM pages WHERE id=?', (offset, chunk, pid)).fetchone()
@@ -598,6 +613,7 @@ class TraceStore:
         low = high = None
         with self.lock:
             while index < stop:
+                check_read_cancel()
                 if self.cancel.is_set():
                     raise Cancelled('Read cancelled')
                 row = self.db.execute('SELECT n,vmin,vmax FROM summaries WHERE sid=? '
@@ -613,7 +629,9 @@ class TraceStore:
                     candidates = (numeric_value(page.value_str(i), sig.signal_type)
                                   for i in range(index - lo, end_index - lo))
                     index = end_index
-                for value in candidates:
+                for i, value in enumerate(candidates):
+                    if i % 256 == 0:
+                        check_read_cancel()
                     if value is not None:
                         low = value if low is None else min(low, value)
                         high = value if high is None else max(high, value)

@@ -424,9 +424,13 @@ class VCDSignal:
         """Get (min, max) numeric values in window for analog scaling.
 
         Values follow the declared signal type, matching numeric_value_at."""
+        from .streaming import check_read_cancel
+        check_read_cancel()
         times, values = self.changes_in_window(t_start, t_end)
         mn = mx = None
-        for raw in values:
+        for i, raw in enumerate(values):
+            if i % 256 == 0:
+                check_read_cancel()
             value = numeric_value(raw, self.signal_type)
             if value is not None:
                 mn = value if mn is None else min(mn, value)

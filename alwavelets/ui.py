@@ -2720,6 +2720,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                     elif self.show_tree:
                         self.draw_tree_browser()
                     else:
+                        self._prepare_row_window()
                         self.draw_header()
                         self.draw_ruler()
                         self.draw_signals()
