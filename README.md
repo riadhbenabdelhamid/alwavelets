@@ -36,7 +36,7 @@ stdlib, original artwork, no third-party assets.
   motions.
 - **Display:** binary / hex / dec / unsigned radixes, analog rendering,
   per-signal color & height, IEEE-754 float decode, scope folding, themes, and
-  sub-cell (2× horizontal resolution) waveforms for even clock periods (`w`),
+  sub-cell (2× horizontal resolution) waveforms for finer clock timing (`w`),
   collapsible signal groups — nestable via `group parent/child` — (fold with
   Tab), and true-color
   themes (`#rrggbb` in theme JSON; quantizes gracefully on 256-color
@@ -79,6 +79,13 @@ palette, guide, scope-separator, and zero-spacing defaults while keeping the
 displayed signals, zoom, cursors, and per-signal settings. `;theme` and `\`
 still change only the palette. `;session` saves the mode and any subsequent
 appearance adjustments for that trace.
+
+Clock edges snap to the nearest terminal column. At zoom levels where a
+half-period spans a fractional number of columns, equal pulses can still
+differ by one column in width. Press `w` to select **Hi-res (sub-cell)** for
+half-column resolution, or zoom in for more detail. Dense activity that cannot
+be resolved is shown with a busy glyph; displayed pulse widths are approximate,
+while cursor time measurements use the trace timestamps.
 
 ## Requirements
 

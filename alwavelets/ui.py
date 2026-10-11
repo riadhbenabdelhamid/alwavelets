@@ -943,13 +943,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
     # ── Zoom / Scroll ──
 
     def time_to_col(self, time):
-        if self.time_end == self.time_start:
-            return 0
-        # Round half-up to match the waveform edge mapping in rendering.py
-        # (draw_*_culled). If this truncated instead, the cursor, ruler ticks and
-        # markers would land one column off the rendered edge at the ~half of
-        # zoom levels where the fractional column is >= 0.5.
-        return int((time - self.time_start) / (self.time_end - self.time_start) * self.wave_width + 0.5)
+        return time_to_column(time, self.time_start, self.time_end, self.wave_width)
 
     def col_to_time(self, col):
         return int(self.time_start + col / max(self.wave_width, 1) * (self.time_end - self.time_start))

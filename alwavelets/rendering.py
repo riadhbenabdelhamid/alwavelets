@@ -1,6 +1,8 @@
 """Waveform rendering — pure functions that turn signal data into
 character/attribute arrays (single-bit, bus, analog). No curses.
 """
+from fractions import Fraction
+
 from .core import time_bisect_left, time_bisect_right, VirtualBitSignal, format_typed_value
 from .streaming import check_read_cancel
 
@@ -60,26 +62,55 @@ def _bit_char(val):
     return ' ', 5
 
 
+def time_to_column(timestamp, start, end, width):
+    """Nearest column, with exact half-up rounding for integer/rational times.
+
+    Multiplying by a float scale can move exact half-column ties left by one
+    cell. Keep the arithmetic exact so periodic edges and cursor marks agree.
+    Columns outside the viewport are left unclipped.
+    """
+    span = end - start
+    if span <= 0:
+        return 0
+    return int((2 * (timestamp - start) * width + span) // (2 * span))
+
+
 def _column_samples(times, value_str, start, end, width, transform=None, lo=0, hi=None):
-    # Adjacent columns share a half-open boundary. Sample each boundary once,
-    # keeping the original float arithmetic so glyphs and labels stay exact.
-    step = (end - start) / width
-    boundaries = [start + i * step for i in range(width + 1)]
+    # Nearest-column bins match time_to_column: [c - 0.5, c + 0.5).
+    # Exact boundaries also preserve tick precision late in a long trace.
+    source = times
+    while hasattr(source, 'source') and getattr(source, 'transform', None) is None:
+        source = source.source
+    if isinstance(start, int) and isinstance(end, int) and getattr(source, 'typecode', None) in ('q', 'Q', 'i', 'I', 'l', 'L'):
+        # Integer tick storage can bisect at ceil(boundary). This avoids
+        # Fraction comparisons per sample on the common large-file path.
+        denominator = 2 * width
+        span = end - start
+        boundaries = [start] + [start + ((2 * i - 1) * span + denominator - 1) // denominator
+                                for i in range(1, width + 1)]
+    else:
+        step = Fraction(end - start) / (2 * width)
+        origin = Fraction(start)
+        boundaries = [origin] + [origin + (2 * i - 1) * step for i in range(1, width + 1)]
     sample = getattr(times, 'sample_boundaries', None)
+    result = None
     if sample is not None:
         result = sample(boundaries, lo, hi, transform)
-        if result is not None:
-            return result
-    result = []
-    last_index, value = None, None
     stop = len(times) if hi is None else hi
-    for timestamp in boundaries:
-        check_read_cancel()
-        index = max(lo, min(stop, time_bisect_left(times, timestamp)))
-        if index != last_index:
-            value = value_str(index - 1) if index > lo else None
-        result.append((index - lo, value))
-        last_index = index
+    if result is None:
+        result = []
+        last_index, value = None, None
+        for timestamp in boundaries:
+            check_read_cancel()
+            index = max(lo, min(stop, time_bisect_left(times, timestamp)))
+            if index != last_index:
+                value = value_str(index - 1) if index > lo else None
+            result.append((index - lo, value))
+            last_index = index
+    # The value at the left endpoint is the baseline, not a visible edge.
+    index = max(lo, min(stop, time_bisect_right(times, start)))
+    if index - lo != result[0][0]:
+        result[0] = (index - lo, value_str(index - 1) if index > lo else None)
     return result
 
 
@@ -119,10 +150,7 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
     if sampled is not None:
         samples, first_val = sampled
         for col in range(width):
-            # Half-open [start, end) float boundaries so every transition
-            # belongs to exactly one column. int() truncation used to overlap
-            # adjacent columns and double-count boundary edges, making a
-            # periodic signal's columns bunch unevenly (e.g. 1,1,1,1,1,4).
+            # Shared half-open bins assign each transition to one column.
             lo, val_before = samples[col]
             hi, last_val = samples[col + 1]
             if lo == 0:
@@ -174,12 +202,8 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
         return chars, attrs
 
     # ── Standard path: iterate transitions (fast when few changes) ──
-    # Round half-up (int(x + 0.5)) rather than Python's round(): round() uses
-    # banker's rounding, so equally-spaced clock edges land inconsistently
-    # (round(4.5)=4 but round(7.5)=8), making periods alternate 1,1,2,2 instead
-    # of a uniform 1,2,1,2. Round-half-up keeps the period width regular.
-    scale = width / span
-    trans = [(min(width - 1, int((t - t_start) * scale + 0.5)), v) for t, v in zip(times, values)]
+    trans = [(time_to_column(t, t_start, t_end, width), v)
+             for t, v in zip(times, values) if t > t_start]
     start_val = sig.value_at(t_start)
     cur = start_val
     ti = 0
@@ -188,12 +212,16 @@ def draw_single_bit_culled(sig, t_start, t_end, width):
     for col in range(width):
         nxt = cur
         edge = False
+        n_trans = 0
         while ti < nt and trans[ti][0] <= col:
             nxt = trans[ti][1]
+            n_trans += 1
             if trans[ti][0] == col and nxt != cur:
                 edge = True
             ti += 1
-        if edge:
+        if n_trans > 1:
+            chars[col], attrs[col] = CH_BUSY, 1
+        elif edge:
             chars[col], attrs[col] = CH_EDGE, 1
         else:
             chars[col], attrs[col] = _bit_char(nxt)
@@ -280,16 +308,16 @@ def draw_single_bit_subcell(sig, t_start, t_end, width):
                 lev[s] = before if lo > 0 else first_val
     else:
         # Standard: map each transition to a sub-column (round half-up).
-        scale = n / span
-        tcols = [min(n - 1, int((t - t_start) * scale + 0.5)) for t in times]
+        trans = [(time_to_column(t, t_start, t_end, n), v)
+                 for t, v in zip(times, values) if t > t_start]
         cur = sig.value_at(t_start)
-        ti, nt, prev_col = 0, len(tcols), -1
+        ti, nt, prev_col = 0, len(trans), -1
         for s in range(n):
-            while ti < nt and tcols[ti] <= s:
-                if tcols[ti] == s and prev_col == s:
+            while ti < nt and trans[ti][0] <= s:
+                if trans[ti][0] == s and prev_col == s:
                     busy[s] = True     # two edges collapsed into one sub-column
-                cur = values[ti]
-                prev_col = tcols[ti]
+                cur = trans[ti][1]
+                prev_col = trans[ti][0]
                 ti += 1
             lev[s] = cur
 
@@ -320,7 +348,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
         labels[0] = format_typed_value(sig, prev, radix)
         samples = _column_samples(at, sig.value_str, t_start, t_end, width)
         for col in range(width):
-            # Half-open [start, end) float boundaries — see draw_single_bit_culled.
+            # Shared half-open bins — see draw_single_bit_culled.
             check_read_cancel()
             lo = samples[col][0]
             hi, last = samples[col + 1]
@@ -344,9 +372,8 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
 
     # ── Standard path ──
     times, values = sig.changes_in_window(t_start, t_end)
-    scale = width / span
-    # Round half-up for consistent column spacing (see draw_single_bit_culled).
-    trans = [(min(width - 1, int((t - t_start) * scale + 0.5)), v) for t, v in zip(times, values)]
+    trans = [(time_to_column(t, t_start, t_end, width), v)
+             for t, v in zip(times, values) if t > t_start]
     start_val = sig.value_at(t_start)
     labels[0] = format_typed_value(sig, start_val, radix)
     cur = start_val
@@ -354,11 +381,13 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
 
     for col in range(width):
         nxt = cur; edge = False
+        n_trans = 0
         while ti < nt and trans[ti][0] <= col:
             nxt = trans[ti][1]
+            n_trans += 1
             if trans[ti][0] == col and nxt != cur: edge = True
             ti += 1
-        if edge:
+        if edge or n_trans > 1:
             chars[col], attrs[col] = CH_BUS_T, 1
             if col + 1 < width:
                 labels[col + 1] = format_typed_value(sig, nxt, radix)

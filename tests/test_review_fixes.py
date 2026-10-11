@@ -7,6 +7,8 @@ one fails here rather than in a user's terminal.
 import json
 import types
 
+import pytest
+
 
 def _viewer(w, order=("a", "b", "c", "d")):
     """Headless stub with the real list-mutation + group machinery bound on."""
@@ -245,16 +247,22 @@ def test_restore_roundtrips_fractional_spacing(w, tmp_path):
 
 # ── CLI flags must win over a saved session ──
 
-def test_layout_flags_disable_session_restore(w):
-    import inspect
-    from alwavelets import cli
-    src = inspect.getsource(cli.main)
-    assert "--no-session" in inspect.getsource(cli.main.__wrapped__) \
-        if hasattr(cli.main, "__wrapped__") else True
-    # use_session is computed from the layout flags and passed through
-    assert "use_session" in src
-    assert "args.no_session or expanded or load_unchecked" in src
-    assert "use_session" in inspect.signature(cli.main_curses).parameters
+@pytest.mark.parametrize('flag', [None, '--expanded', '--loadunchecked', '--no-session'])
+def test_layout_flags_disable_session_restore(tmp_path, monkeypatch, flag):
+    import sys
+    from alwavelets import cache, cli
+    from conftest import make_vcd
+    path = make_vcd(tmp_path / 'layout.vcd', n_steps=2)
+    monkeypatch.setattr(cache, 'ENABLED', True)
+    monkeypatch.setattr(sys, 'argv', ['alwavelets', str(path), '--sync', '--no-cache']
+                        + ([flag] if flag else []))
+    launches = []
+    monkeypatch.setattr(cli.curses, 'wrapper', lambda func, trace, **kwargs: launches.append(kwargs))
+    cli.main()
+    assert len(launches) == 1
+    assert launches[0]['use_session'] is (flag is None)
+    assert launches[0]['start_collapsed'] is (flag != '--expanded')
+    assert launches[0]['load_unchecked'] is (flag == '--loadunchecked')
 
 
 # ── live reload must not serve the previous run's rows ──

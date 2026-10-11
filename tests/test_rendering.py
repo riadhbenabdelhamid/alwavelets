@@ -1,6 +1,14 @@
 """Tests for the pure waveform-rendering functions. These return character /
 attribute arrays (and bus labels) without touching curses, so they're directly
 testable — and they're the core of what the viewer draws."""
+from fractions import Fraction
+from types import SimpleNamespace
+
+import pytest
+
+from alwavelets import rendering
+from alwavelets.core import Radix, TimeScaledSignal, VCDSignal
+from alwavelets.ui import Alwavelets
 
 
 def _sig(w, size, changes):
@@ -8,6 +16,75 @@ def _sig(w, size, changes):
     for t, v in changes:
         s.add_change(t, v)
     return s
+
+
+def _clock_frame(kind, offset=0, start=0, end=100, width=70, ratio=1):
+    sig = VCDSignal('clk', '!', 2 if kind == 'bus' else 1)
+    for t in range(0, 305, 5):
+        sig.add_change(offset + t, format((t // 5) % 2, f'0{sig.size}b'))
+    if ratio != 1:
+        sig = TimeScaledSignal(sig, ratio)
+    draw = {'bit': rendering.draw_single_bit_culled,
+            'sub': rendering.draw_single_bit_subcell,
+            'bus': rendering.draw_bus_culled}[kind]
+    args = (Radix.HEX,) if kind == 'bus' else ()
+    return draw(sig, (offset + start) * ratio, (offset + end) * ratio, width, *args)
+
+
+@pytest.mark.parametrize('kind', ['bit', 'sub', 'bus'])
+def test_clock_periods_stay_uniform_at_half_column_ties(kind):
+    # Ten ticks occupy exactly seven columns (sub-columns in hi-res mode).
+    # Float scaling used to shift t=45 and t=85 left, creating 6/8-wide periods.
+    width = 35 if kind == 'sub' else 70
+    chars = _clock_frame(kind, width=width)[0]
+    if kind == 'sub':
+        unpack = {rendering.SUB_HH: '11', rendering.SUB_LL: '00',
+                  rendering.SUB_HL: '10', rendering.SUB_LH: '01'}
+        levels = ''.join(unpack[ch] for ch in chars)
+        edges = [i for i in range(1, len(levels)) if levels[i] != levels[i - 1]]
+    else:
+        glyph = rendering.CH_BUS_T if kind == 'bus' else rendering.CH_EDGE
+        edges = [i for i, ch in enumerate(chars) if ch == glyph]
+    assert edges == [4, 7, 11, 14, 18, 21, 25, 28, 32, 35, 39, 42, 46, 49, 53, 56, 60, 63, 67]
+    assert {b - a for a, b in zip(edges, edges[2:])} == {7}
+    viewer = SimpleNamespace(time_start=0, time_end=100, wave_width=70)
+    assert [Alwavelets.time_to_col(viewer, t) for t in range(5, 100, 5)] == edges
+
+
+@pytest.mark.parametrize('kind', ['bit', 'sub', 'bus'])
+@pytest.mark.parametrize('width', [21, 35, 41, 70, 82])
+def test_dense_and_detailed_clock_rendering_agree(monkeypatch, kind, width):
+    frames = [_clock_frame(kind, start=start, end=start + 100, width=width)
+              for start in (0, 1, 3, 5)]
+    # Changing the LOD choice alone must not shift edges or change duty cycle.
+    monkeypatch.setattr(VCDSignal, 'transition_count_in_window', lambda *args: 10000)
+    assert frames == [_clock_frame(kind, start=start, end=start + 100, width=width)
+                      for start in (0, 1, 3, 5)]
+
+
+@pytest.mark.parametrize('kind', ['bit', 'sub', 'bus'])
+@pytest.mark.parametrize('width', [13, 20, 21, 35, 70])
+def test_clock_shape_is_independent_of_time_origin_and_units(kind, width):
+    expected = _clock_frame(kind, start=1, end=101, width=width)
+    for offset in (0, (1 << 53) + 3):
+        for ratio in (1, Fraction(2, 3)):
+            assert _clock_frame(kind, offset=offset, start=1, end=101,
+                                width=width, ratio=ratio) == expected
+
+
+@pytest.mark.parametrize('kind', ['bit', 'sub', 'bus'])
+def test_clock_window_end_does_not_create_a_last_column_edge(kind):
+    # The next edge lies at column 20, just outside this viewport.
+    frame = _clock_frame(kind, end=5, width=20)
+    glyph = {'bit': rendering.CH_LOW, 'sub': rendering.SUB_LL,
+             'bus': rendering.CH_BUS_H}[kind]
+    assert frame[0] == [glyph] * 20
+
+
+def test_sparse_collapsed_pulse_is_busy(w):
+    sig = _sig(w, 1, [(0, '0'), (40, '1'), (41, '0')])
+    chars, _ = rendering.draw_single_bit_culled(sig, 0, 100, 20)
+    assert chars[8] == rendering.CH_BUSY
 
 
 # ── single-bit ───────────────────────────────────────────────────────

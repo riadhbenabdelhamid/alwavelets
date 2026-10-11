@@ -295,6 +295,8 @@ class AlwaveletsManual:
             "    H           Cycle signal height (1-4 rows, for detail)",
             "    v           Cycle per-signal color",
             "    w           Wave style: ultra-thin / thin / hi-res (sub-cell)",
+            "                Hi-res gives clock edges half-column resolution.",
+            "                Fractional widths still round to the display grid.",
             "                Hi-res also draws multi-row analog signals as a",
             "                braille curve (2x4 sub-pixels per cell) instead",
             "                of block columns — try it on the demo's adc.",
