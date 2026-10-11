@@ -39,6 +39,8 @@ def worker(args):
     def clear_pages(store):
         store.pages.clear()
         store.cache_bytes = 0
+        if hasattr(store, 'clear_samples'):
+            store.clear_samples()
 
     kind = 'real' if args.kind == 'real' else 'bus'
     started = time.perf_counter()
@@ -108,7 +110,9 @@ def worker(args):
                     frames.update(json.dumps(frame, sort_keys=True).encode() + b'\n')
         queries['pan_zoom'] = dict(summary(samples), **page_counts(reads, timestamps))
         result.update(queries=queries, frames_sha256=frames.hexdigest(), peak_rss_mib=peak_rss(),
-                      page_cache_peak_bytes=store.peak_cache_bytes, rendered_rows=len(rows))
+                      page_cache_peak_bytes=store.peak_cache_bytes, rendered_rows=len(rows),
+                      sample_cache_peak_bytes=getattr(store, 'peak_sample_cache_bytes', 0),
+                      sample_cache_hits=getattr(store, 'sample_cache_hits', 0))
         assert store.peak_cache_bytes <= store.memory_bytes
         return result
 

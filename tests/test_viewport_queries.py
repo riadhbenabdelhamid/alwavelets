@@ -16,7 +16,8 @@ from test_writer_metadata import writer_for
 
 @pytest.mark.parametrize('encoding,width', [('scalar', 1), ('text', 7), ('packed', 1025), ('real', 64)])
 @pytest.mark.parametrize('inline', [False, True])
-def test_boundary_samples_match_bisection_and_preceding_values(tmp_path, monkeypatch, encoding, width, inline):
+@pytest.mark.parametrize('right', [False, True])
+def test_boundary_samples_match_bisection_and_preceding_values(tmp_path, monkeypatch, encoding, width, inline, right):
     monkeypatch.setattr(storage, 'SHORT_EVENTS', 8 if inline else 0)
     trace = VCDFile()
     trace.signals['0'] = VCDSignal('value', '0', width, 'real' if encoding == 'real' else 'wire')
@@ -43,10 +44,13 @@ def test_boundary_samples_match_bisection_and_preceding_values(tmp_path, monkeyp
             for queries in (boundaries, boundaries[::-1]):
                 want = []
                 for time in queries:
-                    index = bisect.bisect_left(times[begin:end], time)
+                    index = (bisect.bisect_right if right else bisect.bisect_left)(times[begin:end], time)
                     want.append((index, values[begin + index - 1] if index else None))
-                assert view.sample_boundaries(queries) == want
-                assert view.sample_boundaries(queries, transform=len) == [
+                def sample(transform=None):
+                    return (store.sample_boundaries('0', queries, begin, end, transform, right=True)
+                            if right else view.sample_boundaries(queries, transform=transform))
+                assert sample() == want
+                assert sample(len) == [
                     (index, len(value) if value is not None else None) for index, value in want]
                 assert store.cache_bytes <= store.memory_bytes
         # Nested contiguous views preserve relative ordinals.

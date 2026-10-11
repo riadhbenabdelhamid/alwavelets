@@ -420,6 +420,15 @@ class VCDSignal:
         decimal notation; logic vectors use unsigned binary."""
         return numeric_value(self.value_at(time), self.signal_type)
 
+    def values_at(self, timestamps):
+        """Raw values at query times, preserving order and exact-time deltas."""
+        from .streaming import check_read_cancel
+        values = []
+        for timestamp in timestamps:
+            check_read_cancel()
+            values.append(self.value_at(timestamp))
+        return values
+
     def numeric_range_in_window(self, t_start, t_end):
         """Get (min, max) numeric values in window for analog scaling.
 
@@ -580,6 +589,9 @@ class AliasSignal(VCDSignal):
     def numeric_range_in_window(self, start, end):
         return self.master.numeric_range_in_window(start, end)
 
+    def values_at(self, timestamps):
+        return self.master.values_at(timestamps)
+
 
 class Radix(Enum):
     BIN = "bin"
@@ -605,6 +617,7 @@ class TimeScaledSignal(AliasSignal):
     changes_in_window = VCDSignal.changes_in_window
     iter_changes = VCDSignal.iter_changes
     numeric_range_in_window = VCDSignal.numeric_range_in_window
+    values_at = VCDSignal.values_at
 
 
 class Marker:
@@ -647,6 +660,8 @@ class VirtualBitSignal:
     def value_at(self, time):
         val = self.parent.value_at(time)
         return self._extract_bit(val)
+
+    values_at = VCDSignal.values_at
 
     def _extract_bit(self, val):
         if val in ('x', 'z'):

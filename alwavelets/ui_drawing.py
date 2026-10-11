@@ -14,7 +14,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
-from .streaming import read_cancellation, check_read_cancel
+from .streaming import read_cancellation
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -503,7 +503,7 @@ class DrawingMixin:
         out = self._row_cache.get(key)
         if out is None:
             t0, t1, ww = self.time_start, self.time_end, self.wave_width
-            def compute():
+            def compute(limits=None):
                 k = kind[1:] if kind.startswith('d') else kind   # diff-row kinds
                 if k == 'bit':
                     return draw_single_bit_culled(sig, t0, t1, ww)
@@ -512,11 +512,11 @@ class DrawingMixin:
                 elif k == 'bus':
                     return draw_bus_culled(sig, t0, t1, ww, extra)
                 elif k == 'analog':
-                    return draw_analog_culled(sig, t0, t1, ww)
+                    return draw_analog_culled(sig, t0, t1, ww, limits=limits)
                 elif k == 'abraille':                     # hi-res analog (w style)
-                    return draw_analog_braille(sig, t0, t1, ww, extra)
+                    return draw_analog_braille(sig, t0, t1, ww, extra, limits=limits)
                 else:                                     # 'amulti'
-                    return draw_analog_multi(sig, t0, t1, ww, extra)
+                    return draw_analog_multi(sig, t0, t1, ww, extra, limits=limits)
             if getattr(self.vcd, '_store', None) is not None:
                 from .background import BackgroundQueries
                 if not hasattr(self, '_queries'):
@@ -526,13 +526,13 @@ class DrawingMixin:
                 placeholder = (*blank, {}) if k == 'bus' else [blank] * extra if k in ('abraille', 'amulti') else blank
                 def compute_disk(cancel):
                     with read_cancellation(cancel):
-                        result = compute()
+                        limits = sig.numeric_range_in_window(t0, t1) if k in ('analog', 'abraille', 'amulti') else None
+                        result = compute(limits)
                         labels = {}
                         if k == 'bus':
-                            for col in result[2]:
-                                check_read_cancel()
-                                labels[col] = sig.value_at(int(t0 + col / max(ww, 1) * (t1 - t0)))
-                        limits = sig.numeric_range_in_window(t0, t1) if k in ('analog', 'abraille', 'amulti') else None
+                            columns = result[2]
+                            labels = dict(zip(columns, sig.values_at(int(t0 + col / max(ww, 1) * (t1 - t0))
+                                                                     for col in columns)))
                         return result, labels, limits
                 result, labels, limits = self._queries.request(
                     'rows', (id(self.vcd), wkey), key, compute_disk, (placeholder, {}, None),

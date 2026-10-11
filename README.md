@@ -272,6 +272,17 @@ Boundary batches use one published history and check cancellation between
 samples. Temporary sample counts scale with screen width; their values and
 labels still require space proportional to signal width.
 
+Related rows share raw boundary samples through a separate cache capped at the
+smaller of **1 MiB per trace** or **one-eighth of the decoded-page budget**.
+It retains timestamps, ordinals and raw values, including an allowance for
+entry overhead; it retains no decoded pages. Values too large for an entry are
+not cached. A publication or reorder changes the trace generation, invalidating
+these samples before the next batch reads them. Left boundaries used for
+waveform edges and inclusive point samples used for bus labels remain distinct,
+so exact-time delta events keep their existing meaning. Bus labels are read in
+one batch, and analog rows reuse their scaling range for the displayed limits.
+The page-cache budget is unchanged; the sample cache is additional bounded memory.
+
 Pan, zoom, resize and waveform-style changes cancel obsolete background rows
 before the UI reads signal metadata. Scrolling removes pending offscreen rows;
 new versions of a row replace its queued work. Requests use a bounded queue
@@ -1312,6 +1323,41 @@ readers remain usable.
 python3 tools/stress_navigation.py --signals 4 --expanded-bits 2 --baseline /path/to/baseline --output navigation-bus.json
 python3 tools/stress_navigation.py --kind scalar --signals 4 --baseline /path/to/baseline --output navigation-scalar.json
 python3 tools/stress_navigation.py --kind real --signals 4 --baseline /path/to/baseline --output navigation-real.json
+```
+
+Shared samples and batched label reads were compared separately with `df82e0d`.
+The navigation benchmark now checks both the uninterrupted wide viewport and
+the final zoomed viewport, clears page and sample caches between rounds, and
+reports decoded pages separately for uninterrupted renders and navigation bursts.
+Five-round local runs with the same 160 columns and 8 MiB page budget measured:
+
+| Workload | Format | Uninterrupted viewport median before → after | Pages decoded across five uninterrupted viewports before → after |
+| --- | --- | ---: | ---: |
+| Four 1,024-bit buses + two bits each, 50k events each (12 rows) | VCD | 829 → 388 ms | 12,280 → 6,180 |
+| Four 1,024-bit buses + two bits each, 50k events each (12 rows) | FST | 219 → 152 ms | 2,140 → 2,140 |
+| Two 256-bit buses + four subcell bits each, 20k events each (10 rows) | VCD | 75.4 → 52.9 ms | 520 → 520 |
+| Two 256-bit buses + four subcell bits each, 20k events each (10 rows) | FST | 49.7 → 29.4 ms | 150 → 150 |
+| Four scalars, 50k events each | VCD | 11.5 → 11.9 ms | 200 → 200 |
+| Four scalars, 50k events each | FST | 11.0 → 11.1 ms | 200 → 200 |
+| Four real-valued signals, 50k events each | VCD | 46.3 → 45.8 ms | 635 → 620 |
+| Four real-valued signals, 50k events each | FST | 57.2 → 48.7 ms | 780 → 780 |
+
+Sharing raw samples saves value extraction and searches even when decoded pages
+already fit in the page cache. VCD's 12-row workload also avoided many repeated
+page decodes. Median submission latency stayed around 1.2 ms for that workload;
+its final viewport completed in 33.6 → 19.0 ms for VCD and 26.2 → 17.6 ms for
+FST. Raw samples stayed below 1 MiB, decoded pages stayed within 8 MiB, and peak
+process RSS was about 40 MiB. Scalars saw little change; analog gains were
+smaller and varied between formats. Navigation bursts can decode more pages
+when a faster worker reaches more rows before cancellation, so their page counts
+are reported separately. These are individual local measurements, with imports,
+indexing, terminal I/O and the normal input polling delay excluded. Stable and
+final glyphs, attributes, labels and analog limits matched across both formats
+and repositories. Signal selection remains optional and index formats are unchanged.
+
+```sh
+python3 tools/stress_navigation.py --signals 4 --expanded-bits 2 --baseline /path/to/df82e0d --output shared-bus.json
+python3 tools/stress_navigation.py --events 20000 --signals 2 --width 256 --expanded-bits 4 --subcell --baseline /path/to/df82e0d --output shared-subcell.json
 ```
 
 Cold VCD ingestion checks cover a million declarations and mixed scalar,

@@ -42,6 +42,8 @@ def worker(args):
     screen.refresh = lambda: None
     with open_trace(args.source, use_cache=False, memory_mib=args.memory_mib) as trace:
         viewer = Alwavelets(screen, trace)
+        if args.subcell:
+            viewer.line_thickness = 2
         signals = list(trace.signal_order)[:args.signals]
         order = []
         for sid in signals:
@@ -58,6 +60,7 @@ def worker(args):
         submits, latest, stable, bursts = [], [], [], []
         frames = hashlib.sha256()
         overlapping, peak_queue = 0, 0
+        stable_pages = burst_pages = 0
 
         def paint():
             screen.erase()
@@ -89,19 +92,38 @@ def worker(args):
             store.pages.clear()
             store.page_hints.clear()
             store.cache_bytes = 0
+            if hasattr(store, 'clear_samples'):
+                store.clear_samples()
             viewer.time_start = args.events // 8
             viewer.time_end = viewer.time_start + args.events // 2
             viewer.cursor_a = (viewer.time_start + viewer.time_end) // 2
+
+        def record_frame():
+            queries = viewer._queries
+            window = (viewer.time_start, viewer.time_end, viewer.wave_width, viewer.line_thickness)
+            assert all(token[1][1] == window for token in queries.ready if token[0] == 'rows')
+            assert sum(token[0] == 'rows' for token in queries.ready) == len(order)
+            frames.update(json.dumps(sorted(screen.lines.items())).encode())
+            for sid in order:
+                rows = [(token[2][0], value) for token, value in queries.ready.items()
+                        if token[0] == 'rows' and token[2][1] == sid]
+                frames.update(json.dumps(rows, sort_keys=True).encode())
+                extras = [value for (kind, key), value in viewer._row_extras.items() if key == sid]
+                frames.update(json.dumps(extras, sort_keys=True).encode())
 
         reads = store.page_reads
         try:
             for _ in range(args.rounds):
                 reset()
+                before_pages = store.page_reads
                 started = time.perf_counter()
                 paint()
                 finish()
                 stable.append((time.perf_counter() - started) * 1000)
+                stable_pages += store.page_reads - before_pages
+                record_frame()
                 reset()
+                before_pages = store.page_reads
                 burst_start = time.perf_counter()
                 paint()
                 for step in range(args.inputs):
@@ -126,21 +148,15 @@ def worker(args):
                 finish()
                 latest.append((time.perf_counter() - started) * 1000)
                 bursts.append((time.perf_counter() - burst_start) * 1000)
-                window = (viewer.time_start, viewer.time_end, viewer.wave_width, viewer.line_thickness)
-                assert all(token[1][1] == window for token in queries.ready if token[0] == 'rows')
-                assert sum(token[0] == 'rows' for token in queries.ready) == len(order)
-                # Recording terminal plus raw labels/limits detect stale or changed output.
-                frames.update(json.dumps(sorted(screen.lines.items())).encode())
-                for sid in order:
-                    rows = [(token[2][0], value) for token, value in queries.ready.items()
-                            if token[0] == 'rows' and token[2][1] == sid]
-                    frames.update(json.dumps(rows, sort_keys=True).encode())
-                    extras = [value for (kind, key), value in viewer._row_extras.items() if key == sid]
-                    frames.update(json.dumps(extras, sort_keys=True).encode())
+                burst_pages += store.page_reads - before_pages
+                record_frame()
             assert store.peak_cache_bytes <= store.memory_bytes
             return dict(submit=summary(submits), latest_viewport=summary(latest), burst=summary(bursts),
                         stable_viewport=summary(stable), overlapping_inputs=overlapping,
                         peak_queued_jobs=peak_queue, pages_decoded=store.page_reads - reads,
+                        stable_pages_decoded=stable_pages, burst_pages_decoded=burst_pages,
+                        sample_cache_hits=getattr(store, 'sample_cache_hits', 0),
+                        peak_sample_cache_bytes=getattr(store, 'peak_sample_cache_bytes', 0),
                         frames_sha256=frames.hexdigest(), rendered_rows=len(order),
                         peak_cache_bytes=store.peak_cache_bytes, peak_rss_mib=peak_rss())
         finally:
@@ -153,6 +169,7 @@ def main():
     parser.add_argument('--events', type=int, default=50000)
     parser.add_argument('--signals', type=int, default=1)
     parser.add_argument('--expanded-bits', type=int, default=0)
+    parser.add_argument('--subcell', action='store_true', help='Render bit lanes at twice the horizontal resolution')
     parser.add_argument('--kind', choices=('bus', 'scalar', 'real'), default='bus')
     parser.add_argument('--width', type=int, default=1024)
     parser.add_argument('--rounds', type=int, default=5)
@@ -182,6 +199,7 @@ def main():
     results = dict(events=args.events, signals=args.signals, expanded_bits=args.expanded_bits, kind=args.kind,
                    width=args.width, rounds=args.rounds, inputs=args.inputs, interval_ms=args.interval_ms,
                    memory_mib=args.memory_mib, repositories={})
+    results['subcell'] = args.subcell
     signature = None
     with tempfile.TemporaryDirectory(prefix='alwavelets-navigation-') as directory:
         vcd, fst = (Path(directory) / ('trace.' + fmt) for fmt in ('vcd', 'fst'))
@@ -207,6 +225,8 @@ def main():
                            '--expanded-bits', str(args.expanded_bits), '--kind', args.kind, '--width', str(args.width),
                            '--rounds', str(args.rounds), '--inputs', str(args.inputs), '--interval-ms', str(args.interval_ms),
                            '--memory-mib', str(args.memory_mib)]
+                if args.subcell:
+                    command.append('--subcell')
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=300,
                                            env=dict(os.environ, ALWAVELETS_CACHE_DIR=str(Path(directory) / label / fmt)))
                 if completed.returncode:

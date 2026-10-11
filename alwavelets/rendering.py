@@ -372,7 +372,7 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
     return chars, attrs, labels
 
 
-def draw_analog_culled(sig, t_start, t_end, width, height_chars=1):
+def draw_analog_culled(sig, t_start, t_end, width, height_chars=1, *, limits=None):
     """
     Draw analog waveform using Unicode block characters with heat-map colors.
     Returns (chars, attrs) where each char is a block element.
@@ -382,7 +382,7 @@ def draw_analog_culled(sig, t_start, t_end, width, height_chars=1):
     chars = [' '] * width
     attrs = [0] * width
 
-    vmin, vmax = sig.numeric_range_in_window(t_start, t_end)
+    vmin, vmax = sig.numeric_range_in_window(t_start, t_end) if limits is None else limits
     span = t_end - t_start
     if span <= 0:
         return chars, attrs
@@ -428,7 +428,7 @@ def draw_analog_culled(sig, t_start, t_end, width, height_chars=1):
 _BRAILLE_BITS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
 
 
-def draw_analog_braille(sig, t_start, t_end, width, height):
+def draw_analog_braille(sig, t_start, t_end, width, height, *, limits=None):
     """Analog line graph at braille sub-pixel resolution: each character cell
     holds 2x4 dots, so `height` rows give 4*height vertical steps and every
     column two samples. Adjacent samples are connected vertically, drawing a
@@ -441,7 +441,7 @@ def draw_analog_braille(sig, t_start, t_end, width, height):
     span = t_end - t_start
     if span <= 0:
         return rows
-    vmin, vmax = sig.numeric_range_in_window(t_start, t_end)
+    vmin, vmax = sig.numeric_range_in_window(t_start, t_end) if limits is None else limits
     vrange = vmax - vmin if vmax != vmin else 1.0
     vres = 4 * height                       # braille rows top→bottom
     nsub = 2 * width                        # braille columns
@@ -482,12 +482,12 @@ def draw_analog_braille(sig, t_start, t_end, width, height):
     return rows
 
 
-def draw_analog_multi(sig, t_start, t_end, width, height):
+def draw_analog_multi(sig, t_start, t_end, width, height, *, limits=None):
     """Render an analog signal across `height` character rows (top row = high
     values). Returns a list of `height` (chars, attrs) tuples, top first."""
     rows = [([' '] * width, [0] * width) for _ in range(max(1, height))]
     check_read_cancel()
-    vmin, vmax = sig.numeric_range_in_window(t_start, t_end)
+    vmin, vmax = sig.numeric_range_in_window(t_start, t_end) if limits is None else limits
     span = t_end - t_start
     if span <= 0:
         return rows

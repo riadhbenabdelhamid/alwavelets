@@ -31,6 +31,7 @@ FST_VERSION = 8  # packed bus pages at arbitrary widths; can also read version 7
 PAGE_BYTES = 64 * 1024
 PAGE_EVENTS = 4096
 PAGE_HINTS = 1024
+SAMPLE_CACHE_BYTES = 1024 * 1024
 SHORT_EVENTS = 8
 SHORT_BYTES = 512
 VCD_BATCH_KEYS = 512
@@ -177,6 +178,10 @@ class StoredSignal(VCDSignal):
     def value_at(self, time):
         return self.store.value_at(self.key, time)
 
+    def values_at(self, timestamps):
+        return [value if index else 'x' for index, value in
+                self.store.sample_boundaries(self.key, timestamps, right=True)]
+
     def changes_in_window(self, start, end):
         lo = max(0, self._times.bisect(start) - 1)
         hi = self._times.bisect(end, True)
@@ -312,6 +317,11 @@ class TraceStore:
         self.timestamp_page_reads = 0
         self.counts, self.definitions = {}, {}
         self.generation = 0
+        # Raw boundary values can serve the parent, its aliases and its bit
+        # lanes. This separate, byte-bounded cache never retains decoded pages.
+        self.samples = OrderedDict()
+        self.sample_generation = 0
+        self.sample_cache_bytes = self.peak_sample_cache_bytes = self.sample_cache_hits = 0
         self.total_changes = 0
         self.cancel = threading.Event()
         self.stage_cb = None
@@ -447,69 +457,109 @@ class TraceStore:
                 raise IndexError(index)
             return self._page(key, *row, values=values)
 
-    def sample_boundaries(self, key, timestamps, lo=0, hi=None, transform=None):
-        """Return left-bisection ordinals and preceding values for a viewport.
+    def clear_samples(self):
+        with self.lock:
+            self.samples.clear()
+            self.sample_cache_bytes = 0
+            self.sample_generation = self.generation
+
+    def _cache_sample(self, key, index, value, limit):
+        # Charge each retained timestamp, ordinal and raw string, including
+        # repeated references. The fixed allowance covers tuples/LRU entries.
+        size = 256 + sum(sys.getsizeof(item) for item in (*key, index, value))
+        timestamp = key[1]
+        if hasattr(timestamp, 'numerator') and not isinstance(timestamp, int):
+            size += sys.getsizeof(timestamp.numerator) + sys.getsizeof(timestamp.denominator)
+        if size > limit:
+            return
+        while self.samples and self.sample_cache_bytes + size > limit:
+            _, old = self.samples.popitem(last=False)
+            self.sample_cache_bytes -= old[2]
+        self.samples[key] = (index, value, size)
+        self.sample_cache_bytes += size
+        self.peak_sample_cache_bytes = max(self.peak_sample_cache_bytes, self.sample_cache_bytes)
+
+    def sample_boundaries(self, key, timestamps, lo=0, hi=None, transform=None, *, right=False):
+        """Return bisection ordinals and preceding values for a viewport.
 
         Keep one active page while sampling, even if it exceeds the LRU budget.
-        Only screen-sized results survive the call; bit extraction happens
-        before retaining values. The lock gives all boundaries one published
-        history, and cancellation is checked between boundaries.
+        A bounded raw-sample cache shares reads across related rows. Transforms
+        apply before values enter the returned list, even for uncacheable values.
+        Left boundaries exclude exact-time events; right boundaries include the
+        last delta event, matching value_at. Clipped views share global ordinals
+        only when their endpoints have not truncated the answer.
         """
         check_read_cancel()
         with self.lock:
+            limit = min(SAMPLE_CACHE_BYTES, self.memory_bytes // 8)
+            if self.sample_generation != self.generation or self.sample_cache_bytes > limit:
+                self.clear_samples()
             n = self.counts.get(key, 0)
             stop = n if hi is None else min(n, hi)
             lo = min(lo, stop)
+            bisect_time = bisect.bisect_right if right else bisect.bisect_left
+            op = '>' if right else '>='
             hint = self._hint(key)
             page, base = hint if hint is not None else (None, 0)
             short, short_loaded = None, False
-            result, last_index, last_value = [], None, None
+            result, last_index, last_raw, last_value = [], None, None, None
             for timestamp in timestamps:
                 check_read_cancel()
                 if self.cancel.is_set():
                     raise Cancelled('Read cancelled')
-                bound = math.ceil(timestamp)
+                cache_key = (key, timestamp, right)
+                cached = self.samples.get(cache_key)
+                bound = math.floor(timestamp) if right else math.ceil(timestamp)
                 count = min(len(page._times), stop - base) if page is not None else 0
-                if stop == lo or bound < -(1 << 63):
+                if cached is not None:
+                    self.samples.move_to_end(cache_key)
+                    self.sample_cache_hits += 1
+                    index = min(stop, cached[0])
+                elif stop == lo or bound < -(1 << 63):
                     index = lo
                 elif bound > (1 << 63) - 1:
                     index = stop
-                elif count > 0 and (base == 0 or page._times[0] < timestamp) and \
-                        (base + count == stop or timestamp <= page._times[count - 1]):
-                    index = base + bisect.bisect_left(page._times, timestamp, 0, count)
+                elif count > 0 and (base == 0 or (page._times[0] <= timestamp if right else page._times[0] < timestamp)) and \
+                        (base + count == stop or (timestamp < page._times[count - 1] if right else timestamp <= page._times[count - 1])):
+                    index = base + bisect_time(page._times, timestamp, 0, count)
                 else:
                     if not short_loaded:
                         short, short_loaded = self.short_page(key), True
                     short_count = min(len(short._times), stop) if short is not None else 0
-                    if short_count and (short_count == stop or timestamp <= short._times[short_count - 1]):
+                    if short_count and (short_count == stop or
+                                        (timestamp < short._times[short_count - 1] if right else timestamp <= short._times[short_count - 1])):
                         page, base = short, 0
-                        index = bisect.bisect_left(page._times, timestamp, 0, short_count)
+                        index = bisect_time(page._times, timestamp, 0, short_count)
                     else:
-                        row = self.db.execute('SELECT id,lo,n,t0 FROM pages WHERE sid=? AND t1>=? '
+                        row = self.db.execute(f'SELECT id,lo,n,t0 FROM pages WHERE sid=? AND t1{op}? '
                                               'AND lo<? ORDER BY t1,lo LIMIT 1', (key, bound, stop)).fetchone()
                         if row is None:
                             index = stop
-                        elif row[3] >= timestamp:
+                        elif (row[3] > timestamp if right else row[3] >= timestamp):
                             # A gap or exact page start: no need to decode the
                             # following page to find its preceding ordinal.
                             index = row[1]
                         else:
                             page, base = self._page(key, *row[:3])
                             count = min(len(page._times), stop - base)
-                            index = base + bisect.bisect_left(page._times, timestamp, 0, count)
+                            index = base + bisect_time(page._times, timestamp, 0, count)
                 index = max(lo, index)
                 if index == lo:
-                    value = None
+                    raw = value = None
                 elif index == last_index:
-                    value = last_value
+                    raw, value = last_raw, last_value
                 else:
-                    if page is None or page._values is None or not base <= index - 1 < base + len(page._times):
-                        page, base = self.page_at(key, index - 1)
-                    value = page.value_str(index - base - 1)
-                    if transform is not None:
-                        value = transform(value)
+                    if cached is not None and index == cached[0]:
+                        raw = cached[1]
+                    else:
+                        if page is None or page._values is None or not base <= index - 1 < base + len(page._times):
+                            page, base = self.page_at(key, index - 1)
+                        raw = page.value_str(index - base - 1)
+                    value = transform(raw) if transform is not None else raw
+                if cached is None and (lo == 0 or index > lo) and (stop == n or index < stop):
+                    self._cache_sample(cache_key, index, raw, limit)
                 result.append((index - lo, value))
-                last_index, last_value = index, value
+                last_index, last_raw, last_value = index, raw, value
             if self.cancel.is_set():
                 raise Cancelled('Read cancelled')
             check_read_cancel()
@@ -664,6 +714,7 @@ class TraceStore:
             self.db.close()
             self.pages.clear()
             self.page_hints.clear()
+            self.clear_samples()
             self.cache_bytes = 0
             if self.temporary:
                 self.temporary.cleanup()
