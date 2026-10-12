@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from alwavelets.core import VCDSignal
 from alwavelets.instruction_store import InstructionResults
+from alwavelets.ui_chrome import text_width, wave_origin, wave_right
+from alwavelets.ui_registers import REGISTER_POSITIONS
 from test_ui_chrome import Screen, viewer as _viewer_fixture
 
 viewer = _viewer_fixture
@@ -30,6 +33,7 @@ class PanelScreen(Screen):
 def panel(viewer):
     v = viewer
     v.show_reg_panel = True
+    v.register_panel_position = 'overlay'
     regs = [0] + [0xdead0000 + i for i in range(1, 32)]
     regs[7] = None
     current = {'pc': 0x80000108, 'decoded': {'asm': 'addi a0, a0, 1'}}
@@ -222,3 +226,163 @@ def test_toggle_preserves_trace_setup_message_and_avoids_duplicate_jobs(panel, m
     v._analysis_job = SimpleNamespace()
     v._kb_reg_panel()
     assert calls == [True] and 'Analysis running' in v._message
+
+
+def test_registers_default_to_right_and_closing_restores_waveform_space(viewer):
+    v = viewer
+    v.instr_trace.built = True
+    before = v.signal_left, v.wave_width, v.wave_top, v.wave_bottom
+    assert v.register_panel_position == 'right'
+    v._kb_reg_panel()
+    assert v.wave_width < before[1]
+    assert wave_right(v) == v._register_panel_layout['left']
+    v._kb_reg_panel()
+    assert (v.signal_left, v.wave_width, v.wave_top, v.wave_bottom) == before
+
+
+@pytest.mark.parametrize('position', REGISTER_POSITIONS)
+@pytest.mark.parametrize('width,height', [(40, 18), (80, 24), (160, 40)])
+@pytest.mark.parametrize('details', [False, True])
+def test_docks_reserve_space_for_all_waveform_layers(panel, position, width, height, details):
+    v = panel
+    v.stdscr = PanelScreen(width, height)
+    v.show_inspector = v.show_overview = details
+    v.show_grid = 2
+    v.signal_spacing, v.signal_divider = 1, True
+    analog = VCDSignal('analog', '!', 1, signal_type='real', scope='top')
+    analog.add_change(0, '0.25')
+    analog.add_change(40, '0.75')
+    v.vcd.signals['!'] = analog
+    v.sig_height['!'] = 3
+    v.diff_vcd = v.vcd
+    v.diff_sig_map['!'] = analog
+    v.diff_ranges['!'] = [(0, 10)]
+    v.create_group('Example signals', ['!'])
+    v.tree_expanded.add('top')
+    v._rebuild_tree()
+    v.set_register_position(position)
+    v.draw_register_panel()
+    box = v._register_panel_layout
+    left, top, pw, ph = (box[k] for k in ('left', 'top', 'width', 'height'))
+    original = [row[:] for row in v.stdscr.rows]
+    v.stdscr.calls.clear()
+    v.draw_header()
+    v.draw_overview()
+    v.draw_ruler()
+    v.draw_signals()
+    v.draw_panel_tree()
+    v.draw_inspector()
+    v.draw_status_bar()
+    if position != 'overlay':
+        for row, col, text, _ in v.stdscr.calls:
+            assert not (top <= row < top + ph and col < left + pw and col + text_width(text) > left), (row, col, text)
+        for row in range(top, top + ph):
+            assert v.stdscr.rows[row][left:left + pw] == original[row][left:left + pw]
+    assert wave_origin(v) < wave_right(v)
+    assert v.wave_top < v.wave_bottom
+    if details:
+        assert 'Signal inspector' in v.stdscr.line(v.inspector_top)
+
+
+@pytest.mark.parametrize('position', REGISTER_POSITIONS)
+def test_every_placement_has_reachable_values_and_commands(panel, position):
+    v = panel
+    v.stdscr = PanelScreen(80, 24)
+    v.set_register_position(position)
+    seen = set()
+    for _ in range(32):
+        v.stdscr.erase()
+        v.stdscr.calls.clear()
+        v.draw_register_panel()
+        assert {button[3] for button in v._register_panel_buttons} == set(REGISTER_POSITIONS)
+        box = v._register_panel_layout
+        assert box['fits']
+        for row, _, text, _ in v.stdscr.calls:
+            match = re.fullmatch(r'x(\d+)\s+\S+\s+([0-9a-f-]+)', text)
+            if match:
+                seen.add(int(match[1]))
+                assert text in v.stdscr.line(row)
+        assert 'PC=0x80000108' in v.stdscr.line(box['top'] + box['height'] - 4)
+        old_page = v._register_panel_page
+        v.page_register_panel(1)
+        if old_page == v._register_panel_page:
+            break
+    assert seen == set(range(32))
+
+
+@pytest.mark.parametrize('active', ['a', 'b'])
+@pytest.mark.parametrize('position', REGISTER_POSITIONS[:4])
+def test_cursor_stays_visible_when_moving_right_through_docked_view(panel, position, active):
+    v = panel
+    v.stdscr = PanelScreen(120, 30)
+    v.panel_mode = False
+    v.show_module_sep = False
+    v.cursor_on = v.cursor_b_on = True
+    v.active_cursor = active
+    v.set_register_position(position)
+    # Cross the boundary repeatedly, not just once within the initial view.
+    for _ in range(150):
+        v.keymap[curses.KEY_RIGHT]()
+        col = v.time_to_col(v.cursor_time)
+        assert 0 <= col < v.wave_width - 1
+        v.stdscr.erase()
+        v.draw_ruler()
+        v.draw_signals()
+        v.draw_register_panel()
+        assert v.stdscr.rows[v.wave_top][wave_origin(v) + col] == '┃'
+
+
+def test_placement_shortcuts_and_clicks_preserve_times_and_selection(panel):
+    v = panel
+    v.stdscr = PanelScreen(120, 30)
+    v.cursor_a, v.cursor_b, v.active_cursor = 20, 75, 'b'
+    v.selected_signals = {'!'}
+    before = v.time_start, v.time_end, v.cursor_a, v.cursor_b, list(v.zoom_history)
+    for key, position in zip('34567', REGISTER_POSITIONS):
+        assert v.register_panel_handle_key(ord(key))
+        assert v.register_panel_position == position
+        assert (v.time_start, v.time_end, v.cursor_a, v.cursor_b, v.zoom_history) == before
+        assert v.selected_signals == {'!'} and v.active_cursor == 'b'
+    for position in REGISTER_POSITIONS:
+        v.draw_register_panel()
+        row, x0, _, _ = next(button for button in v._register_panel_buttons if button[3] == position)
+        assert v.register_panel_mouse(x0, row, curses.BUTTON1_CLICKED)
+        assert v.register_panel_position == position
+        assert (v.time_start, v.time_end, v.cursor_a, v.cursor_b, v.zoom_history) == before
+    assert not v.register_panel_handle_key(ord('1'))  # Cursor A/B keys remain available.
+    assert not v.register_panel_handle_key(ord('2'))
+    assert not v.set_register_position('invalid')
+
+
+@pytest.mark.parametrize('position', REGISTER_POSITIONS)
+def test_placement_persists_in_session_and_resize_never_changes_it(panel, position, tmp_path, monkeypatch):
+    v = panel
+    monkeypatch.setattr(v, 'apply_theme', lambda: None)
+    v.vcd._filename = str(tmp_path / 'registers.vcd')
+    v.set_register_position(position)
+    v.save_session()
+    v.register_panel_position = 'invalid'
+    assert v.restore_session()
+    assert v.register_panel_position == position
+    for width, height in ((12, 8), (24, 12), (80, 24), (160, 40)):
+        v.stdscr = PanelScreen(width, height)
+        v.update_layout()
+        v.draw_register_panel()
+        assert v.register_panel_position == position
+        box = v._register_panel_layout
+        assert 0 <= box['left'] <= box['left'] + box['width'] <= width
+        assert 0 <= box['top'] <= box['top'] + box['height'] < height
+
+
+@pytest.mark.parametrize('position', REGISTER_POSITIONS[:4])
+def test_mouse_maps_times_inside_resized_waveform_pane(panel, position, monkeypatch):
+    v = panel
+    v.stdscr = PanelScreen(120, 30)
+    v.set_register_position(position)
+    v.draw_signals()
+    col = v.wave_width // 2
+    expected = v.col_to_time(col)
+    monkeypatch.setattr(curses, 'getmouse', lambda: (
+        0, wave_origin(v) + col, v.wave_top, 0, curses.BUTTON1_CLICKED))
+    v.handle_mouse()
+    assert v.cursor_time == expected

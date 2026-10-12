@@ -403,7 +403,7 @@ u            <span class="cm"># undo any group edit</span></code></pre>
       <tr><td class="k"><kbd>\</kbd> · <kbd>C</kbd></td><td>Cycle built-in themes · show the color legend.</td></tr>
       <tr><td class="k"><kbd>D</kbd></td><td>Load a translation JSON (enum decode: raw value → state name shown on the wave).</td></tr>
       <tr><td class="k"><kbd>I</kbd></td><td>Protocol decode menu: SPI, I²C, UART overlays on the selected signals.</td></tr>
-      <tr><td class="k"><kbd>p</kbd> · <kbd>`</kbd></td><td>RISC-V register panel · ISA trace query prompt. The panel adapts its columns to terminal size and shows complete register values; <kbd>PgUp</kbd>/<kbd>PgDn</kbd> or the wheel over the panel page through registers when needed. <kbd>p</kbd>/<kbd>Esc</kbd> closes it.</td></tr>
+      <tr><td class="k"><kbd>p</kbd> · <kbd>`</kbd></td><td>RISC-V register panel · ISA trace query prompt. Registers dock right by default. The panel's top controls select <kbd>3</kbd> Right / <kbd>4</kbd> Bottom / <kbd>5</kbd> Top / <kbd>6</kbd> Left / <kbd>7</kbd> Overlay. Columns adapt to terminal size; <kbd>PgUp</kbd>/<kbd>PgDn</kbd> or the wheel over the panel page through registers when needed. <kbd>p</kbd>/<kbd>Esc</kbd> closes it.</td></tr>
       <tr><td class="k"><kbd>A</kbd></td><td>Add a time-anchored annotation (saved to the notes sidecar).</td></tr>
       <tr><td class="k"><kbd>F5</kbd></td><td>Live reload: watch the file and re-parse on change; <code>;follow</code> instead tails appended changes incrementally and auto-scrolls.</td></tr>
     </tbody>
@@ -833,6 +833,12 @@ sig.value_at(1500); sig.changes_in_window(0, 2000)           <span class="cm"># 
   </table></div>
   <h3>Register panel demo</h3>
   <pre><code>python3 alwavelets.py demo_register_panel.vcd --expanded --no-session</code></pre>
+  <p>The panel docks right by default. While it is open, click a placement command
+    at its top or press <kbd>3</kbd> Right, <kbd>4</kbd> Bottom, <kbd>5</kbd> Top,
+    <kbd>6</kbd> Left, or <kbd>7</kbd> Overlay. Narrow panels use arrows for dock
+    directions. Docks reserve waveform space so cursors remain unobstructed;
+    overlay covers the waveform. Moving or closing the panel preserves cursor
+    times and the displayed time range. Sessions remember the chosen position.</p>
   <p>Press <kbd>p</kbd>, then type <code>;goto 6500ns</code> and press <kbd>Enter</kbd>.
     This synthetic RV32 trace supplies automatically detected instruction, PC,
     writeback, clock and hart signals. The panel reconstructs earlier writes and

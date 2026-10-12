@@ -9,7 +9,7 @@ from .parsers import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .hierarchy import scope_signal_ids, scope_all_selected, scope_ranges
 from .display_order import DisplayOrder
-from .ui_chrome import elide, text_width, wave_bottom
+from .ui_chrome import elide, text_width, wave_bottom, wave_right
 
 
 class TreePanelMixin:
@@ -206,7 +206,8 @@ class TreePanelMixin:
         """Draw the tree panel on the left side."""
         if not self.panel_mode or (not self.sidebar_width and self.panel_focus != 0):
             return
-        tw = self.sidebar_width or max(1, self.width - 1)
+        left = getattr(self, 'content_left', 0)
+        tw = self.sidebar_width or max(1, wave_right(self) - left - 1)
         h = wave_bottom(self) + 1
         has_focus = (self.panel_focus == 0)
 
@@ -227,13 +228,13 @@ class TreePanelMixin:
         try:
             # Clear the entire pane, including any unused row above the footer.
             for row in range(top, h - 1):
-                self.stdscr.addstr(row, 0, ' ' * tw, curses.A_NORMAL)
-            self.stdscr.addstr(top, 0, hdr[:tw].ljust(tw), hdr_attr)
+                self.stdscr.addstr(row, left, ' ' * tw, curses.A_NORMAL)
+            self.stdscr.addstr(top, left, hdr[:tw].ljust(tw), hdr_attr)
         except curses.error:
             pass
 
         # ── Tree entries (top portion: from wave_top to ~h//2) ──
-        tree_rows = max(1, h // 2 - self.wave_top)
+        tree_rows = max(1, (wave_bottom(self) - self.wave_top) // 2)
         if self.tree_scroll > self.tree_cursor:
             self.tree_scroll = self.tree_cursor
         if self.tree_cursor >= self.tree_scroll + tree_rows:
@@ -247,7 +248,7 @@ class TreePanelMixin:
             if idx >= len(self._tree_flat):
                 # Clear remaining rows
                 try:
-                    self.stdscr.addstr(row, 0, ' ' * tw, curses.A_NORMAL)
+                    self.stdscr.addstr(row, left, ' ' * tw, curses.A_NORMAL)
                 except curses.error:
                     pass
                 continue
@@ -283,8 +284,8 @@ class TreePanelMixin:
             try:
                 line = elide(label, tw)
                 line += ' ' * (tw - text_width(line))
-                self.stdscr.addstr(row, 0, line, attr)
-                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addstr(row, left, line, attr)
+                self.stdscr.addch(row, left + tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
@@ -294,8 +295,8 @@ class TreePanelMixin:
             sep_label = " Signals"
             try:
                 sep_line = sep_label[:tw].ljust(tw)
-                self.stdscr.addstr(sep_row, 0, sep_line, curses.color_pair(self.C_MENU))
-                self.stdscr.addch(sep_row, tw, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addstr(sep_row, left, sep_line, curses.color_pair(self.C_MENU))
+                self.stdscr.addch(sep_row, left + tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
@@ -327,15 +328,15 @@ class TreePanelMixin:
             try:
                 line = elide(label, tw)
                 line += ' ' * (tw - text_width(line))
-                self.stdscr.addstr(row, 0, line, attr)
-                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addstr(row, left, line, attr)
+                self.stdscr.addch(row, left + tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
         # ── Vertical separator ──
         for row in range(self.ruler_row, h - 1):
             try:
-                self.stdscr.addch(row, tw, '│', curses.color_pair(self.C_MENUSEP))
+                self.stdscr.addch(row, left + tw, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 

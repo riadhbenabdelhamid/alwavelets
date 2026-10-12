@@ -15,7 +15,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .streaming import read_cancellation
-from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_bottom, wave_origin
+from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_bottom, wave_origin, wave_right
 from .ui_spacing import row_spacing, spacing_name
 from .ui_registers import RegisterPanelMixin
 
@@ -297,7 +297,7 @@ class DrawingMixin(RegisterPanelMixin):
         if self.cursor_on:
             cc = self.time_to_col(self.cursor_a)
             ac = wave_origin(self) + cc
-            if 0 <= cc < self.wave_width and ac < self.width:
+            if 0 <= cc < self.wave_width and ac < wave_right(self):
                 try:
                     self.stdscr.addch(row, ac, 'A', curses.color_pair(self.C_CURSOR) | curses.A_BOLD)
                 except curses.error:
@@ -307,7 +307,7 @@ class DrawingMixin(RegisterPanelMixin):
         if self.cursor_b_on:
             cc = self.time_to_col(self.cursor_b)
             ac = wave_origin(self) + cc
-            if 0 <= cc < self.wave_width and ac < self.width:
+            if 0 <= cc < self.wave_width and ac < wave_right(self):
                 try:
                     self.stdscr.addch(row, ac, 'B', curses.color_pair(self.C_CURSORB) | curses.A_BOLD)
                 except curses.error:
@@ -407,7 +407,7 @@ class DrawingMixin(RegisterPanelMixin):
         grid_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
         for col in columns:
             screen_col = wave_origin(self) + col
-            if screen_col >= self.width - 1 or col >= len(chars):
+            if screen_col >= wave_right(self) - 1 or col >= len(chars):
                 continue
             if attrs[col] in (1, 2, 3):  # transition/busy, unknown, high impedance
                 continue
@@ -485,7 +485,7 @@ class DrawingMixin(RegisterPanelMixin):
             if is_alt_row and getattr(self, 'workmode', 'classic') != 'minimal':
                 for rr in range(row, row + sig_rows):
                     try:
-                        self.stdscr.addstr(rr, signal_origin(self), ' ' * (self.width - signal_origin(self) - 1), curses.color_pair(self.C_ROWALT))
+                        self.stdscr.addstr(rr, signal_origin(self), ' ' * (wave_right(self) - signal_origin(self) - 1), curses.color_pair(self.C_ROWALT))
                     except curses.error:
                         pass
 
@@ -625,8 +625,8 @@ class DrawingMixin(RegisterPanelMixin):
                         display_lbl = translated if translated else lbl
                         display_lbl = display_lbl[:max_lbl_len]
                         ac = wave_origin(self) + bcol
-                        if ac < self.width - 1 and bcol < self.wave_width:
-                            dl = display_lbl[:min(len(display_lbl), self.width - ac - 1)]
+                        if ac < wave_right(self) - 1 and bcol < self.wave_width:
+                            dl = display_lbl[:min(len(display_lbl), wave_right(self) - ac - 1)]
                             try:
                                 self.stdscr.addstr(row, ac, dl, curses.color_pair(self.C_BUSLBL))
                             except curses.error:
@@ -681,7 +681,7 @@ class DrawingMixin(RegisterPanelMixin):
                             # Draw delimiter at start and end of diff region
                             for dc in (c0, c1):
                                 gac = wave_origin(self) + dc
-                                if gac < self.width:
+                                if gac < wave_right(self):
                                     try:
                                         self.stdscr.addch(row, gac, '┃', curses.color_pair(self.C_DIFF_ED) | curses.A_BOLD)
                                         self.stdscr.addch(diff_row, gac, '┃', curses.color_pair(self.C_DIFF_ED) | curses.A_BOLD)
@@ -690,7 +690,7 @@ class DrawingMixin(RegisterPanelMixin):
                             # Highlight diff region background on both rows
                             for dc in range(c0, c1 + 1):
                                 gac = wave_origin(self) + dc
-                                if gac < self.width and dc % 4 == 0:
+                                if gac < wave_right(self) and dc % 4 == 0:
                                     try:
                                         self.stdscr.addch(row, gac, '░', curses.color_pair(self.C_DIFF_BG))
                                         self.stdscr.addch(diff_row, gac, '░', curses.color_pair(self.C_DIFF_BG))
@@ -715,7 +715,7 @@ class DrawingMixin(RegisterPanelMixin):
                 start_rel = max(0, lo_c + 1)
                 end_rel = min(self.wave_width, hi_c)        # exclusive of B's column
                 bx = wave_origin(self) + start_rel
-                count = min(end_rel - start_rel, self.width - 1 - bx)
+                count = min(end_rel - start_rel, wave_right(self) - 1 - bx)
                 if count > 0:
                     for sr in range(sig_rows):
                         wc = wave_rows[sr] if sr < len(wave_rows) else wave_rows[-1]
@@ -729,7 +729,7 @@ class DrawingMixin(RegisterPanelMixin):
             if self.cursor_on:
                 cc = self.time_to_col(self.cursor_a)
                 ac = wave_origin(self) + cc
-                if 0 <= cc < self.wave_width and ac < self.width:
+                if 0 <= cc < self.wave_width and ac < wave_right(self):
                     for rr in range(row, row + sig_rows):
                         try:
                             self.stdscr.addch(rr, ac, '┃', curses.color_pair(self.C_CURSOR) | curses.A_BOLD)
@@ -739,7 +739,7 @@ class DrawingMixin(RegisterPanelMixin):
             if self.cursor_b_on:
                 cc = self.time_to_col(self.cursor_b)
                 ac = wave_origin(self) + cc
-                if 0 <= cc < self.wave_width and ac < self.width:
+                if 0 <= cc < self.wave_width and ac < wave_right(self):
                     for rr in range(row, row + sig_rows):
                         try:
                             self.stdscr.addch(rr, ac, '┃', curses.color_pair(self.C_CURSORB) | curses.A_BOLD)
@@ -750,7 +750,7 @@ class DrawingMixin(RegisterPanelMixin):
             for marker in self.markers:
                 mc = self.time_to_col(marker.time)
                 ac = wave_origin(self) + mc
-                if 0 <= mc < self.wave_width and ac < self.width:
+                if 0 <= mc < self.wave_width and ac < wave_right(self):
                     for rr in range(row, row + sig_rows):
                         try:
                             self.stdscr.addch(rr, ac, '▎', curses.color_pair(self.C_MARKER) | curses.A_BOLD)
@@ -769,7 +769,7 @@ class DrawingMixin(RegisterPanelMixin):
             if limits is not None:
                 vmin, vmax = limits
                 attr = curses.color_pair(self.C_VAL) | curses.A_DIM
-                right = self.width - 2          # leave the scrollbar column free
+                right = wave_right(self) - 2          # leave the scrollbar column free
                 left = wave_origin(self)
                 if sig_rows > 1:
                     for r_idx, val in ((row, vmax), (row + sig_rows - 1, vmin)):
@@ -806,7 +806,7 @@ class DrawingMixin(RegisterPanelMixin):
                 gap_ch = '┈' if offset == 0 and (divider or self.show_grid >= 2) else ' '
                 try:
                     self.stdscr.addstr(sep_row, signal_origin(self),
-                                      gap_ch * (self.width - signal_origin(self) - 1),
+                                      gap_ch * (wave_right(self) - signal_origin(self) - 1),
                                       curses.color_pair(self.C_SCOPE) | curses.A_DIM)
                 except curses.error:
                     pass
@@ -815,14 +815,14 @@ class DrawingMixin(RegisterPanelMixin):
         # When there are more signals than fit, a thumb on the rightmost column
         # (which the waveform leaves free) shows the visible window's position.
         total = len(self.display_order)
-        if total > self.visible_signals and self.width > wave_origin(self) + 3:
+        if total > self.visible_signals and wave_right(self) > wave_origin(self) + 3:
             track_top = self.wave_top
             track_bot = wave_bottom(self) - 1
             track_h = max(1, track_bot - track_top + 1)
             thumb_h = max(1, min(track_h, round(track_h * self.visible_signals / total)))
             thumb_top = track_top + min(track_h - thumb_h,
                                         int(track_h * self.sig_offset / total))
-            sx = self.width - 1
+            sx = wave_right(self) - 1
             for r in range(track_top, track_bot + 1):
                 on = thumb_top <= r < thumb_top + thumb_h
                 try:
@@ -846,7 +846,7 @@ class DrawingMixin(RegisterPanelMixin):
         label = f"{focus}{indent}{arrow} {name}  ({count})"
         attr = curses.color_pair(self.C_HEADER) | curses.A_BOLD
         try:
-            room = self.width - signal_origin(self) - 1
+            room = wave_right(self) - signal_origin(self) - 1
             label = elide(label, room)
             self.stdscr.addstr(row, signal_origin(self), label + ' ' * (room - text_width(label)), attr)
         except curses.error:
@@ -857,11 +857,11 @@ class DrawingMixin(RegisterPanelMixin):
         if row >= wave_bottom(self) or row < self.wave_top:
             return
         try:
-            sep_line = '┄' * (self.width - signal_origin(self) - 1)
+            sep_line = '┄' * (wave_right(self) - signal_origin(self) - 1)
             self.stdscr.addstr(row, signal_origin(self), sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
             # Overdraw the module name with highlighted background
             x = signal_origin(self) + 2
-            label = elide(f" {scope_name} ", max(0, self.width - x - 1))
+            label = elide(f" {scope_name} ", max(0, wave_right(self) - x - 1))
             if label:
                 self.stdscr.addstr(row, x, label, curses.color_pair(self.C_HEADER) | curses.A_BOLD)
         except curses.error:

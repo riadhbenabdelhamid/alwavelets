@@ -5,7 +5,7 @@ from .background import BackgroundQueries
 from .rendering import time_to_column
 from .streaming import read_cancellation
 from .ui_actions import shortcut_for
-from .ui_chrome import elide, signal_origin, text_width, wave_bottom, wave_origin
+from .ui_chrome import elide, signal_origin, text_width, wave_bottom, wave_origin, wave_right
 from .ui_navigation import set_time_range
 
 
@@ -25,7 +25,8 @@ class InspectionMixin:
     def _detail_line(self, row, text, attr=0, left=0):
         if not 0 <= row < self.height - 1:
             return
-        room = max(0, self.width - left - 1)
+        right = wave_right(self) if row < getattr(self, 'inspector_top', self.height - 1) else self.width
+        room = max(0, right - left - 1)
         text = elide(text, room)
         try:
             self.stdscr.addstr(row, left, text + ' ' * (room - text_width(text)), attr)
@@ -102,7 +103,7 @@ class InspectionMixin:
     def draw_inspector(self):
         if not self.inspector_rows:
             return
-        top = wave_bottom(self)
+        top = getattr(self, 'inspector_top', wave_bottom(self))
         room = max(1, self.width - 2)
         key = shortcut_for(self, 'toggle_inspector', 1)
         lines = [f' Signal inspector · {key} close']

@@ -608,6 +608,14 @@ remaining registers when space is limited. Cursor navigation still updates the
 snapshot. **p** or **Esc** closes the panel. Unknown values show `--------`;
 loading and missing instruction data are labeled explicitly.
 
+The panel **docks right by default**. While it is open, use the commands at its
+top (click them or press the number): **3 Right**, **4 Bottom**, **5 Top**,
+**6 Left**, **7 Overlay**. Narrow panels use arrows for the four dock directions.
+Docking reserves space for the panel so the waveform, ruler, and cursors remain
+visible beside it; overlay draws over the waveform. Moving or closing the panel
+preserves cursor times and the displayed time range. The session remembers the
+chosen position.
+
 Try the included [register-panel demo](demo_register_panel.vcd):
 
 ```bash

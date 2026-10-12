@@ -284,6 +284,8 @@ class KeymapMixin:
             self._register_panel_page = 0
             self._register_panel_layout = None
             self._drag_anchor = self._drag_cur = None
+            self.update_layout()
+            self._needs_layout = True
             if not self.instr_trace.built:
                 if getattr(self, '_analysis_job', None) is not None:
                     self._show_message('Analysis running; reopen registers after it finishes')

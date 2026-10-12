@@ -36,7 +36,7 @@ def _viewer(w, tmp_path):
         radix=w.Radix.HEX, sig_radix={}, sig_color={}, sig_height={},
         analog_signals=set(), collapsed_scopes=set(),
         _undo_stack=[], _needs_layout=False, _dirty=False, _remote_depth=0,
-        _message=None, width=100, height=40, show_grid=0,
+        _message=None, width=100, height=40, wave_width=75, show_grid=0,
         signal_spacing=0, show_full_names=False, show_tree=False,
         show_manual=False, virtual_signals={}, control=None,
         tcl=types.SimpleNamespace(execute=lambda c: None),
@@ -53,7 +53,7 @@ def _viewer(w, tmp_path):
               "_group_chain", "_sync_display_set", "push_undo", "undo",
               "_undo_groups_snapshot", "zoom_fit_all", "_cmd_zoom_range",
               "_cmd_goto_time", "_time_arg", "_cmd_group", "_signals_matching", "_cmd_ungroup", "_cmd_help",
-              "_ensure_cursor_visible", "cursor_delta", "cursor_time",
+              "_ensure_cursor_visible", "time_to_col", "cursor_delta", "cursor_time",
               "_focus_on"):
         attr = getattr(Alwavelets, m, None)
         if attr is None:

@@ -32,7 +32,8 @@ from .ui_commands import CommandLineMixin
 from .ui_keymap import KeymapMixin
 from .ui_debug import DebugActionsMixin, load_analysis_data
 from .ui_drawing import DrawingMixin
-from .ui_chrome import signal_origin, wave_bottom, wave_origin
+from .ui_chrome import signal_origin, wave_bottom, wave_origin, wave_right
+from .ui_registers import register_layout, register_position, REGISTER_POSITIONS
 from .ui_actions import ActionPaletteMixin
 from .ui_navigation import ViewHistoryMixin, push_view_history, set_time_range
 from .ui_inspection import InspectionMixin
@@ -309,6 +310,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
         # ISA debug
         self.show_reg_panel = False
+        self.register_panel_position = 'right'
         self._heatmap_data = None
         # Hart color map (cycle through 6 distinct colors)
         self.HART_COLORS = [
@@ -751,30 +753,50 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
     def update_layout(self):
         self.height, self.width = self.stdscr.getmaxyx()
+        self.menu_row = 1
+        top = 2 if self.show_menu_bar else 1
+        overview = self.show_overview and self.height >= 8
+        base_wave_top = top + 1 + int(overview)
+        self.inspector_rows = min(8, max(0, self.height - base_wave_top - 4)) if self.show_inspector else 0
+        self.inspector_top = self.height - 1 - self.inspector_rows
+        self._register_area = (top, self.inspector_top)
+        self.content_left, self.content_right = 0, self.width
+        self.wave_bottom = self.inspector_top
+        self._register_panel_buttons = []
+        self._register_panel_layout = register_layout(self) if self.show_reg_panel else None
+        if self._register_panel_layout is not None:
+            layout = self._register_panel_layout
+            position = register_position(self)
+            if position == 'left':
+                self.content_left = layout['width']
+            elif position == 'right':
+                self.content_right = layout['left']
+            elif position == 'top':
+                top += layout['height']
+            elif position == 'bottom':
+                self.wave_bottom = layout['top']
         # Keep waveform labels in their own column. A narrow terminal uses
         # an explicitly focused browser overlay instead of squeezing traces.
-        self.sidebar_width = min(self.panel_tree_width, self.width // 4) if self.panel_mode and self.width >= 96 else 0
-        self.signal_left = self.sidebar_width + 1 if self.sidebar_width else 0
-        available = self.width - self.signal_left
+        available = self.content_right - self.content_left
+        self.sidebar_width = min(self.panel_tree_width, available // 4) if self.panel_mode and available >= 96 else 0
+        self.signal_left = self.content_left + (self.sidebar_width + 1 if self.sidebar_width else 0)
+        available = self.content_right - self.signal_left
         if not self._name_width_manual:
             if available < 40:
                 self.name_width = max(8, available // 3)
             else:
                 self.name_width = min(22, available // 4)
         # Clamp to terminal width
-        self.name_width = min(self.name_width, available // 2)
-        self.wave_width = max(1, self.width - wave_origin(self))
+        self.name_width = min(self.name_width, max(0, available // 2 - (available <= 2)))
+        self.wave_width = max(1, wave_right(self) - wave_origin(self))
         # Color separates the bars, leaving the vertical space for waveforms.
         #   menu shown:  0 title · 1 menu · 2 ruler · 3+ signals
         #   menu hidden: 0 title · 1 ruler · 2+ signals
-        self.menu_row = 1
-        self.ruler_row = 2 if self.show_menu_bar else 1
-        self.overview_row = self.ruler_row if self.show_overview and self.height >= 8 else None
+        self.ruler_row = top
+        self.overview_row = top if overview else None
         if self.overview_row is not None:
             self.ruler_row += 1
         self.wave_top = self.ruler_row + 1
-        self.inspector_rows = min(8, max(0, self.height - self.wave_top - 4)) if self.show_inspector else 0
-        self.wave_bottom = self.height - 1 - self.inspector_rows
         # Each signal takes a waveform row and its gap, plus diff/analog rows.
         rows_for_signals = max(1, self.wave_bottom - self.wave_top)
         row_stride = 1 + row_spacing(self)[0]
@@ -1003,13 +1025,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         step = max(span // self.wave_width, 1)
         new_t = max(0, self.cursor_time + step * direction)
         self.cursor_time = new_t
-        # Auto-scroll if cursor exits window
-        if new_t < self.time_start:
-            diff = self.time_start - new_t
-            set_time_range(self, self.time_start - diff, self.time_end - diff)
-        elif new_t > self.time_end:
-            diff = new_t - self.time_end
-            set_time_range(self, self.time_start + diff, self.time_end + diff)
+        self._ensure_cursor_visible()
 
     # ── Edge Navigation ──
 
@@ -1052,7 +1068,9 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
     def _ensure_cursor_visible(self):
         span = self.time_end - self.time_start
         ct = self.cursor_time
-        if ct < self.time_start or ct > self.time_end:
+        # The end timestamp maps just beyond the last column; use the actual
+        # drawable boundary so scrolling never pins the cursor off screen.
+        if ct < self.time_start or self.time_to_col(ct) >= max(1, self.wave_width - 1):
             start = max(0, ct - span // 4)
             set_time_range(self, start, start + span)
 
@@ -1609,6 +1627,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             'scope_separators': getattr(self, 'show_module_sep', False),
             'inspector': getattr(self, 'show_inspector', False),
             'overview': getattr(self, 'show_overview', False),
+            'register_panel_position': register_position(self),
         }
 
     def save_session(self):
@@ -1691,6 +1710,8 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                               ('inspector', 'show_inspector'), ('overview', 'show_overview')):
                 if isinstance(data.get(key), bool):
                     setattr(self, attr, data[key])
+            position = data.get('register_panel_position', 'right')
+            self.register_panel_position = position if position in REGISTER_POSITIONS else 'right'
             if 'name_width' in data:
                 self.name_width = max(8, int(data['name_width']))
                 self._name_width_manual = True
@@ -2228,7 +2249,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         """Write chars to screen batching consecutive same-attribute runs."""
         if not chars:
             return
-        max_col = self.width - 1
+        max_col = wave_right(self) - 1
         i = 0
         n = len(chars)
         while i < n:
@@ -2677,20 +2698,22 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             return
         if self._drag_anchor is None:
             if getattr(self, 'overview_row', None) == my:
-                if clicked and mx >= wave_origin(self):
+                if clicked and wave_origin(self) <= mx < wave_right(self):
                     self.overview_click(mx - wave_origin(self))
                 return
             if my >= getattr(self, 'wave_bottom', getattr(self, 'height', 100000) - 1):
                 return
         if self._drag_anchor is None and getattr(self, 'ruler_row', 0) <= my < getattr(self, 'height', 100000) - 1:
             sidebar = getattr(self, 'sidebar_width', 0)
-            browser = getattr(self, 'panel_mode', False) and (mx < sidebar or
+            left = getattr(self, 'content_left', 0)
+            browser = getattr(self, 'panel_mode', False) and (left <= mx < left + sidebar or
                        (not sidebar and self.panel_focus == 0))
             if browser:
                 if clicked:
                     self.panel_focus = 0
                     index = self.tree_scroll + my - self.wave_top
-                    if self.wave_top <= my < max(self.wave_top + 1, (wave_bottom(self) + 1) // 2) and index < len(self._tree_flat):
+                    tree_end = self.wave_top + max(1, (wave_bottom(self) - self.wave_top) // 2)
+                    if self.wave_top <= my < tree_end and index < len(self._tree_flat):
                         self.tree_cursor = index
                         self._panel_update_selected_scope()
                     self.menu_page = 0
