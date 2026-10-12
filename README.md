@@ -206,6 +206,23 @@ displayed signals, zoom, cursors, and per-signal settings. `;theme` and `\`
 still change only the palette. `;session` saves the mode and any subsequent
 appearance adjustments for that trace.
 
+For clearer separation between neighboring signals, press **`|`** to cycle
+**Compact → Blank gap → Divider**, or choose directly:
+
+```text
+;spacing blank
+;spacing divider
+;spacing compact
+```
+
+**Blank gap** adds one empty terminal row so a signal's low level cannot touch
+the next signal's high level. **Divider** adds a faint dotted line in that row.
+Both leave fewer signals visible; **Compact** remains the default. Dividers sit
+below the complete signal, including tall analog plots and comparison lanes.
+The **Q** grid setting can also add horizontal guides in gaps.
+Use `;session` to save your choice. Older fractional spacing settings retain
+their full-row gap with a dotted divider; saved two/three-row gaps also survive.
+
 Clock edges snap to the nearest terminal column. At zoom levels where a
 half-period spans a fractional number of columns, equal pulses can still
 differ by one column in width. Press `w` to select **Hi-res (sub-cell)** for
@@ -584,6 +601,41 @@ keeps its regex behavior. IPC, fairness, starvation, divergence, heatmaps, and
 register snapshots process history incrementally. The register panel reads
 indexed snapshots on a background worker. Aggregate memory scales with the
 number of harts (and heatmap dimensions), rather than retired instructions.
+Press **p** for the register panel: it shows x0–x31, ABI names, complete hex
+values, and the current PC/instruction on a cleared background. Columns adapt
+to terminal size; **PgUp/PgDn** or the mouse wheel over the panel reach the
+remaining registers when space is limited. Cursor navigation still updates the
+snapshot. **p** or **Esc** closes the panel. Unknown values show `--------`;
+loading and missing instruction data are labeled explicitly.
+
+Try the included [register-panel demo](demo_register_panel.vcd):
+
+```bash
+python3 alwavelets.py demo_register_panel.vcd --expanded --no-session
+```
+
+Press **p**, then enter `;goto 6500ns` and press Enter. The synthetic RV32
+writeback signals are tagged automatically; no manual setup is needed. The
+panel retains earlier register writes while the waveform shows each individual
+writeback. Values in the panel are hexadecimal.
+
+| Cursor command | What to look for in the panel |
+| --- | --- |
+| `;goto 0ns` | x0 is zero; other registers are unknown (`--------`). |
+| `;goto 6200ns` | All 32 registers are visible/available; hart 1 has x1=`00000201` through x31=`0000021f`. |
+| `;goto 6500ns` | Hart 0: a0=`00000005`, a1=`00000007`, a2=`0000000c`; the footer shows the addition. |
+| `;goto 6600ns`, then `;goto 6700ns` | Two identical `addi` instructions update a0 to 6, then 7. |
+| `;goto 6800ns` | No retirement: register values and the last retired instruction stay unchanged. |
+| `;goto 7100ns` | t0=`ffffffff`, t1=`80000000`, t2=`7fffffff`; full-width values remain readable. |
+| `;goto 7200ns` | A `nop` retires without changing registers; x0 stays zero. |
+| `;goto 7500ns` | Hart 1: a0=100, a1=200, a2=300 (hex `64`, `c8`, `12c`). |
+| `;goto 7600ns` | Back to hart 0: its a0=7 and a2=12 were preserved; a3=19 (`00000013`). |
+| `;goto 7700ns` | Hart 1 has its own a3=400 (`00000190`). |
+
+At a retirement time the newly written register is highlighted. Resize the
+terminal to try the adaptive columns and **PgUp/PgDn** paging. Regenerate the
+file with `python3 tools/generate_register_demo.py`.
+
 The historical `ipc` formula remains count divided by elapsed trace ticks;
 it does not normalize by a separately tagged clock.
 

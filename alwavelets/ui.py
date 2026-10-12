@@ -39,6 +39,7 @@ from .ui_inspection import InspectionMixin
 from .ui_editing import apply_format, format_targets, remember_entries, remember_rows, step_history
 from .ui_signal_menu import SignalMenuMixin
 from .ui_custom_radix import CustomRadixMixin
+from .ui_spacing import SPACING_MODES, row_spacing, spacing_name
 from .custom_radix import custom_radix_state, load_custom_radixes
 
 
@@ -285,7 +286,8 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         self.show_time_units = True   # show ns/us/ms in ruler instead of raw ticks
 
         # Signal spacing
-        self.signal_spacing = 0       # spacing index into SPACING_VALUES
+        self.signal_spacing = 0       # whole blank rows between signals
+        self.signal_divider = False
 
 
         # Signal name display
@@ -633,6 +635,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         self.show_menu_bar = mode['menu_bar']
         self.show_module_sep = mode['scope_separators']
         self.signal_spacing = 0
+        self.signal_divider = False
         self.menu_page = 0
         self.apply_theme()
         focused_row = self.sig_offset + self.focus_idx
@@ -772,15 +775,9 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         self.wave_top = self.ruler_row + 1
         self.inspector_rows = min(8, max(0, self.height - self.wave_top - 4)) if self.show_inspector else 0
         self.wave_bottom = self.height - 1 - self.inspector_rows
-        # Each signal takes (1 + spacing) rows, plus extra for diff pairs
+        # Each signal takes a waveform row and its gap, plus diff/analog rows.
         rows_for_signals = max(1, self.wave_bottom - self.wave_top)
-        # All non-zero spacings add at least 1 real separator row
-        if self.signal_spacing > 0 and self.signal_spacing < 1:
-            row_stride = 2  # signal row + thin separator row
-        elif self.signal_spacing >= 1:
-            row_stride = 1 + int(self.signal_spacing)
-        else:
-            row_stride = 1
+        row_stride = 1 + row_spacing(self)[0]
         # In diff mode, each differing signal takes 2 rows
         if hasattr(self, 'diff_ranges') and self.diff_ranges:
             # Estimate: assume ~half the signals have diffs
@@ -1602,6 +1599,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             'cursors': [self.cursor_a, self.cursor_b, self.cursor_b_on],
             'name_width': self.name_width,
             'signal_spacing': self.signal_spacing,
+            'signal_divider': row_spacing(self)[1],
             'show_grid': self.show_grid,
             'line_thickness': self.line_thickness,
             'value_label_size': self.value_label_size,
@@ -1697,9 +1695,10 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                 self.name_width = max(8, int(data['name_width']))
                 self._name_width_manual = True
             if 'signal_spacing' in data:
-                # float, not int: the fractional steps (0.25/0.5) would floor
-                # to 0 and silently lose the user's spacing.
+                # Keep legacy fractional gaps; row_spacing maps them to one
+                # full row with a dotted divider instead of block glyphs.
                 self.signal_spacing = float(data['signal_spacing'])
+                self.signal_divider = data.get('signal_divider') is True
             if 'show_grid' in data:
                 self.show_grid = int(data['show_grid']) % 3
             if 'line_thickness' in data:
@@ -2565,17 +2564,22 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
     # ── Signal Spacing ──
 
-    SPACING_VALUES = [0, 0.25, 0.5, 1, 2, 3]
-
     def cycle_signal_spacing(self):
-        """Cycle signal spacing: 0 → 0.25 → 0.5 → 1 → 2 → 3 → 0."""
-        idx = -1
-        for i, v in enumerate(self.SPACING_VALUES):
-            if abs(v - self.signal_spacing) < 0.01:
-                idx = i
-                break
-        self.signal_spacing = self.SPACING_VALUES[(idx + 1) % len(self.SPACING_VALUES)]
+        """Cycle Compact → Blank gap → Divider → Compact."""
+        self.set_signal_spacing()
+
+    def set_signal_spacing(self, mode=''):
+        mode = mode.strip().lower()
+        if not mode:
+            gap, divider = row_spacing(self)
+            mode = 'blank' if not gap else 'compact' if divider else 'divider'
+        if mode not in SPACING_MODES:
+            self._show_message('Use: spacing compact | blank | divider')
+            return
+        self.signal_spacing, self.signal_divider = SPACING_MODES[mode]
         self.update_layout()
+        self._needs_layout = self._dirty = True
+        self._show_message('Row spacing: ' + spacing_name(self))
 
     # ── Diff Mode ──
 
@@ -2652,6 +2656,10 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         except curses.error:
             return
 
+        if (getattr(self, 'show_reg_panel', False)
+                and self.register_panel_mouse(mx, my, bstate)):
+            return
+
         clicked = bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
         if (bstate & curses.BUTTON3_CLICKED and self._drag_anchor is None
                 and not (self.panel_mode and not self.sidebar_width and self.panel_focus == 0)
@@ -2718,12 +2726,11 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
         if bstate & curses.BUTTON1_CLICKED or bstate & curses.BUTTON1_PRESSED:
             self.cursor_time = t
-            # Update focus based on row clicked. int(): signal_spacing can be
-            # fractional (0.25/0.5), and // on a float yields a float, which
-            # then blows up every list index derived from focus_idx.
+            # Prefer actual drawn rows (including tall/diff signals). The
+            # fallback uses the same whole-row spacing as layout and drawing.
             hit_rows = getattr(self, '_signal_hit_rows', None)
             sig_row = (hit_rows.get(my, -1) if hit_rows is not None else
-                       int((my - self.wave_top) // (1 + self.signal_spacing)))
+                       (my - self.wave_top) // (1 + row_spacing(self)[0]))
             if 0 <= sig_row < self.visible_signals:
                 self.focus_idx = sig_row
             if bstate & curses.BUTTON1_PRESSED:              # possible drag start
@@ -2828,11 +2835,11 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                             self.draw_annotation_overlays()
                         if self.panel_mode:
                             self.draw_panel_tree()
-                        if self.show_reg_panel:
-                            self.draw_register_panel()
                         if self._drag_cur is not None:
                             self.draw_drag_selection()
                         self.draw_inspector()
+                        if self.show_reg_panel:
+                            self.draw_register_panel()
                         if getattr(self, 'show_instruction_results', False):
                             self.draw_instruction_results()
                         self.draw_status_bar()
@@ -2918,6 +2925,9 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                 if getattr(self, 'show_instruction_results', False):
                     if self.instruction_results_handle_key(key) == 'QUIT':
                         break
+                    continue
+
+                if self.show_reg_panel and self.register_panel_handle_key(key):
                     continue
 
                 # Panel mode: the tree gets first dibs on the key. Anything it

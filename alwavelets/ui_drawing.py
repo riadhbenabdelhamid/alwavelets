@@ -16,6 +16,8 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .streaming import read_cancellation
 from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_bottom, wave_origin
+from .ui_spacing import row_spacing, spacing_name
+from .ui_registers import RegisterPanelMixin
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -30,7 +32,7 @@ def _fmt_freq(hz):
 
 
 
-class DrawingMixin:
+class DrawingMixin(RegisterPanelMixin):
     def draw_manual_overlay(self):
         """Draw the extensive manual with navigation."""
         h, w = self.height, self.width
@@ -146,94 +148,6 @@ class DrawingMixin:
                 self.manual.goto(idx)
 
         return True
-
-
-    def draw_register_panel(self):
-        """Draw per-thread register file snapshot panel."""
-        if not self.instr_trace.built:
-            return
-
-        h, w = wave_bottom(self) + 1, self.width
-        panel_w = min(40, w // 3)
-        start_x = w - panel_w
-
-        from .instruction_store import InstructionResults
-        trace, cursor = self.instr_trace, self.cursor_time
-        if isinstance(trace.entries, InstructionResults):
-            from .background import BackgroundQueries
-            if not hasattr(self, '_queries'):
-                self._queries = BackgroundQueries()
-            state = self._queries.request('registers', (id(trace.entries), cursor), 'panel',
-                                          lambda cancel: trace.register_panel_state(cursor, cancel=cancel),
-                                          (0, [0] + [None] * 31, set(), None), cancellable=True)
-        else:
-            state = trace.register_panel_state(cursor)
-        cur_hart, regs, recent, current = state
-
-        # Header
-        hdr = f" Hart {cur_hart} Regs @t={self.cursor_time}"
-        try:
-            self.stdscr.addstr(2, start_x, hdr[:panel_w].ljust(panel_w),
-                              curses.color_pair(self.C_HEADER) | curses.A_BOLD)
-        except curses.error:
-            pass
-
-        # Register grid: 2 columns of 16 regs each
-        for i in range(32):
-            row = 3 + (i % 16)
-            col_offset = 0 if i < 16 else panel_w // 2
-            x = start_x + col_offset
-
-            if row >= h - 1:
-                break
-
-            name = RV32Decoder.REG_NAMES[i]
-            val = regs[i]
-            if val is None:
-                val_str = "--------"
-            elif val == 0 and i == 0:
-                val_str = "00000000"
-            else:
-                val_str = f"{val:08x}"
-
-            # Highlight recently-written registers
-            is_recent = i in recent
-
-            label = f"{name:>4}={val_str}"
-            attr = curses.color_pair(self.C_HIGH) | curses.A_BOLD if is_recent else curses.A_NORMAL
-            if i == 0:
-                attr = curses.A_DIM  # x0 is always 0
-
-            try:
-                self.stdscr.addstr(row, x, label[:panel_w//2], attr)
-            except curses.error:
-                pass
-
-        # Separator line
-        for row in range(2, min(20, h - 1)):
-            try:
-                self.stdscr.addch(row, start_x - 1, '│', curses.color_pair(self.C_MENUSEP))
-            except curses.error:
-                pass
-
-        # Info footer
-        info_row = 19 if 19 < h - 1 else h - 2
-        # Find current instruction
-        cur_instr = "---"
-        cur_pc = "---"
-        if current is not None:
-            cur_instr = current['decoded']['asm'][:20]
-            cur_pc = f"0x{current['pc']:08x}"
-        try:
-            self.stdscr.addstr(info_row, start_x,
-                              f" PC={cur_pc}"[:panel_w].ljust(panel_w),
-                              curses.color_pair(self.C_VAL))
-            if info_row + 1 < h - 1:
-                self.stdscr.addstr(info_row + 1, start_x,
-                                  f" {cur_instr}"[:panel_w].ljust(panel_w),
-                                  curses.color_pair(self.C_MENUKEY))
-        except curses.error:
-            pass
 
 
     def draw_header(self):
@@ -507,14 +421,8 @@ class DrawingMixin:
         self._signal_hit_rows = {}
         self._pending_row_ids = set()
         grid_columns = [col for col, _ in self._ruler_ticks()] if self.show_grid else ()
-        # Compute row stride: all non-zero spacing adds at least 1 separator row
-        if self.signal_spacing > 0 and self.signal_spacing < 1:
-            row_stride = 2  # signal + thin separator
-        elif self.signal_spacing >= 1:
-            row_stride = 1 + int(self.signal_spacing)
-        else:
-            row_stride = 1
-        frac_spacing = self.signal_spacing if 0 < self.signal_spacing < 1 else 0
+        gap_rows, divider = row_spacing(self)
+        row_stride = 1 + gap_rows
         self._rebuild_view_rows()      # refresh the group overlay (cheap, O(rows))
         visible = self.view_rows[self.sig_offset:self.sig_offset + self.visible_signals]
         queries = getattr(self, '_queries', None)
@@ -567,6 +475,7 @@ class DrawingMixin:
             # Analog signals may span several rows (H key); others are 1 row.
             sig_rows = self.sig_height.get(sig_id, 1) if is_analog else 1
             sig_rows = max(1, min(sig_rows, wave_bottom(self) - row))
+            signal_bottom = row + sig_rows
             for rr in range(row, row + sig_rows):
                 self._signal_hit_rows[rr] = idx
             custom_color = self.sig_color.get(sig_id, 0)
@@ -729,21 +638,12 @@ class DrawingMixin:
                 label = 'No recorded values'
             else:
                 label = ''
-            if self.show_grid >= 2:
-                # Horizontal separator after each signal
-                sep_row = row + row_stride - 1 if row_stride > 1 else row
-                if sep_row < wave_bottom(self) and sep_row != row:
-                    try:
-                        sep_line = '┈' * (self.width - signal_origin(self) - 1)
-                        self.stdscr.addstr(sep_row, signal_origin(self), sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
-                    except curses.error:
-                        pass
-
             # ── Split diff view: draw second waveform below with delimiters ──
             if has_diff and sig_id in self.diff_sig_map:
-                diff_row = row + 1
+                diff_row = signal_bottom
                 if diff_row < wave_bottom(self):
                     self._signal_hit_rows[diff_row] = idx
+                    signal_bottom += 1
                     extra_rows += 1
                     sig_b = self.diff_sig_map[sig_id]
                     sig_rx = self.get_signal_radix(sig_id)
@@ -897,22 +797,19 @@ class DrawingMixin:
                 except curses.error:
                     pass
 
-            # ── Fractional spacing: visual sub-row gap using block characters ──
-            if frac_spacing > 0:
-                sep_row = row + sig_rows
-                if sep_row < wave_bottom(self):
-                    gap_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
-                    if frac_spacing >= 0.5:
-                        # 0.5 = lower half block — looks like half a blank row
-                        gap_ch = '▄'
-                    else:
-                        # 0.25 = lower eighth block — looks like thin gap
-                        gap_ch = '▁'
-                    try:
-                        gap_line = gap_ch * (self.width - signal_origin(self) - 1)
-                        self.stdscr.addstr(sep_row, signal_origin(self), gap_line, gap_attr)
-                    except curses.error:
-                        pass
+            # Keep separators outside every waveform row, including analog
+            # heights and the comparison lane. Gaps have no signal hit target.
+            for offset in range(gap_rows):
+                sep_row = signal_bottom + offset
+                if sep_row >= wave_bottom(self):
+                    break
+                gap_ch = '┈' if offset == 0 and (divider or self.show_grid >= 2) else ' '
+                try:
+                    self.stdscr.addstr(sep_row, signal_origin(self),
+                                      gap_ch * (self.width - signal_origin(self) - 1),
+                                      curses.color_pair(self.C_SCOPE) | curses.A_DIM)
+                except curses.error:
+                    pass
 
         # ── Scroll-position indicator (right edge) ──
         # When there are more signals than fit, a thumb on the rightmost column
@@ -1102,10 +999,9 @@ class DrawingMixin:
             _put(f"▸ {focus_name}", curses.color_pair(self.C_HEADER) | curses.A_BOLD)
 
         # Spacing indicator
-        if self.signal_spacing > 0:
+        if row_spacing(self)[0]:
             _sep()
-            sp_str = f"{self.signal_spacing:g}" if self.signal_spacing != int(self.signal_spacing) else f"{int(self.signal_spacing)}"
-            _put(f"Spc:{sp_str}", curses.color_pair(self.C_HEADER) | curses.A_DIM)
+            _put('Spc:' + spacing_name(self), curses.color_pair(self.C_HEADER) | curses.A_DIM)
 
         # Markers
         if self.markers:

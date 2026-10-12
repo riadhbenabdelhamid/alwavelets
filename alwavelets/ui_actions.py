@@ -72,7 +72,7 @@ ACTION_INFO = {
     '_jump_next_module': ('Next module', 'Focus the next module in the waveform view'),
     '_jump_prev_module': ('Previous module', 'Focus the previous module in the waveform view'),
     '_vim_goto_last_in_module': ('Last signal in module', 'Focus the last waveform in the current module'),
-    'cycle_signal_spacing': ('Row spacing', 'Cycle the gap between waveform rows'),
+    'cycle_signal_spacing': ('Row spacing', 'Cycle Compact / Blank gap / Divider between signals'),
     'cycle_theme': ('Cycle theme', 'Change the color palette while keeping the current workmode'),
     '_kb_toggle_analog': ('Analog display', 'Toggle analog rendering for the focused waveform'),
     '_kb_toggle_indent': ('Indent signal names', 'Indent waveform labels by scope depth'),
@@ -120,6 +120,7 @@ COMMAND_INPUT = {
     'eval': ('Evaluate Tcl', '<script>', 'set time 100'),
 }
 COMMAND_INFO = {
+    'spacing': ('Row spacing', 'Cycle Compact / Blank gap / Divider (|)'),
     'signal-menu': ('Signal actions', 'Open the signal menu (F10)'),
     'expand-fields': ('Expand format components', 'Expand or collapse fixed-point/float fields (F)'),
     'undo': ('Undo', 'Undo a signal or layout edit (u)'),

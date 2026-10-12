@@ -398,16 +398,23 @@ u            <span class="cm"># undo any group edit</span></code></pre>
       <tr><td class="k"><kbd>L</kbd></td><td>Bus value label size: hidden / compact (4 chars) / full.</td></tr>
       <tr><td class="k"><kbd>t</kbd> · <kbd>Enter</kbd></td><td>Toggle at-cursor value column · full vs short signal names.</td></tr>
       <tr><td class="k"><kbd>i</kbd></td><td>Indent names by scope depth.</td></tr>
-      <tr><td class="k"><kbd>(</kbd> <kbd>)</kbd> · <kbd>|</kbd></td><td>Shrink/grow the name column · cycle row spacing (0 → 0.25 → 0.5 → 1 → 2 → 3).</td></tr>
+      <tr><td class="k"><kbd>(</kbd> <kbd>)</kbd> · <kbd>|</kbd></td><td>Shrink/grow the name column · cycle row spacing: <b>Compact → Blank gap → Divider</b>.</td></tr>
       <tr><td class="k"><kbd>T</kbd> · <kbd>Q</kbd></td><td>Ruler in time units vs raw ticks · grid off / vertical / both.</td></tr>
       <tr><td class="k"><kbd>\</kbd> · <kbd>C</kbd></td><td>Cycle built-in themes · show the color legend.</td></tr>
       <tr><td class="k"><kbd>D</kbd></td><td>Load a translation JSON (enum decode: raw value → state name shown on the wave).</td></tr>
       <tr><td class="k"><kbd>I</kbd></td><td>Protocol decode menu: SPI, I²C, UART overlays on the selected signals.</td></tr>
-      <tr><td class="k"><kbd>p</kbd> · <kbd>`</kbd></td><td>RISC-V register panel · ISA trace query prompt.</td></tr>
+      <tr><td class="k"><kbd>p</kbd> · <kbd>`</kbd></td><td>RISC-V register panel · ISA trace query prompt. The panel adapts its columns to terminal size and shows complete register values; <kbd>PgUp</kbd>/<kbd>PgDn</kbd> or the wheel over the panel page through registers when needed. <kbd>p</kbd>/<kbd>Esc</kbd> closes it.</td></tr>
       <tr><td class="k"><kbd>A</kbd></td><td>Add a time-anchored annotation (saved to the notes sidecar).</td></tr>
       <tr><td class="k"><kbd>F5</kbd></td><td>Live reload: watch the file and re-parse on change; <code>;follow</code> instead tails appended changes incrementally and auto-scrolls.</td></tr>
     </tbody>
   </table></div>
+  <h3 id="signal-spacing">Separating adjacent signals</h3>
+  <p>If the low level of one signal appears to touch the high level of the next, press <kbd>|</kbd> once from the default Compact mode to select <b>Blank gap</b>. It leaves one empty terminal row between signals. Press again for <b>Divider</b>, which draws a faint dotted line in that gap; another press returns to <b>Compact</b>.</p>
+  <pre class="block"><code>;spacing blank
+;spacing divider
+;spacing compact</code></pre>
+  <p>Blank gap and Divider show fewer signals at once. Their gaps sit below the complete waveform, including tall analog plots and comparison lanes. <kbd>Q</kbd>'s horizontal-grid option can also draw dotted guides in gaps. Save your choice with <code>;session</code>; changing workmode resets spacing to Compact.</p>
+  <p>Older sessions keep their row spacing: the former 0.25/0.5 choices become a full-row dotted divider instead of block characters, while saved two/three-row gaps retain their height.</p>
 </section>
 
 <!-- ══════════════════ CUSTOM NUMBER FORMATS ══════════════════ -->
@@ -518,7 +525,8 @@ u            <span class="cm"># undo any group edit</span></code></pre>
     <tr><td class="k"><code>find PAT</code></td><td>Focus a signal by name pattern — among those <em>already displayed</em>.</td></tr>
     <tr><td class="k"><code>add PAT…</code></td><td>Put signals on screen: <code>add top.valid top.ready</code>, <code>add top.alu.*</code>. This is how a script or agent changes which signals are shown; the interactive routes are <kbd>/</kbd> and <kbd>B</kbd>.</td></tr>
     <tr><td class="k"><code>remove PAT…</code> · <code>rm</code></td><td>Take signals off screen. Both are undoable with <kbd>u</kbd>.</td></tr>
-    <tr><td class="k"><code>grid</code> · <code>spacing</code> · <code>names</code> · <code>tree</code></td><td>Toggle grid · cycle spacing · full/short names · open the tree browser.</td></tr>
+    <tr><td class="k"><code>grid</code> · <code>names</code> · <code>tree</code></td><td>Cycle grid · full/short names · open the tree browser.</td></tr>
+    <tr><td class="k"><code>spacing [compact|blank|divider]</code></td><td>Select <a href="#signal-spacing">row separation</a>; omit the argument to cycle, as with <kbd>|</kbd>.</td></tr>
   </tbody></table></div>
 
   <h3>Analysis</h3>
@@ -823,6 +831,31 @@ sig.value_at(1500); sig.changes_in_window(0, 2000)           <span class="cm"># 
       <tr><td class="k">8</td><td><code>;session</code>, quit, reopen</td><td>The whole arrangement comes back on its own.</td></tr>
     </tbody>
   </table></div>
+  <h3>Register panel demo</h3>
+  <pre><code>python3 alwavelets.py demo_register_panel.vcd --expanded --no-session</code></pre>
+  <p>Press <kbd>p</kbd>, then type <code>;goto 6500ns</code> and press <kbd>Enter</kbd>.
+    This synthetic RV32 trace supplies automatically detected instruction, PC,
+    writeback, clock and hart signals. The panel reconstructs earlier writes and
+    displays hexadecimal values for the hart at the cursor.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Cursor command</th><th>Observe</th></tr></thead>
+    <tbody>
+      <tr><td><code>;goto 0ns</code></td><td>x0 is zero; registers without a write show <code>--------</code>.</td></tr>
+      <tr><td><code>;goto 6200ns</code></td><td>All registers have values; hart 1 has x1=<code>00000201</code> through x31=<code>0000021f</code>.</td></tr>
+      <tr><td><code>;goto 6500ns</code></td><td>Hart 0 adds a0=5 and a1=7 into a2=<code>0000000c</code>. Read the PC and instruction below the grid.</td></tr>
+      <tr><td><code>;goto 6600ns</code>, then <code>;goto 6700ns</code></td><td>Identical consecutive instructions increment a0 to 6, then 7.</td></tr>
+      <tr><td><code>;goto 6800ns</code></td><td>An idle cycle preserves all register values and the last retired instruction.</td></tr>
+      <tr><td><code>;goto 7100ns</code></td><td>Read full-width patterns: t0=<code>ffffffff</code>, t1=<code>80000000</code>, t2=<code>7fffffff</code>.</td></tr>
+      <tr><td><code>;goto 7200ns</code></td><td>A <code>nop</code> retires without changing registers; x0 stays zero.</td></tr>
+      <tr><td><code>;goto 7500ns</code></td><td>Hart 1 has a0=100, a1=200 and a2=300 (hex <code>64</code>, <code>c8</code>, <code>12c</code>).</td></tr>
+      <tr><td><code>;goto 7600ns</code></td><td>Hart 0 retains a0=7 and a2=12; its new a3 is 19 (<code>00000013</code>).</td></tr>
+      <tr><td><code>;goto 7700ns</code></td><td>Hart 1 retains its own values and writes a3=400 (<code>00000190</code>).</td></tr>
+    </tbody>
+  </table></div>
+  <p>New writes are highlighted at retirement. Resize the terminal to try adaptive
+    columns; use <kbd>PgUp</kbd>/<kbd>PgDn</kbd> when the registers need multiple pages.
+    Close with <kbd>p</kbd> or <kbd>Esc</kbd>. Regenerate the capture with
+    <code>python3 tools/generate_register_demo.py</code>.</p>
 </section>
 
 <footer>

@@ -21,10 +21,12 @@ class KeymapMixin:
         return 'QUIT'
 
     def _kb_escape(self):
-        """Esc cancels — a pending g- prefix, visual mode, then the
+        """Esc closes registers or cancels a pending g- prefix, visual mode, then the
         selection. It never quits: terminals deliver a bare Esc for unknown
         Alt/function-key sequences, and users press it to back out."""
-        if self._pending_g:
+        if getattr(self, 'show_reg_panel', False):
+            self.close_register_panel()
+        elif self._pending_g:
             self._pending_g = False
             self._show_message("g- cancelled")
         elif getattr(self, 'panel_mode', False) and self.panel_focus == 0:
@@ -108,10 +110,16 @@ class KeymapMixin:
         self.cursor_a = self.vcd.max_time
 
     def _kb_page_up(self):
+        if getattr(self, 'show_reg_panel', False):
+            self.page_register_panel(-1)
+            return
         self.sig_offset = max(0, self.sig_offset - self.visible_signals)
         self.focus_idx = 0
 
     def _kb_page_down(self):
+        if getattr(self, 'show_reg_panel', False):
+            self.page_register_panel(1)
+            return
         self.sig_offset = min(
             max(0, len(self.view_rows) - self.visible_signals),
             self.sig_offset + self.visible_signals
@@ -269,13 +277,19 @@ class KeymapMixin:
         self.show_tree = True
 
     def _kb_reg_panel(self):
-        self.show_reg_panel = not self.show_reg_panel
         if self.show_reg_panel:
-            if not self.instr_trace.built:
-                self._build_trace()
-            self._show_message("Register panel ON")
+            self.close_register_panel()
         else:
-            self._show_message("Register panel OFF")
+            self.show_reg_panel = True
+            self._register_panel_page = 0
+            self._register_panel_layout = None
+            self._drag_anchor = self._drag_cur = None
+            if not self.instr_trace.built:
+                if getattr(self, '_analysis_job', None) is not None:
+                    self._show_message('Analysis running; reopen registers after it finishes')
+                else:
+                    self._build_trace()
+        self._dirty = True
 
     def _kb_command_line(self):
         result = self.do_command_line()
