@@ -25,6 +25,9 @@ class KeymapMixin:
         if self._pending_g:
             self._pending_g = False
             self._show_message("g- cancelled")
+        elif getattr(self, 'panel_mode', False) and self.panel_focus == 0:
+            self.panel_focus = 1
+            self.menu_page = 0
         elif self._visual_mode:
             self._kb_visual_mode()
         elif self.selected_signals:
@@ -146,7 +149,8 @@ class KeymapMixin:
         # No status message: the panel appearing/disappearing already makes the
         # state obvious, and it keeps the status row stable during quick toggles.
         self.panel_mode = not self.panel_mode
-        self._name_width_manual = False
+        self.panel_focus = 0 if self.panel_mode else 1
+        self.menu_page = 0
         if self.panel_mode and not self._tree_flat:
             self._rebuild_tree()
         self._needs_layout = True
@@ -154,6 +158,7 @@ class KeymapMixin:
     def _kb_tab(self):
         if self.panel_mode:
             self.panel_focus = 1 - self.panel_focus
+            self.menu_page = 0
             focus_name = "Tree" if self.panel_focus == 0 else "Waveform"
             self._show_message(f"Focus: {focus_name}")
         else:
@@ -325,6 +330,8 @@ class KeymapMixin:
             K.KEY_F1: self._kb_show_manual,
             K.KEY_F2: self._kb_toggle_menu_bar,
             K.KEY_F3: self._kb_cycle_workmode,
+            K.KEY_F4: self.open_action_palette,
+            16: self.open_action_palette,  # Ctrl-P
             ord('C'): self._kb_show_colors,
             K.KEY_RIGHT: self._kb_cursor_right, ord('l'): self._kb_cursor_right,
             K.KEY_LEFT: self._kb_cursor_left, ord('h'): self._kb_cursor_left,

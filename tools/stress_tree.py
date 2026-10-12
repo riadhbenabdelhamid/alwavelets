@@ -52,6 +52,7 @@ def make_viewer(count, scopes=1):
     viewer.tree_cursor = viewer.tree_scroll = 0
     viewer.height, viewer.width, viewer.visible_signals = 40, 120, 30
     viewer.wave_top, viewer.ruler_row, viewer.panel_tree_width = 5, 4, 40
+    viewer.panel_mode, viewer.sidebar_width = True, min(viewer.panel_tree_width, viewer.width // 4)
     viewer.panel_focus, viewer.panel_selected_scope = 0, 'top' if scopes == 1 else 'top.block0'
     viewer.groups, viewer._group_by_name, viewer._member_group, viewer._group_depth = [], {}, {}, {}
     viewer.view_rows, viewer.sig_offset, viewer.focus_idx = list(viewer.display_order), 0, 0

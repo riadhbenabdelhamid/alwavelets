@@ -4,6 +4,7 @@ import curses
 import pytest
 
 from alwavelets.core import VCDSignal
+from alwavelets.ui_chrome import wave_origin
 from test_ui_chrome import Screen, viewer as _viewer_fixture
 
 viewer = _viewer_fixture
@@ -70,7 +71,7 @@ def test_mouse_clicks_and_markers_keep_exact_ticks(viewer, monkeypatch, offset):
     for col, delta in enumerate(ticks):
         for button in (curses.BUTTON1_CLICKED, curses.BUTTON3_CLICKED):
             monkeypatch.setattr(curses, 'getmouse', lambda: (
-                0, viewer.name_width + 1 + col, viewer.wave_top, 0, button))
+                0, wave_origin(viewer) + col, viewer.wave_top, 0, button))
             viewer.handle_mouse()
             timestamp = viewer.cursor_time if button == curses.BUTTON1_CLICKED else viewer.markers[-1].time
             assert timestamp == offset + delta
@@ -83,7 +84,7 @@ def test_mouse_wheel_keeps_time_under_pointer(viewer, monkeypatch, button, facto
     viewer.time_start, viewer.time_end, viewer.wave_width = offset, offset + 1000, 100
     viewer.cursor_a = offset + 800
     monkeypatch.setattr(curses, 'getmouse', lambda: (
-        0, viewer.name_width + 1 + 20, viewer.wave_top, 0, button))
+        0, wave_origin(viewer) + 20, viewer.wave_top, 0, button))
     viewer.handle_mouse()
     assert viewer.col_to_time(20) == offset + 200
     assert viewer.cursor_a == offset + 800
@@ -112,7 +113,7 @@ def test_grid_uses_ruler_columns_after_pan_zoom_and_resize(viewer, monkeypatch, 
         viewer.stdscr.erase()
         viewer.draw_ruler()
         viewer.draw_signals()
-        origin = viewer.name_width + 1
+        origin = wave_origin(viewer)
         tick_cols = {col for col in range(origin, viewer.width - 1)
                      if viewer.stdscr.rows[viewer.ruler_row][col] == '┬'}
         grid_cols = {col for col in range(origin, viewer.width - 1)
@@ -139,7 +140,7 @@ def test_grid_preserves_waveform_glyphs_labels_and_cached_rows(viewer, monkeypat
     viewer.draw_ruler()
     viewer.draw_signals()
     rows = range(viewer.wave_top, viewer.wave_top + (3 if analog else 1))
-    origin = viewer.name_width + 1
+    origin = wave_origin(viewer)
     before = {(row, col): viewer.stdscr.rows[row][col]
               for row in rows for col in range(origin, viewer.width - 1)}
     attrs = dict(viewer.stdscr.attrs)

@@ -6,6 +6,14 @@ def text_width(text):
     return sum(cell_width(char) for char in text)
 
 
+def signal_origin(viewer):
+    return getattr(viewer, 'signal_left', 0)
+
+
+def wave_origin(viewer):
+    return signal_origin(viewer) + viewer.name_width + 1
+
+
 def elide(text, width):
     """Fit a label without splitting a wide character; mark omitted text."""
     if width <= 0:

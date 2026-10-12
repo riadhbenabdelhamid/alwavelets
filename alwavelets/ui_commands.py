@@ -40,6 +40,7 @@ class CommandLineMixin:
         """verb -> zero-arg callable, bound to `args`. Single source for both
         the interactive prompt and the agent control channel."""
         return {
+            'actions': lambda: self.open_action_palette(),
             'help': lambda: self._cmd_help(),
             'zoom': lambda: self._cmd_zoom_range(args),
             'fit': lambda: self.zoom_fit_all(),
@@ -139,6 +140,7 @@ class CommandLineMixin:
 
     def _cmd_help(self):
         cmds = [
+            "actions   — Search actions and shortcuts (F4 / Ctrl-P)",
             "help      — Show this list",
             "zoom A B  — Set time range [A..B]",
             "fit       — Zoom to fit all",

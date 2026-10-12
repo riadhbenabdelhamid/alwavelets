@@ -202,15 +202,19 @@ class TreePanelMixin:
 
     def draw_panel_tree(self):
         """Draw the tree panel on the left side."""
-        tw = min(self.panel_tree_width, self.width // 2)
+        if not self.panel_mode or (not self.sidebar_width and self.panel_focus != 0):
+            return
+        tw = self.sidebar_width or max(1, self.width - 1)
         h = self.height
         has_focus = (self.panel_focus == 0)
 
         # Use cached tree (rebuilt on toggle, not on draw)
 
         # ── Tree panel header ──
-        hdr = " ▸ Modules" if has_focus else "   Modules"
-        if tw >= 22:
+        hdr = " ▸ Hierarchy" if has_focus else "   Hierarchy"
+        if not self.sidebar_width:
+            hdr += " · Tab / Esc: return to waves"
+        elif tw >= 22:
             hdr = hdr.ljust(tw - 5) + ' Tab '
         hdr_attr = curses.color_pair(self.C_MENUKEY if has_focus else self.C_MENU)
         if has_focus:
@@ -335,18 +339,17 @@ class TreePanelMixin:
 
     def panel_handle_tree_key(self, key):
         """Handle key input when tree panel has focus in split mode."""
+        if key not in (curses.KEY_DOWN, ord('j'), curses.KEY_UP, ord('k'),
+                       curses.KEY_RIGHT, ord('l'), curses.KEY_LEFT, ord('h'),
+                       curses.KEY_NPAGE, curses.KEY_PPAGE, curses.KEY_HOME, curses.KEY_END,
+                       ord(' '), 10, curses.KEY_ENTER):
+            return False
         n = len(self._tree_flat)
         if n == 0:
             for name in self.scope_tree.children:
                 self.tree_expanded.add(self.scope_tree.children[name].full_path)
             self._rebuild_tree()
             return True
-
-        if key not in (curses.KEY_DOWN, ord('j'), curses.KEY_UP, ord('k'),
-                       curses.KEY_RIGHT, ord('l'), curses.KEY_LEFT, ord('h'),
-                       curses.KEY_NPAGE, curses.KEY_PPAGE, curses.KEY_HOME, curses.KEY_END,
-                       ord(' '), 10, curses.KEY_ENTER):
-            return False
 
         if key == curses.KEY_DOWN or key == ord('j'):
             self.tree_cursor = min(self.tree_cursor + 1, n - 1)

@@ -15,7 +15,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .streaming import read_cancellation
-from .ui_chrome import elide, menu_pages, text_width
+from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_origin
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -277,90 +277,8 @@ class DrawingMixin:
             pass
         if not self.show_menu_bar:
             return
-        # Each entry: (key_label, description)
-        all_menu_items = [
-            ("?", "Help"),
-            ("F3", "Mode"),
-            ("/", "Find"),
-            ("+/-", "Zoom"),
-            ("Z", "Fit"),
-            ("Tab", "Focus / fold"),
-            ("s", "Panels"),
-            ("F1", "Manual"),
-            ("F2", "Hide guide"),
-            # ── Navigation ──
-            ("←→", "Scroll time"),
-            ("W", "Fit A↔B"),
-            ("↑↓", "Navigate signals"),
-            ("Home", "Start of file"),
-            ("End", "End of file"),
-            # ── VIM-style ──
-            ("gg", "First in scope level"),
-            ("G", "Last in scope level"),
-            ("V", "Visual line select"),
-            ("BS", "Remove selected"),
-            ("S↑↓", "Jump to prev/next module"),
-            ("S←→", "Collapse/expand scope"),
-            # ── Cursors & Markers ──
-            ("c", "Toggle cursor"),
-            ("12", "Cursor A/B"),
-            ("S", "Snap to edge"),
-            ("m", "Place marker"),
-            ("M", "Clear markers"),
-            ("<>", "Jump markers"),
-            ("gt", "Go to time"),
-            ("e", "Edge-to-edge"),
-            # ── Edge & Search ──
-            ("][", "Next/prev edge"),
-            ("f", "Find value"),
-            ("P", "Pattern trigger"),
-            ("n", "Next result"),
-            # ── Signal Management ──
-            ("B", "Scope tree (fullscreen)"),
-            ("x", "Expand bus bits"),
-            ("F", "Float decode (IEEE754)"),
-            ("{", "Collapse all modules"),
-            ("}", "Expand all modules"),
-            ("J/K", "Reorder signals"),
-            ("d/u", "Delete/undo signal"),
-            ("Spc", "Highlight signal"),
-            # ── Display ──
-            ("r", "Global radix"),
-            ("R", "Signal radix"),
-            ("v", "Signal color"),
-            ("H", "Signal height"),
-            ("L", "Waveform label size"),
-            ("w", "Wave style"),
-            ("()", "Name column ±"),
-            ("|", "Signal spacing"),
-            ("i", "Indent hierarchy mode"),
-            ("Ent", "Full/short names"),
-            ("a", "Analog toggle"),
-            ("t", "Values toggle"),
-            ("T", "Time units"),
-            ("Q", "Grid (off/vert/both)"),
-            ("\\", "Cycle theme"),
-            ("C", "Color guide"),
-            ("0/9", "Menu page ◀▶"),
-            # ── Protocol & Export ──
-            ("D", "Load decode file"),
-            ("I", "Protocol decode"),
-            (":", "Tcl command"),
-            (";", "CLI (diff, theme, trace, query ...)"),
-            ("`", "Trace query (ISA debug)"),
-            ("p", "Register panel"),
-            ("A", "Add annotation"),
-            (";formal", "CEX analyzer"),
-            (";power", "Power heatmap"),
-            (";axi", "Decode AXI"),
-            (";bm", "Bookmark"),
-            ("t", "Tag signal (in B tree)"),
-            ("T", "Load tag file (in B tree)"),
-            ("E", "Export menu"),
-            ("X", "SVG export"),
-            ("F5", "Live reload (watch file)"),
-            ("q", "Quit"),
-        ]
+        from .ui_actions import contextual_menu
+        all_menu_items = contextual_menu(self)
 
         # Reserve a fixed-width page control, then pack by actual cell width.
         # Every shortcut appears on a page, including unusually long entries.
@@ -448,20 +366,23 @@ class DrawingMixin:
             if start + len(label) <= self.wave_width:
                 ruler[start:start + len(label)] = label
 
-        name_header = elide(" Signals", self.name_width).ljust(self.name_width)
+        focused = not self.panel_mode or self.panel_focus == 1
+        heading = " ▸ Signals" if focused else "   Signals"
+        name_header = elide(heading, self.name_width).ljust(self.name_width)
         if self.show_values and self.cursor_on and self.name_width >= 18:
-            name_header = " Signals".ljust(self.name_width - 7) + " Value "
+            name_header = heading.ljust(self.name_width - 7) + " Value "
         try:
-            self.stdscr.addstr(row, 0, name_header, curses.color_pair(self.C_MENU))
-            self.stdscr.addstr(row, self.name_width, '│', curses.color_pair(self.C_MENUSEP))
-            self.stdscr.addstr(row, self.name_width + 1, ''.join(ruler)[:self.wave_width], curses.color_pair(self.C_MENU))
+            self.stdscr.addstr(row, signal_origin(self), name_header,
+                               curses.color_pair(self.C_MENUKEY if focused else self.C_MENU) | (curses.A_BOLD if focused else 0))
+            self.stdscr.addstr(row, wave_origin(self) - 1, '│', curses.color_pair(self.C_MENUSEP))
+            self.stdscr.addstr(row, wave_origin(self), ''.join(ruler)[:self.wave_width], curses.color_pair(self.C_MENU))
         except curses.error:
             pass
 
         # Draw cursor A on ruler
         if self.cursor_on:
             cc = self.time_to_col(self.cursor_a)
-            ac = self.name_width + 1 + cc
+            ac = wave_origin(self) + cc
             if 0 <= cc < self.wave_width and ac < self.width:
                 try:
                     self.stdscr.addch(row, ac, 'A', curses.color_pair(self.C_CURSOR) | curses.A_BOLD)
@@ -471,7 +392,7 @@ class DrawingMixin:
         # Draw cursor B on ruler
         if self.cursor_b_on:
             cc = self.time_to_col(self.cursor_b)
-            ac = self.name_width + 1 + cc
+            ac = wave_origin(self) + cc
             if 0 <= cc < self.wave_width and ac < self.width:
                 try:
                     self.stdscr.addch(row, ac, 'B', curses.color_pair(self.C_CURSORB) | curses.A_BOLD)
@@ -567,7 +488,7 @@ class DrawingMixin:
         """Keep waveform shapes intact; edges, x/z, and later overlays win."""
         grid_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
         for col in columns:
-            screen_col = self.name_width + 1 + col
+            screen_col = wave_origin(self) + col
             if screen_col >= self.width - 1 or col >= len(chars):
                 continue
             if attrs[col] in (1, 2, 3):  # transition/busy, unknown, high impedance
@@ -579,6 +500,7 @@ class DrawingMixin:
 
     def _draw_signals(self):
         start_row = self.wave_top
+        self._signal_hit_rows = {}
         grid_columns = [col for col, _ in self._ruler_ticks()] if self.show_grid else ()
         # Compute row stride: all non-zero spacing adds at least 1 separator row
         if self.signal_spacing > 0 and self.signal_spacing < 1:
@@ -608,6 +530,7 @@ class DrawingMixin:
                 break
 
             if self.is_group_header(sig_id):       # a collapsible group header row
+                self._signal_hit_rows[row] = idx
                 self._draw_group_header(row, sig_id[1], idx == self.focus_idx)
                 continue
 
@@ -636,6 +559,8 @@ class DrawingMixin:
             # Analog signals may span several rows (H key); others are 1 row.
             sig_rows = self.sig_height.get(sig_id, 1) if is_analog else 1
             sig_rows = max(1, min(sig_rows, self.height - 1 - row))
+            for rr in range(row, row + sig_rows):
+                self._signal_hit_rows[rr] = idx
             custom_color = self.sig_color.get(sig_id, 0)
             has_diff = sig_id in self.diff_ranges and self.diff_ranges[sig_id]
 
@@ -643,7 +568,7 @@ class DrawingMixin:
             if is_alt_row and getattr(self, 'workmode', 'classic') != 'minimal':
                 for rr in range(row, row + sig_rows):
                     try:
-                        self.stdscr.addstr(rr, 0, ' ' * (self.width - 1), curses.color_pair(self.C_ROWALT))
+                        self.stdscr.addstr(rr, signal_origin(self), ' ' * (self.width - signal_origin(self) - 1), curses.color_pair(self.C_ROWALT))
                     except curses.error:
                         pass
 
@@ -657,7 +582,7 @@ class DrawingMixin:
             indent_str = ""
             if self.indent_mode:
                 depth = len(sig.scope.split('.')) if sig.scope else 0
-                indent_str = "  " * min(depth, 5)
+                indent_str = "  " * min(depth, 5, max(0, (self.name_width - 8) // 2))
             prefix = f"{indent_str}▸{type_icon}" if is_focused else f"{indent_str} {type_icon}"
             scope_part = ""
             if self.show_full_names:
@@ -679,24 +604,20 @@ class DrawingMixin:
 
             # Calculate available widths
             avail = self.name_width - 1
-            prefix_w = 2 + len(indent_str)
-            scope_w = len(scope_part)
-            name_w = len(name_part)
-            val_w = len(val_str) + 1 if val_str else 0
+            prefix_w = text_width(prefix)
+            # Keep a useful signal label at small widths; full values remain
+            # available on the waveform and in the cursor readout.
+            val_str = elide(val_str, avail // 3) if avail >= 14 else ''
+            val_w = text_width(val_str) + 1 if val_str else 0
+            max_name_area = max(0, avail - prefix_w - val_w)
+            name_part = elide(name_part, max_name_area)
+            scope_part = elide(scope_part, max(0, max_name_area - text_width(name_part)))
 
-            max_name_area = avail - prefix_w - val_w
-            if scope_w + name_w > max_name_area:
-                if name_w > max_name_area:
-                    scope_part = ""
-                    name_part = name_part[:max(max_name_area, 3)]
-                else:
-                    scope_part = scope_part[:max(max_name_area - name_w, 0)]
-
-            content_len = prefix_w + len(scope_part) + len(name_part) + val_w
+            content_len = prefix_w + text_width(scope_part) + text_width(name_part) + val_w
             pad = max(0, avail - content_len)
 
             # ── Name color: bus vs wire distinction ──
-            col = 0
+            col = signal_origin(self)
             if is_selected:
                 name_attr = curses.color_pair(self.C_SELECT)
             elif is_focused:
@@ -729,9 +650,9 @@ class DrawingMixin:
                     col += 1
                 if scope_part:
                     self.stdscr.addstr(row, col, scope_part, curses.color_pair(self.C_SCOPE))
-                    col += len(scope_part)
+                    col += text_width(scope_part)
                 self.stdscr.addstr(row, col, name_part, name_attr)
-                col += len(name_part)
+                col += text_width(name_part)
                 if pad > 0:
                     self.stdscr.addstr(row, col, ' ' * pad, curses.A_NORMAL)
                     col += pad
@@ -739,8 +660,8 @@ class DrawingMixin:
                     self.stdscr.addstr(row, col, ' ', curses.A_NORMAL)
                     col += 1
                     self.stdscr.addstr(row, col, val_str, curses.color_pair(self.C_VAL) | curses.A_BOLD)
-                    col += len(val_str)
-                self.stdscr.addstr(row, self.name_width, '│', curses.color_pair(self.C_MENUSEP))
+                    col += text_width(val_str)
+                self.stdscr.addstr(row, wave_origin(self) - 1, '│', curses.color_pair(self.C_MENUSEP))
             except curses.error:
                 pass
 
@@ -753,7 +674,7 @@ class DrawingMixin:
                     akind = 'abraille' if self.line_thickness == 2 else 'amulti'
                     arows = self._render_row(akind, sig, sig_id, sig_rows)
                     for sr, (a_chars, a_attrs) in enumerate(arows):
-                        self._batched_addstr(row + sr, self.name_width + 1, a_chars, a_attrs)
+                        self._batched_addstr(row + sr, wave_origin(self), a_chars, a_attrs)
                         if grid_columns:
                             self._draw_wave_grid(row + sr, a_chars, a_attrs, grid_columns)
                     extra_rows += sig_rows - 1   # reserve the extra rows
@@ -761,18 +682,18 @@ class DrawingMixin:
                     wave_rows = [a[0] for a in arows]   # per-row glyphs for the band
                 else:
                     chars, attrs = self._render_row('analog', sig, sig_id)
-                    self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                    self._batched_addstr(row, wave_origin(self), chars, attrs)
                     if grid_columns:
                         self._draw_wave_grid(row, chars, attrs, grid_columns)
             elif sig.size == 1 and getattr(sig, 'signal_type', 'wire') != "real":
                 chars, attrs = self._render_row(
                     'sub' if self.line_thickness == 2 else 'bit', sig, sig_id)
-                self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                self._batched_addstr(row, wave_origin(self), chars, attrs)
                 if grid_columns:
                     self._draw_wave_grid(row, chars, attrs, grid_columns)
             else:
                 chars, attrs, labels = self._render_row('bus', sig, sig_id, sig_rx)
-                self._batched_addstr(row, self.name_width + 1, chars, attrs)
+                self._batched_addstr(row, wave_origin(self), chars, attrs)
                 if grid_columns:
                     self._draw_wave_grid(row, chars, attrs, grid_columns)
                 if self.value_label_size > 0:
@@ -786,7 +707,7 @@ class DrawingMixin:
                         translated = self.translations.translate(sig.name, raw_val, sig.size)
                         display_lbl = translated if translated else lbl
                         display_lbl = display_lbl[:max_lbl_len]
-                        ac = self.name_width + 1 + bcol
+                        ac = wave_origin(self) + bcol
                         if ac < self.width - 1 and bcol < self.wave_width:
                             dl = display_lbl[:min(len(display_lbl), self.width - ac - 1)]
                             try:
@@ -799,8 +720,8 @@ class DrawingMixin:
                 sep_row = row + row_stride - 1 if row_stride > 1 else row
                 if sep_row < self.height - 1 and sep_row != row:
                     try:
-                        sep_line = '┈' * (self.width - 1)
-                        self.stdscr.addstr(sep_row, 0, sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
+                        sep_line = '┈' * (self.width - signal_origin(self) - 1)
+                        self.stdscr.addstr(sep_row, signal_origin(self), sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
                     except curses.error:
                         pass
 
@@ -808,6 +729,7 @@ class DrawingMixin:
             if has_diff and sig_id in self.diff_sig_map:
                 diff_row = row + 1
                 if diff_row < self.height - 1:
+                    self._signal_hit_rows[diff_row] = idx
                     extra_rows += 1
                     sig_b = self.diff_sig_map[sig_id]
                     sig_rx = self.get_signal_radix(sig_id)
@@ -815,8 +737,8 @@ class DrawingMixin:
                     # Draw diff label
                     diff_label = "  ▿ diff"[:self.name_width-1].ljust(self.name_width-1)
                     try:
-                        self.stdscr.addstr(diff_row, 0, diff_label, curses.color_pair(self.C_DIFF_ED) | curses.A_DIM)
-                        self.stdscr.addstr(diff_row, self.name_width, '│', curses.color_pair(self.C_MENUSEP))
+                        self.stdscr.addstr(diff_row, signal_origin(self), diff_label, curses.color_pair(self.C_DIFF_ED) | curses.A_DIM)
+                        self.stdscr.addstr(diff_row, wave_origin(self) - 1, '│', curses.color_pair(self.C_MENUSEP))
                     except curses.error:
                         pass
 
@@ -830,7 +752,7 @@ class DrawingMixin:
                         d_chars, d_attrs = self._render_row('danalog', sig_b, sig_id)
                     else:
                         d_chars, d_attrs, _ = self._render_row('dbus', sig_b, sig_id, sig_rx)
-                    self._batched_addstr(diff_row, self.name_width + 1, d_chars, d_attrs)
+                    self._batched_addstr(diff_row, wave_origin(self), d_chars, d_attrs)
                     if grid_columns:
                         self._draw_wave_grid(diff_row, d_chars, d_attrs, grid_columns)
 
@@ -844,7 +766,7 @@ class DrawingMixin:
                             c1 = min(self.wave_width - 1, int((min(d_end, self.time_end) - self.time_start) / span * self.wave_width))
                             # Draw delimiter at start and end of diff region
                             for dc in (c0, c1):
-                                gac = self.name_width + 1 + dc
+                                gac = wave_origin(self) + dc
                                 if gac < self.width:
                                     try:
                                         self.stdscr.addch(row, gac, '┃', curses.color_pair(self.C_DIFF_ED) | curses.A_BOLD)
@@ -853,7 +775,7 @@ class DrawingMixin:
                                         pass
                             # Highlight diff region background on both rows
                             for dc in range(c0, c1 + 1):
-                                gac = self.name_width + 1 + dc
+                                gac = wave_origin(self) + dc
                                 if gac < self.width and dc % 4 == 0:
                                     try:
                                         self.stdscr.addch(row, gac, '░', curses.color_pair(self.C_DIFF_BG))
@@ -878,7 +800,7 @@ class DrawingMixin:
                 lo_c, hi_c = (ca, cb) if ca <= cb else (cb, ca)
                 start_rel = max(0, lo_c + 1)
                 end_rel = min(self.wave_width, hi_c)        # exclusive of B's column
-                bx = self.name_width + 1 + start_rel
+                bx = wave_origin(self) + start_rel
                 count = min(end_rel - start_rel, self.width - 1 - bx)
                 if count > 0:
                     for sr in range(sig_rows):
@@ -892,7 +814,7 @@ class DrawingMixin:
             # ── Cursor A / B (span all of a multi-row signal's rows) ──
             if self.cursor_on:
                 cc = self.time_to_col(self.cursor_a)
-                ac = self.name_width + 1 + cc
+                ac = wave_origin(self) + cc
                 if 0 <= cc < self.wave_width and ac < self.width:
                     for rr in range(row, row + sig_rows):
                         try:
@@ -902,7 +824,7 @@ class DrawingMixin:
 
             if self.cursor_b_on:
                 cc = self.time_to_col(self.cursor_b)
-                ac = self.name_width + 1 + cc
+                ac = wave_origin(self) + cc
                 if 0 <= cc < self.wave_width and ac < self.width:
                     for rr in range(row, row + sig_rows):
                         try:
@@ -913,7 +835,7 @@ class DrawingMixin:
             # ── Markers ──
             for marker in self.markers:
                 mc = self.time_to_col(marker.time)
-                ac = self.name_width + 1 + mc
+                ac = wave_origin(self) + mc
                 if 0 <= mc < self.wave_width and ac < self.width:
                     for rr in range(row, row + sig_rows):
                         try:
@@ -934,7 +856,7 @@ class DrawingMixin:
                 vmin, vmax = limits
                 attr = curses.color_pair(self.C_VAL) | curses.A_DIM
                 right = self.width - 2          # leave the scrollbar column free
-                left = self.name_width + 1
+                left = wave_origin(self)
                 if sig_rows > 1:
                     for r_idx, val in ((row, vmax), (row + sig_rows - 1, vmin)):
                         lbl = self._fmt_num(val)
@@ -965,8 +887,8 @@ class DrawingMixin:
                         # 0.25 = lower eighth block — looks like thin gap
                         gap_ch = '▁'
                     try:
-                        gap_line = gap_ch * (self.width - 1)
-                        self.stdscr.addstr(sep_row, 0, gap_line, gap_attr)
+                        gap_line = gap_ch * (self.width - signal_origin(self) - 1)
+                        self.stdscr.addstr(sep_row, signal_origin(self), gap_line, gap_attr)
                     except curses.error:
                         pass
 
@@ -974,7 +896,7 @@ class DrawingMixin:
         # When there are more signals than fit, a thumb on the rightmost column
         # (which the waveform leaves free) shows the visible window's position.
         total = len(self.display_order)
-        if total > self.visible_signals and self.width > self.name_width + 4:
+        if total > self.visible_signals and self.width > wave_origin(self) + 3:
             track_top = self.wave_top
             track_bot = self.height - 2
             track_h = max(1, track_bot - track_top + 1)
@@ -1005,7 +927,9 @@ class DrawingMixin:
         label = f"{focus}{indent}{arrow} {name}  ({count})"
         attr = curses.color_pair(self.C_HEADER) | curses.A_BOLD
         try:
-            self.stdscr.addstr(row, 0, label[:self.width - 1].ljust(self.width - 1), attr)
+            room = self.width - signal_origin(self) - 1
+            label = elide(label, room)
+            self.stdscr.addstr(row, signal_origin(self), label + ' ' * (room - text_width(label)), attr)
         except curses.error:
             pass
 
@@ -1014,13 +938,12 @@ class DrawingMixin:
         if row >= self.height - 1 or row < self.wave_top:
             return
         try:
-            # Draw dim separator line across full width
-            sep_line = '┄' * (self.width - 1)
-            self.stdscr.addstr(row, 0, sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
+            sep_line = '┄' * (self.width - signal_origin(self) - 1)
+            self.stdscr.addstr(row, signal_origin(self), sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
             # Overdraw the module name with highlighted background
-            label = f" {scope_name} "
-            x = 2
-            if x + len(label) < self.width:
+            x = signal_origin(self) + 2
+            label = elide(f" {scope_name} ", max(0, self.width - x - 1))
+            if label:
                 self.stdscr.addstr(row, x, label, curses.color_pair(self.C_HEADER) | curses.A_BOLD)
         except curses.error:
             pass
@@ -1038,7 +961,7 @@ class DrawingMixin:
         x1 = min(self.wave_width - 1, x1)
         if x1 < x0:
             return
-        off = self.name_width + 1
+        off = wave_origin(self)
         for row in range(self.ruler_row, self.height - 1):
             try:
                 self.stdscr.chgat(row, off + x0, x1 - x0 + 1, curses.A_REVERSE)
@@ -1245,6 +1168,9 @@ class DrawingMixin:
         width and the borders line up regardless of the content."""
         title = " ALWAVELETS QUICK HELP \u2014 F1 for full manual "
         sections = [
+            ("Actions", [
+                "F4/Ctrl-P Search commands · ↑↓ Choose · Enter Run · Esc Back",
+            ]),
             ("Navigation", [
                 "\u2190\u2192/hl Scroll \u00b7 \u2191\u2193/jk Signals \u00b7 +/- Zoom",
                 "Z Fit all \u00b7 W Fit A\u2194B \u00b7 S Snap \u00b7 Home/End \u00b7 PgUp/Dn",
@@ -1262,7 +1188,7 @@ class DrawingMixin:
                 "P Pattern \u00b7 / Find \u00b7 n Next",
             ]),
             ("Signals", [
-                "s Panel mode \u00b7 Tab Panel focus / fold group",
+                "s Hierarchy \u00b7 Tab Pane focus / fold group \u00b7 Esc Waves",
                 "B Scope tree \u00b7 { Collapse all \u00b7 } Expand all",
                 "x Expand bus \u00b7 F Float decode (S|E|M)",
                 "J/K Reorder \u00b7 d/u Del/undo \u00b7 Space Highlight",

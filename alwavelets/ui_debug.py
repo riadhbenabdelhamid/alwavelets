@@ -14,6 +14,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .ui_results import InstructionResultsMixin
+from .ui_chrome import wave_origin
 
 
 
@@ -305,11 +306,11 @@ class DebugActionsMixin(InstructionResultsMixin):
             return
         for a in self.annotations.in_range(self.time_start, self.time_end):
             col = self.time_to_col(a.time_start)
-            ac = self.name_width + 1 + col
+            ac = wave_origin(self) + col
             if 0 <= col < self.wave_width and ac < self.width:
                 icon, color = AnnotationStore.CATEGORY_MARKERS.get(a.category, ('*', 7))
                 try:
-                    self.stdscr.addch(2, ac, icon, curses.color_pair(self.C_MARKER) | curses.A_BOLD)
+                    self.stdscr.addch(self.ruler_row, ac, icon, curses.color_pair(self.C_MARKER) | curses.A_BOLD)
                 except curses.error:
                     pass
 

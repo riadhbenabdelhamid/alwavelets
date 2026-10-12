@@ -32,6 +32,8 @@ from .ui_commands import CommandLineMixin
 from .ui_keymap import KeymapMixin
 from .ui_debug import DebugActionsMixin, load_analysis_data
 from .ui_drawing import DrawingMixin
+from .ui_chrome import wave_origin
+from .ui_actions import ActionPaletteMixin
 
 
 # ══════════════════════════════════════════════════════════════
@@ -74,7 +76,7 @@ def nearest_color_256(r, g, b):
     return (232 + gi) if d_gray < d_cube else cube
 
 
-class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
+class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
     """Full-featured TUI waveform viewer."""
 
     # Color pair indices
@@ -240,6 +242,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         self.show_manual = False
         self.manual = AlwaveletsManual()
         self.show_colors = False
+        self.show_actions = False
         self.selected_signals = set()
         self.markers = []
         self.radix = Radix.HEX
@@ -310,7 +313,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
         # Panel mode (split view)
         self.panel_mode = True          # Default: panel mode on
-        self.panel_focus = 0            # 0=tree panel, 1=waveform panel
+        self.panel_focus = 1            # 0=hierarchy, 1=waveforms
         self.panel_tree_width = 30      # Width of tree panel in split mode
         self.panel_selected_scope = None  # Currently selected scope in tree       # Show signals indented by scope depth     # 0=hidden, 1=compact(4ch), 2=normal(full)
 
@@ -728,17 +731,19 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
 
     def update_layout(self):
         self.height, self.width = self.stdscr.getmaxyx()
-        # Auto-size name column only if user hasn't manually adjusted
-        if self.panel_mode:
-            self.name_width = self.panel_tree_width
-        elif not self._name_width_manual:
-            if self.width < 40:
-                self.name_width = max(8, self.width // 3)
+        # Keep waveform labels in their own column. A narrow terminal uses
+        # an explicitly focused browser overlay instead of squeezing traces.
+        self.sidebar_width = min(self.panel_tree_width, self.width // 4) if self.panel_mode and self.width >= 96 else 0
+        self.signal_left = self.sidebar_width + 1 if self.sidebar_width else 0
+        available = self.width - self.signal_left
+        if not self._name_width_manual:
+            if available < 40:
+                self.name_width = max(8, available // 3)
             else:
-                self.name_width = min(22, self.width // 4)
+                self.name_width = min(22, available // 4)
         # Clamp to terminal width
-        self.name_width = min(self.name_width, self.width // 2)
-        self.wave_width = max(1, self.width - self.name_width - 1)
+        self.name_width = min(self.name_width, available // 2)
+        self.wave_width = max(1, self.width - wave_origin(self))
         # Color separates the bars, leaving the vertical space for waveforms.
         #   menu shown:  0 title · 1 menu · 2 ruler · 3+ signals
         #   menu hidden: 0 title · 1 ruler · 2+ signals
@@ -2163,7 +2168,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                                          [], cancellable=True)
             for col, text in runs:
                 try:
-                    self.stdscr.addstr(row, self.name_width + 1 + col, text,
+                    self.stdscr.addstr(row, wave_origin(self) + col, text,
                                       curses.color_pair(self.C_BUSLBL) | curses.A_BOLD)
                 except curses.error:
                     pass
@@ -2176,7 +2181,7 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             if col_end <= col_start:
                 continue
             # Draw frame box with label
-            ac = self.name_width + 1 + col_start
+            ac = wave_origin(self) + col_start
             width = col_end - col_start
             label = frame.label[:width]
             try:
@@ -2629,9 +2634,30 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
         except curses.error:
             return
 
+        clicked = bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        if self._drag_anchor is None and getattr(self, 'ruler_row', 0) <= my < getattr(self, 'height', 100000) - 1:
+            sidebar = getattr(self, 'sidebar_width', 0)
+            browser = getattr(self, 'panel_mode', False) and (mx < sidebar or
+                       (not sidebar and self.panel_focus == 0))
+            if browser:
+                if clicked:
+                    self.panel_focus = 0
+                    index = self.tree_scroll + my - self.wave_top
+                    if self.wave_top <= my < max(self.wave_top + 1, self.height // 2) and index < len(self._tree_flat):
+                        self.tree_cursor = index
+                        self._panel_update_selected_scope()
+                    self.menu_page = 0
+                return
+            if clicked:
+                self.panel_focus = 1
+                self.menu_page = 0
+                row_index = getattr(self, '_signal_hit_rows', {}).get(my)
+                if row_index is not None:
+                    self.focus_idx = row_index
+
         # Clamp to the wave area so a drag can run past its edges.
-        wave_x = min(max(mx - self.name_width - 1, 0), max(self.wave_width - 1, 0))
-        in_wave = 0 <= mx - self.name_width - 1 < self.wave_width
+        wave_x = min(max(mx - wave_origin(self), 0), max(self.wave_width - 1, 0))
+        in_wave = 0 <= mx - wave_origin(self) < self.wave_width
         t = self.col_to_time(wave_x)
 
         # ── Drag-to-zoom: press anchors, motion tracks, release zooms ──
@@ -2657,7 +2683,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
             # Update focus based on row clicked. int(): signal_spacing can be
             # fractional (0.25/0.5), and // on a float yields a float, which
             # then blows up every list index derived from focus_idx.
-            sig_row = int((my - self.wave_top) // (1 + self.signal_spacing))
+            hit_rows = getattr(self, '_signal_hit_rows', None)
+            sig_row = (hit_rows.get(my, -1) if hit_rows is not None else
+                       int((my - self.wave_top) // (1 + self.signal_spacing)))
             if 0 <= sig_row < self.visible_signals:
                 self.focus_idx = sig_row
             if bstate & curses.BUTTON1_PRESSED:              # possible drag start
@@ -2739,7 +2767,9 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 if self._dirty:
                     self.stdscr.erase()
 
-                    if self.show_manual:
+                    if self.show_actions:
+                        self.draw_action_palette()
+                    elif self.show_manual:
                         self.draw_manual_overlay()
                     elif self.show_help:
                         self.draw_help_overlay()
@@ -2798,6 +2828,11 @@ class Alwavelets(DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin,
                 #    layout stays stale until a second resize ──
                 if key == curses.KEY_RESIZE:
                     self._needs_layout = True
+                    continue
+
+                if self.show_actions:
+                    if self.action_palette_handle_key(key) == 'QUIT':
+                        break
                     continue
 
                 # ── Manual takes full control of keys (F1/?? opens it) ──

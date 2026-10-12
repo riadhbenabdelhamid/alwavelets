@@ -58,11 +58,23 @@ stdlib, original artwork, no third-party assets.
 - **Scripting:** a small TCL-like command engine and an in-app command line.
 
 The compact title and shortcut bars leave more room for waveforms. The guide
-fits shortcuts to the terminal width; `0` / `9` page through them, `F2` hides
+shows actions for the focused pane and selected signals, using your configured
+keys. It fits shortcuts to the terminal width; `0` / `9` page through them, `F2` hides
 the guide, and `?` opens quick help. The dark theme uses quiet panel colors and
 a subtle A–B measurement region. Sidebar labels truncate at character-cell
 boundaries, and the status bar keeps complete readouts together while giving
 loading, errors, and agent-control activity priority on narrow terminals.
+
+Press **F4** or **Ctrl-P** (or enter `;actions`) to search actions and commands.
+Type words such as `fit cursors`, `workmode`, or `export`; use **↑/↓** to choose,
+**Enter** to run, and **Esc** to return. The palette shows shortcuts and a
+description; commands that need arguments prompt with their syntax.
+
+At **96 columns or wider**, the hierarchy browser, signal labels/values, and
+waveforms have separate columns. On smaller terminals, **Tab** opens the
+hierarchy as an overlay; **Tab** or **Esc** returns to waveforms. The active
+pane has a **▸** in its header. **s** toggles hierarchy browsing, and **(** / **)**
+adjust the signal-label width. Waveforms receive keyboard focus at startup.
 
 Three selectable **workmodes** combine a palette with presentation defaults:
 
