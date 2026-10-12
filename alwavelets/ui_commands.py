@@ -42,6 +42,7 @@ class CommandLineMixin:
         the interactive prompt and the agent control channel."""
         return {
             'signal-menu': lambda: self.open_signal_menu(),
+            'expand-fields': lambda: self.expand_format_fields(),
             'undo': lambda: self.undo(),
             'redo': lambda: self.redo(),
             'actions': lambda: self.open_action_palette(),
@@ -182,6 +183,7 @@ class CommandLineMixin:
             "radix R   — Set radix (bin/hex/dec/uns/f16/bf16/f32/f64/fixed/float)",
             "fixed I F [signed|unsigned] — Configure custom fixed-point",
             "float E M [bias|auto] [ieee|finite|nan] — Configure custom float",
+            "expand-fields — Expand/collapse focused fixed/float components (F)",
             "theme T   — Set theme or load JSON file",
             "workmode M — calm | classic | minimal (F3 cycles)",
             "export    — Export menu (CSV/SVG/PDF/screenshot)",

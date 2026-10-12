@@ -1214,7 +1214,7 @@ class DrawingMixin:
                 "F6 Inspector: signal details and A/B values",
                 "s Hierarchy \u00b7 Tab Pane focus / fold group \u00b7 Esc Waves",
                 "B Scope tree \u00b7 { Collapse all \u00b7 } Expand all",
-                "x Expand bus \u00b7 F Float decode (S|E|M)",
+                "x Expand bits \u00b7 F Fixed/float components",
                 "J/K Reorder \u00b7 d/u Del/undo \u00b7 Ctrl-R Redo",
                 "F10 Signal menu \u00b7 Space Select \u00b7 R/v/H Format selection",
                 "Enter Full/short names \u00b7 L Label size",

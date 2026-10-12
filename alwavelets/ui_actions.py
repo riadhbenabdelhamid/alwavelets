@@ -30,7 +30,7 @@ ACTION_INFO = {
     '_kb_cursor_b': ('Cursor B', 'Activate the second time cursor'),
     '_kb_toggle_cursor': ('Toggle cursor', 'Show or hide the time cursor'),
     'expand_bus': ('Expand bus bits', 'Expand or collapse individual bit lanes of the focused bus'),
-    'expand_float_fields': ('Decode float fields', 'Expand the focused bus into IEEE 754 fields'),
+    'expand_float_fields': ('Expand format components', 'Expand fixed-point or float into its fields and decoded value'),
     'cycle_signal_radix': ('Signal radix', 'Change the number format of selected waveforms, or the focused waveform'),
     '_kb_radix_cycle': ('Global radix', 'Change the number format for all waveforms'),
     '_kb_signal_color': ('Signal color', 'Change the color of selected waveforms, or the focused waveform'),
@@ -121,6 +121,7 @@ COMMAND_INPUT = {
 }
 COMMAND_INFO = {
     'signal-menu': ('Signal actions', 'Open the signal menu (F10)'),
+    'expand-fields': ('Expand format components', 'Expand or collapse fixed-point/float fields (F)'),
     'undo': ('Undo', 'Undo a signal or layout edit (u)'),
     'redo': ('Redo', 'Replay an undone signal or layout edit (Ctrl-R)'),
     'session': ('Save session', 'Save the current layout and appearance for this trace'),

@@ -940,66 +940,9 @@ def format_float_decomposed(val, fmt, size=1):
 
 
 def make_float_field_signals(parent_sig, fmt):
-    """
-    Create virtual signals for IEEE 754 field decomposition.
-    Returns list of (field_name, VCDSignal) for sign, exponent, mantissa.
-    """
-    total, exp_bits, man_bits, bias = float_format_spec(fmt)
-    results = []
-
-    # Sign bit
-    sign_sig = VCDSignal(
-        f"{parent_sig.name}.sign", f"{parent_sig.identifier}__fsign",
-        size=1, signal_type="wire", scope=parent_sig.scope
-    )
-    # Exponent field
-    exp_sig = VCDSignal(
-        f"{parent_sig.name}.exp", f"{parent_sig.identifier}__fexp",
-        size=exp_bits, signal_type="wire", scope=parent_sig.scope
-    )
-    # Mantissa field
-    man_sig = VCDSignal(
-        f"{parent_sig.name}.mant", f"{parent_sig.identifier}__fmant",
-        size=max(1, man_bits), signal_type="wire", scope=parent_sig.scope
-    )
-    # Decoded float value (as real)
-    float_sig = VCDSignal(
-        f"{parent_sig.name}.value", f"{parent_sig.identifier}__fval",
-        size=1, signal_type="real", scope=parent_sig.scope
-    )
-    float_sig.analog_mode = True
-
-    # Extract fields from parent's changes (decodes packed storage)
-    for t, v in parent_sig.changes:
-        if any(c in v for c in 'xXzZ'):
-            sign_sig.add_change(t, 'x')
-            exp_sig.add_change(t, 'x')
-            man_sig.add_change(t, 'x')
-            float_sig.add_change(t, 'x')
-            continue
-        try:
-            bits = int(v, 2)
-        except ValueError:
-            continue
-
-        s = (bits >> (total - 1)) & 1
-        e = (bits >> man_bits) & ((1 << exp_bits) - 1)
-        m = bits & ((1 << man_bits) - 1)
-
-        sign_sig.add_change(t, str(s))
-        exp_sig.add_change(t, format(e, f'0{exp_bits}b'))
-        man_sig.add_change(t, format(m, f'0{man_bits}b'))
-
-        fval, _, _, _, _, _ = ieee754_decode(bits, fmt)
-        float_sig.add_change(t, f"{fval}")
-
-    results = [
-        ('sign', sign_sig),
-        ('exp', exp_sig),
-        *([('mant', man_sig)] if man_bits else []),
-        ('value', float_sig),
-    ]
-    return results
+    """Create lazy sign/exponent/mantissa/value views of a binary float."""
+    from .components import make_component_signals
+    return make_component_signals(parent_sig, fmt)
 
 
 def format_value(val, radix, size=1):

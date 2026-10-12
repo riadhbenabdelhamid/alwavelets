@@ -150,9 +150,29 @@ and stored mantissa widths, followed optionally by a bias (`auto` means
 The default float slot uses 5 exponent bits, 10 mantissa bits, automatic bias,
 and `ieee`. Exponents may have 1–15 bits, mantissas may have zero bits, and the
 total width must not exceed 1024 bits. Explicit biases range from -65535 to
-65535. **F** expands a selected custom float into fields and a decoded value.
+65535.
 These formats describe individual words; any external scaling must be supplied
 separately. Analog display retains its existing numeric interpretation.
+
+To debug an encoding, focus its signal and press **F**, choose **F10 → Expand
+components**, or enter `;expand-fields`. The chosen radix determines the lanes:
+
+| Radix | Component lanes |
+| --- | --- |
+| f16 / bf16 / f32 / f64 / custom float | `.sign`, `.exp`, `.mant`, `.value` |
+| Custom fixed | `.sign` (signed only), `.integer`, `.fraction`, `.value` |
+
+Zero-width fields are omitted. Exponent and integer fields start in unsigned
+decimal; sign, mantissa, and fraction fields start in binary. These are the raw
+stored fields: signed fixed `11101000` with I=3/F=4 splits into `1 | 110 | 1000`
+and decodes to **-1.5**, using two's complement. The `.value` lane plots the
+decoded number. **x** expands a bus or component into individual bits.
+
+Press **F** on the parent again to collapse all its component and bit lanes.
+Expansion shares the signal's history and follows newly loaded samples. After
+editing a custom definition, collapse and expand again to refresh its lanes.
+Component lanes are temporary; expand them again after restoring a saved view
+or reloading the trace.
 
 Signal widths must match the configured total; a `width!` label reports a
 mismatch. Short VCD binary values are zero-extended, and unknown X/Z values are

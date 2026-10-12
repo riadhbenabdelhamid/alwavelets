@@ -357,7 +357,7 @@
       <tr><td class="k"><kbd>d</kbd> · <kbd>Backspace</kbd></td><td>Remove the focused signal · remove the whole selection.</td></tr>
       <tr><td class="k"><kbd>u</kbd> · <kbd>Ctrl-R</kbd></td><td><b>Undo / redo</b> supported edits: removes (single and bulk), moves, finder adds, radix/color/height changes, custom-format settings, analog toggles, and group edits. Also available as <code>;undo</code> / <code>;redo</code>.</td></tr>
       <tr><td class="k"><kbd>x</kbd></td><td>Expand a bus into per-bit virtual lanes.</td></tr>
-      <tr><td class="k"><kbd>F</kbd></td><td>Decompose the focused float bus into sign / exponent / mantissa / decoded-value lanes. Supports f16, bf16, f32, f64, and the selected <a href="#custom-float">custom float</a>. A zero-width mantissa has no lane. Press again to collapse.</td></tr>
+      <tr><td class="k"><kbd>F</kbd></td><td>Expand the focused signal into <a href="#format-components">numeric components</a>, using its chosen radix: sign / exponent / mantissa for floats, or sign / integer / fraction for fixed-point, plus a decoded-value lane. Press again on the parent to collapse.</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -468,7 +468,21 @@ u            <span class="cm"># undo any group edit</span></code></pre>
   <p>Example: an 8-bit float with 4 exponent bits, 3 mantissa bits, and automatic bias 7:</p>
   <pre class="block"><code>;float 4 3 auto ieee
 ;radix float</code></pre>
-  <p><code>00111100</code> splits into <code>0 | 0111 | 100</code> and displays <code>1.5 [+|E:7|M:4]</code>. <code>;float 2 1 auto finite</code> instead defines a 4-bit format whose <code>0111</code> word represents <code>6</code>. Press <kbd>F</kbd> on a bus using custom float to inspect its fields and decoded-value lane; collapse and expand again after changing the definition to regenerate those lanes.</p>
+  <p><code>00111100</code> splits into <code>0 | 0111 | 100</code> and displays <code>1.5 [+|E:7|M:4]</code>. <code>;float 2 1 auto finite</code> instead defines a 4-bit format whose <code>0111</code> word represents <code>6</code>.</p>
+
+  <h3 id="format-components">Debugging numeric components</h3>
+  <p>Choose a numeric radix, focus the signal, then press <kbd>F</kbd>, choose <kbd>F10</kbd> → <b>Expand components</b>, or enter <code>;expand-fields</code>. The parent stays visible, followed by its component lanes:</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Selected radix</th><th>Lanes</th></tr></thead>
+    <tbody>
+      <tr><td>f16, bf16, f32, f64, custom float</td><td><code>.sign</code>, <code>.exp</code> (stored exponent), <code>.mant</code> (stored mantissa), <code>.value</code> (decoded number).</td></tr>
+      <tr><td>Custom fixed</td><td><code>.sign</code> (signed only), <code>.integer</code>, <code>.fraction</code>, <code>.value</code> (decoded number).</td></tr>
+    </tbody>
+  </table></div>
+  <p>Fields with zero bits are omitted. Exponent and integer fields start in unsigned decimal; sign, mantissa, and fraction start in binary. Use the number-format menu to change an individual field's display, or <kbd>x</kbd> to expand it into bits. The decoded <code>.value</code> lane uses an analog plot.</p>
+  <p>Fixed-point fields show the <b>raw stored bits</b>. For signed I=3/F=4, <code>11101000</code> splits into <code>1 | 110 | 1000</code>, while <code>.value</code> reads <code>-1.5</code>. The integer field therefore starts at <code>6</code> and the fraction field at <code>1000</code>; their bits form a two's-complement word, not a sign-and-magnitude encoding. Unknown X/Z bits remain visible in their own fields; known fields stay readable.</p>
+  <p>Press <kbd>F</kbd> on the parent again to collapse its children, including any expanded bits. Lanes share the parent history without copying it and follow newly loaded samples. Collapse and expand again after editing a custom definition to rebuild the layout. Component lanes are temporary: expand them again after restoring a session/arrangement or reloading the trace.</p>
+  <p>For convenience, <kbd>F</kbd> also selects f16/f32/f64 on an ordinary 16/32/64-bit bus. An explicitly selected numeric format always takes precedence and must match the signal width.</p>
 
   <h3>Width checks, saving, and exports</h3>
   <p>A <code>width! (need 8b)</code> label means the signal width does not match the configured word width. Adjust the definition or select a matching bus. Short binary strings in a correctly sized VCD signal are zero-extended; unknown <code>X</code>/<code>Z</code> values remain unknown.</p>
@@ -528,6 +542,7 @@ u            <span class="cm"># undo any group edit</span></code></pre>
     <tr><td class="k"><code>radix R</code> · <code>theme T</code></td><td>Set global radix · switch theme by name or load a theme JSON path.</td></tr>
     <tr><td><code>fixed I F [signed|unsigned]</code></td><td>Configure the <a href="#custom-fixed">custom fixed-point slot</a>; integer bits exclude sign. Use <code>radix fixed</code> to select it globally.</td></tr>
     <tr><td><code>float E M [bias|auto] [ieee|finite|nan]</code></td><td>Configure the <a href="#custom-float">custom float slot</a>; use <code>radix float</code> to select it globally.</td></tr>
+    <tr><td><code>expand-fields</code></td><td>Expand/collapse the focused signal's <a href="#format-components">fixed-point or float components</a>, as with <kbd>F</kbd>.</td></tr>
     <tr><td class="k"><code>signal-menu</code> · <code>undo</code> · <code>redo</code></td><td>Open signal actions · undo a supported edit · redo it.</td></tr>
     <tr><td class="k"><code>decode F</code></td><td>Load a decode/translation JSON file.</td></tr>
     <tr><td class="k"><code>follow</code></td><td>Live-tail a growing dump (running simulation) with auto-scroll.</td></tr>

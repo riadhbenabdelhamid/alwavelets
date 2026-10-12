@@ -1530,6 +1530,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             with open(fname) as f:
                 data = json.load(f)
             data, missing = remap_view_state(self.vcd, data)
+            self._clear_expansion_views()
             self._undo_stack, self._redo_stack = [], []
             self._signal_menu = None
             # Validate signal IDs exist
@@ -1654,6 +1655,8 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             return False
         try:
             data, missing = remap_view_state(self.vcd, data)
+            if hasattr(self, '_clear_expansion_views'):
+                self._clear_expansion_views()
             self._undo_stack, self._redo_stack = [], []
             self._signal_menu = None
             valid = self.vcd.signals
@@ -1839,19 +1842,44 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             self.collapse_bus(sig_id)
             return
 
-        # Create virtual bit signals
+        self._install_expansion(sig_id, [('bit', VirtualBitSignal(sig, bit))
+                                        for bit in range(sig.size - 1, -1, -1)])
+
+    def _finish_expansion_edit(self):
+        self._sync_display_set()
+        self._rebuild_view_rows()
+        # IDs can be reused on re-expansion with a different format. Cancel
+        # old work as well as dropping cached results for the previous views.
+        self._row_cache.clear()
+        self._row_cache_window = None
+        queries = getattr(self, '_queries', None)
+        if queries is not None:
+            for group in ('rows', 'values', 'inspector'):
+                queries.invalidate(group)
+        self._needs_layout = self._dirty = True
+
+    def _install_expansion(self, sid, fields):
         virt_ids = []
-        for bit in range(sig.size - 1, -1, -1):  # MSB first
-            virt = VirtualBitSignal(sig, bit)
-            self.virtual_signals[virt.identifier] = virt
-            virt_ids.append(virt.identifier)
-
-        self.expanded_buses[sig_id] = virt_ids
-
-        # Insert virtual signals into display_order after parent
-        idx = self.display_order.index(sig_id) if sig_id in self.display_order else len(self.display_order)
+        for field, signal in fields:
+            base, counter = signal.identifier, 0
+            while signal.identifier in self.vcd.signals or signal.identifier in self.virtual_signals:
+                counter += 1
+                signal.identifier = f'{base}__{counter}'
+            vid = signal.identifier
+            self.virtual_signals[vid] = signal
+            virt_ids.append(vid)
+            self.sig_radix[vid] = Radix.UNSIGNED if field in ('exp', 'integer') else Radix.BIN
+            if field == 'value':
+                self.analog_signals.add(vid)
+        self.expanded_buses[sid] = virt_ids
+        idx = self.display_order.index(sid) if sid in self.display_order else len(self.display_order) - 1
         for i, vid in enumerate(virt_ids):
             self.display_order.insert(idx + 1 + i, vid)
+        self._finish_expansion_edit()
+
+    def _clear_expansion_views(self):
+        for sid in list(getattr(self, 'expanded_buses', {})):
+            self.collapse_bus(sid)
 
     def collapse_bus(self, sig_id=None):
         """Collapse expanded bus back to single signal."""
@@ -1860,83 +1888,58 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         if not sig_id or sig_id not in self.expanded_buses:
             return
         self._redo_stack = []
-        virt_ids = self.expanded_buses.pop(sig_id)
-        for vid in virt_ids:
-            if vid in self.display_order:
-                self.display_order.remove(vid)
+        pending, removed = [sig_id], set()
+        while pending:
+            children = self.expanded_buses.pop(pending.pop(), [])
+            pending.extend(children)
+            removed.update(children)
+        remove_display_ids(self.display_order, removed)
+        for vid in removed:
             self.virtual_signals.pop(vid, None)
+            self.sig_radix.pop(vid, None)
+            self.sig_color.pop(vid, None)
+            self.sig_height.pop(vid, None)
+        self.analog_signals.difference_update(removed)
+        self.selected_signals.difference_update(removed)
+        self._finish_expansion_edit()
 
     def expand_float_fields(self):
-        """Expand focused bus into float fields (sign/exp/mantissa/value)."""
-        sid = self.focused_signal_id()
+        """Compatibility entry point for the F shortcut and existing remaps."""
+        self.expand_format_fields()
+
+    def expand_format_fields(self, sid=None):
+        """Expand the chosen fixed/float format into raw fields and a value."""
+        from .components import make_component_signals
+        sid = self.focused_signal_id() if sid is None else sid
         if not sid:
             return
         sig = self.get_signal(sid)
-        # Collapsing remains available after changing the custom slot width.
         if sid in self.expanded_buses:
             self.collapse_bus(sid)
             return
+        if not sig or sig.signal_type in ('real', 'realtime'):
+            self._show_message('Choose a binary signal for component expansion')
+            return
         chosen = self.get_signal_radix(sid)
-        custom = isinstance(chosen, CustomFloat)
-        if custom and sig and sig.size != chosen.total_bits:
-            self._show_message(f'Custom float needs a {chosen.total_bits}-bit signal')
-            return
-        if not sig or (sig.size < 16 and not custom):
-            self._show_message("Signal must be ≥16 bits for float decode")
-            return
-
-        # A 16-bit bus can hold either half precision or bfloat16.
-        if custom:
+        if isinstance(chosen, (CustomFixed, CustomFloat)) or chosen in IEEE754_FORMATS:
             fmt = chosen
-        elif sig.size == 16:
-            fmt = Radix.BFLOAT16 if chosen == Radix.BFLOAT16 else Radix.FLOAT16
-        elif sig.size == 32:
-            fmt = Radix.FLOAT32
-        elif sig.size == 64:
-            fmt = Radix.FLOAT64
         else:
-            # Prompt user
-            choice = self.prompt_input(f"Float format for {sig.size}-bit ({sig.name}): [h]alf [b]f16 [s]ingle [d]ouble: ")
-            if not choice:
+            # Retain the existing F convenience for ordinary 16/32/64-bit
+            # buses. Explicit numeric radixes always take precedence.
+            fmt = {16: Radix.FLOAT16, 32: Radix.FLOAT32, 64: Radix.FLOAT64}.get(sig.size)
+            if fmt is None:
+                self._show_message('Choose a fixed or floating-point radix before expanding components')
                 return
-            c = choice[0].lower()
-            if c == 'h':
-                fmt = Radix.FLOAT16
-            elif c == 'b':
-                fmt = Radix.BFLOAT16
-            elif c == 's':
-                fmt = Radix.FLOAT32
-            elif c == 'd':
-                fmt = Radix.FLOAT64
-            else:
-                return
-
-        # Set the signal's radix to the float format
+        try:
+            fields = make_component_signals(sig, fmt)
+        except ValueError as exc:
+            self._show_message(str(exc))
+            return
         self._redo_stack = []
-        self.sig_radix[sid] = Radix.CUSTOM_FLOAT if custom else fmt
-
-        # Create field decomposition signals
-        fields = make_float_field_signals(sig, fmt)
-        virt_ids = []
-        for field_name, field_sig in fields:
-            vid = field_sig.identifier
-            self.virtual_signals[vid] = field_sig
-            virt_ids.append(vid)
-            # Auto-set the float value channel to analog
-            if field_name == 'value':
-                self.analog_signals.add(vid)
-            # Auto-set exponent to decimal radix
-            if field_name == 'exp':
-                self.sig_radix[vid] = Radix.UNSIGNED if custom else Radix.DEC
-            elif custom and field_name in ('sign', 'mant'):
-                self.sig_radix[vid] = Radix.BIN
-
-        self.expanded_buses[sid] = virt_ids
-
-        # Insert into display after parent
-        idx = self.display_order.index(sid) if sid in self.display_order else len(self.display_order)
-        for i, vid in enumerate(virt_ids):
-            self.display_order.insert(idx + 1 + i, vid)
+        self.sig_radix[sid] = (Radix.CUSTOM_FIXED if isinstance(fmt, CustomFixed) else
+                               Radix.CUSTOM_FLOAT if isinstance(fmt, CustomFloat) else fmt)
+        self._install_expansion(sid, fields)
+        self._show_message('Expanded components: ' + ', '.join(name for name, _ in fields))
 
     # ── Per-Signal Properties ──
 

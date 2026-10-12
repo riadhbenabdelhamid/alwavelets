@@ -119,6 +119,16 @@ def _column_samples(times, value_str, start, end, width, transform=None, lo=0, h
     return result
 
 
+def _sample_transform(sig):
+    """Project raw disk samples through every virtual field/bit view."""
+    if not isinstance(sig, VirtualBitSignal):
+        return None
+    parent_transform = _sample_transform(sig.parent)
+    if parent_transform is None:
+        return sig._extract_bit
+    return lambda raw: sig._extract_bit(parent_transform(raw))
+
+
 def _bit_lod_samples(sig, start, end, columns):
     times = sig._times
     lo, hi = 0, None
@@ -135,7 +145,7 @@ def _bit_lod_samples(sig, start, end, columns):
     else:
         return None
     samples = _column_samples(times, sig.value_str, start, end, columns,
-                              getattr(sig, '_extract_bit', None), lo, hi)
+                              _sample_transform(sig), lo, hi)
     first = sig.value_at(start) if samples[0][0] == 0 else samples[0][1]
     return samples, first
 
@@ -344,14 +354,14 @@ def draw_bus_culled(sig, t_start, t_end, width, radix):
         return chars, attrs, labels
     # Bisect-only transition count decides LOD, so a dense bus never decodes
     # the whole window's values just to be culled per column.
-    n_changes = sig.transition_count_in_window(t_start, t_end)
+    n_changes = getattr(sig, 'lod_event_count', sig.transition_count_in_window)(t_start, t_end)
 
     # ── LOD path (activate when transitions > pixels for symmetry) ──
     if n_changes > width:
         at = sig._times
         prev = sig.value_at(t_start)
         labels[0] = format_typed_value(sig, prev, radix)
-        samples = _column_samples(at, sig.value_str, t_start, t_end, width)
+        samples = _column_samples(at, sig.value_str, t_start, t_end, width, _sample_transform(sig))
         for col in range(width):
             # Shared half-open bins — see draw_single_bit_culled.
             check_read_cancel()

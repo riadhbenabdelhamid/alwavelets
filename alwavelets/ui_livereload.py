@@ -158,6 +158,8 @@ class LiveReloadMixin:
             del self._queries
         if hasattr(self, '_clear_decode_results'):
             self._clear_decode_results(all_results=True)
+        if hasattr(self, '_clear_expansion_views'):
+            self._clear_expansion_views()
         self.vcd.close()
         self.vcd = new_vcd
         self._undo_stack, self._redo_stack = [], []

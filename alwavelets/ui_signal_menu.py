@@ -1,7 +1,8 @@
 """Small signal action popup, shared by mouse and keyboard users."""
 import curses
 
-from .core import Radix
+from .core import Radix, IEEE754_FORMATS
+from .custom_radix import CustomFixed, CustomFloat
 from .ui_chrome import elide, signal_origin, text_width
 from .ui_editing import apply_format, format_targets, remove_rows
 
@@ -36,6 +37,14 @@ class SignalMenuMixin:
             if menu['bus']:
                 expanded = menu['targets'][0] in self.expanded_buses
                 items.append(('Collapse bus' if expanded else 'Expand bus', 'bus', None))
+            if len(menu['targets']) == 1:
+                sid = menu['targets'][0]
+                sig = self.get_signal(sid)
+                fmt = self.get_signal_radix(sid)
+                if (sig is not None and sig.signal_type not in ('real', 'realtime')
+                        and (isinstance(fmt, (CustomFixed, CustomFloat)) or fmt in IEEE754_FORMATS)):
+                    items.append(('Collapse components' if sid in self.expanded_buses else
+                                  'Expand components', 'components', None))
             items += [('Add to group…', 'group', None), ('Remove from view', 'remove', None)]
             return items
         if page == 'radix':
@@ -84,6 +93,8 @@ class SignalMenuMixin:
             self._sync_display_set()
             self._rebuild_view_rows()
             self._needs_layout = True
+        elif action == 'components':
+            self.expand_format_fields(targets[0])
         elif action == 'group':
             name = self.prompt_input('Add to group (name or parent/name): ')
             if not name or not name.strip():
