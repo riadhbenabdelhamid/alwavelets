@@ -41,6 +41,9 @@ class CommandLineMixin:
         """verb -> zero-arg callable, bound to `args`. Single source for both
         the interactive prompt and the agent control channel."""
         return {
+            'signal-menu': lambda: self.open_signal_menu(),
+            'undo': lambda: self.undo(),
+            'redo': lambda: self.redo(),
             'actions': lambda: self.open_action_palette(),
             'back': lambda: self.view_back(),
             'forward': lambda: self.view_forward(),
@@ -69,6 +72,8 @@ class CommandLineMixin:
             'stats': lambda: self._cmd_stats(),
             'measure': lambda: self._cmd_stats(),
             'radix': lambda: self._cmd_set_radix(args),
+            'fixed': lambda: self.configure_custom_radix('fixed', args),
+            'float': lambda: self.configure_custom_radix('float', args),
             'theme': lambda: self._cmd_load_theme(args),
             'workmode': lambda: self._cmd_workmode(args),
             'export': lambda: self.do_export_menu(),
@@ -145,6 +150,8 @@ class CommandLineMixin:
 
     def _cmd_help(self):
         cmds = [
+            "signal-menu — Actions for the focused signal or selection (F10)",
+            "undo / redo — Undo (u) or redo (Ctrl-R) a signal/layout edit",
             "actions   — Search actions and shortcuts (F4 / Ctrl-P)",
             "back      — Restore previous time range (F8)",
             "forward   — Return to next time range (F9)",
@@ -172,7 +179,9 @@ class CommandLineMixin:
             "            'session clear' forgets it, 'session load' re-applies",
             "stats     — Measure focused signal over A‥B or the visible window",
             "            (transitions, period/freq, duty; min/max for buses)",
-            "radix R   — Set radix (bin/hex/dec/uns/f16/f32/f64)",
+            "radix R   — Set radix (bin/hex/dec/uns/f16/bf16/f32/f64/fixed/float)",
+            "fixed I F [signed|unsigned] — Configure custom fixed-point",
+            "float E M [bias|auto] [ieee|finite|nan] — Configure custom float",
             "theme T   — Set theme or load JSON file",
             "workmode M — calm | classic | minimal (F3 cycles)",
             "export    — Export menu (CSV/SVG/PDF/screenshot)",
@@ -363,6 +372,7 @@ class CommandLineMixin:
             self._show_message(f"Derive error: {e}")
             return
         sid = sig.identifier
+        self._redo_stack = []
         self.virtual_signals[sid] = sig
         pos = self.sig_offset + self.focus_idx + 1
         if sid in self.display_order:
@@ -410,6 +420,7 @@ class CommandLineMixin:
         if len(words) > 1 and not members:
             self._show_message("group: nothing matched %s" % " ".join(words[1:]))
             return
+        restore = self._undo_groups_snapshot()
         if members:
             missing = [sid for sid in members if sid not in self._display_order_set]
             if missing:
@@ -426,8 +437,8 @@ class CommandLineMixin:
         if not members:
             self._show_message("Select signals first (V), then: group <name>")
             return
-        self.push_undo(f"group '{name}'", self._undo_groups_snapshot())
         if self.create_group(name, members, parent=parent):
+            self.push_undo(f"group '{name}'", restore)
             self.selected_signals.clear()
             self._visual_mode = False
             self._needs_layout = True
@@ -443,9 +454,9 @@ class CommandLineMixin:
             tok = self.focused_token()
             if self.is_group_header(tok):
                 name = tok[1]
-        if name and name in self._group_by_name:
-            self.push_undo(f"ungroup '{name}'", self._undo_groups_snapshot())
+        restore = self._undo_groups_snapshot()
         if name and self.ungroup(name):
+            self.push_undo(f"ungroup '{name}'", restore)
             self._needs_layout = True
             self._show_message(f"Ungrouped '{name}'")
         else:
@@ -547,6 +558,7 @@ class CommandLineMixin:
         r = args.strip().lower()
         for rx in Radix:
             if rx.value == r:
+                self._redo_stack = []
                 self.radix = rx
                 self._show_message(f"Radix: {r}")
                 return

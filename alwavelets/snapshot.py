@@ -9,11 +9,13 @@ import json
 import re
 
 from .core import Radix, ensure_trace_loaded, format_typed_value, xml_escape
+from .custom_radix import load_custom_radixes, resolve_custom_radix
 from .rendering import (draw_single_bit_culled, draw_single_bit_subcell,
                         draw_bus_culled, draw_analog_culled)
 from .analysis import measure_signal
 
 _RADIX = {
+    **{r.value: r for r in Radix},
     "bin": Radix.BIN, "binary": Radix.BIN,
     "hex": Radix.HEX, "hexadecimal": Radix.HEX,
     "dec": Radix.DEC, "decimal": Radix.DEC, "signed": Radix.DEC,
@@ -113,15 +115,19 @@ def _resolve_palette(theme):
 
 # ── Saved-view (arrangement) loading ─────────────────────────────────
 
+def _arrangement_data(vcd, path):
+    with open(path) as f:
+        data = json.load(f)
+    from .persistence import remap_view_state
+    return remap_view_state(vcd, data)[0]
+
+
 def load_arrangement(vcd, path):
     """Read a saved arrangement file and return (signal_full_names, radix_name).
 
     Versions 2/3 resolve identities or validated catalog ranges before mapping
     display order to full names; legacy files use raw identifiers."""
-    with open(path) as f:
-        data = json.load(f)
-    from .persistence import remap_view_state
-    data, _ = remap_view_state(vcd, data)
+    data = _arrangement_data(vcd, path)
     names = []
     for sid in data.get("display_order", []):
         sig = vcd.signals.get(sid)
@@ -130,22 +136,25 @@ def load_arrangement(vcd, path):
     return names, data.get("radix")
 
 
-def _resolve_request(vcd, signals, radix, arrangement):
+def _resolve_request(vcd, signals, radix, arrangement, *, per_signal=False):
     """Resolve the effective (signal objects, Radix) from explicit args plus an
     optional arrangement (explicit args win)."""
     names = list(signals) if signals else []
-    arr_radix = None
+    data = {}
     if arrangement:
-        arr_names, arr_radix = load_arrangement(vcd, arrangement)
+        data = _arrangement_data(vcd, arrangement)
         if not names:
-            names = arr_names
+            names = [vcd.signals[sid].full_name for sid in data.get('display_order', [])
+                     if sid in vcd.signals]
     sigs = resolve_signals(vcd, names) if names else []
-    rx = None
-    if radix:
-        rx = _RADIX.get(str(radix).lower())
-    if rx is None and arr_radix:
-        rx = _RADIX.get(str(arr_radix).lower())
-    return sigs, (rx or Radix.HEX)
+    explicit = _RADIX.get(str(radix).lower()) if radix else None
+    rx = explicit or _RADIX.get(str(data.get('radix')).lower(), Radix.HEX)
+    profiles = load_custom_radixes(data.get('custom_radixes'))
+    if per_signal:
+        saved = data.get('sig_radix', {})
+        return sigs, [resolve_custom_radix(explicit or _RADIX.get(saved.get(s.identifier), rx), profiles)
+                      for s in sigs]
+    return sigs, resolve_custom_radix(rx, profiles)
 
 
 def resolve_signals(vcd, patterns):
@@ -224,11 +233,11 @@ def render_text(vcd, signals=None, t_start=None, t_end=None, width=100,
     if t_end <= t_start:
         t_end = t_start + 1
 
-    sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
+    sigs, radixes = _resolve_request(vcd, signals, radix, arrangement, per_signal=True)
     if not sigs:
         return "(no signals matched: %s)" % ", ".join(signals or ["(none given)"])
 
-    return render_signal_rows(vcd, [(s, rx, s.analog_mode) for s in sigs],
+    return render_signal_rows(vcd, [(s, rx, s.analog_mode) for s, rx in zip(sigs, radixes)],
                               t_start, t_end, width, name_width, header)
 
 
@@ -284,7 +293,7 @@ def iter_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
     if t_end <= t_start:
         t_end = t_start + 1
     ensure_trace_loaded(vcd, t_start, t_end)
-    sigs, rx = _resolve_request(vcd, signals, radix, arrangement)
+    sigs, radixes = _resolve_request(vcd, signals, radix, arrangement, per_signal=True)
     pal = _resolve_palette(theme)
 
     margin = 12
@@ -310,6 +319,7 @@ def iter_svg(vcd, signals=None, t_start=None, t_end=None, width=900,
                % (total_w - margin, ry, xml_escape(vcd.time_to_str(t_end))))
 
     for i, sig in enumerate(sigs):
+        rx = radixes[i]
         check_cancel(cancel)
         y0 = margin + row_h * (i + 1)
         ytop, ybot, ymid = y0 + 4, y0 + row_h - 6, y0 + row_h // 2

@@ -94,6 +94,79 @@ overview uses time metadata and stays provisional while the extent is loading.
 Both optional panels start hidden, work in all three workmodes, and save with
 `;session`. Config fields `inspector` and `overview` set their startup defaults.
 
+**F10** (or `;signal-menu`) opens a small action menu beside the focused signal.
+Right-click a signal's label to open it there. Choose a number format, color,
+analog height, bus expansion, grouping, or removal; **↑/↓** choose, **Enter**
+applies, and **Esc** returns or closes. Right-clicking an unselected label
+selects that target for the menu; right-clicking a selected label keeps the
+selection. Right-clicking waveforms still places markers.
+
+Select signals with **Space** or **V**, then use **R**, **v**, or **H** to change
+their radix, color, or analog height together. Cycling uses the focused selected
+signal's setting (or the first selected signal by ID when focus is elsewhere)
+and applies that same setting to the selection. The menu offers explicit choices
+and a **Default** option to clear overrides. With no selection, these actions
+affect the focused signal. Digital rows retain their fixed height.
+
+Floating-point radixes include **f16**, **bf16** (bfloat16), **f32**, and **f64**.
+Choose BF16 in the signal menu or use `;radix bf16` for the global setting.
+On a 16-bit bus with BF16 selected, **F** expands its sign, exponent, mantissa,
+and decoded value. The `bf16` setting also works in config, saved sessions,
+and snapshot exports.
+
+Two configurable number formats are also available: **fixed** and **float**.
+See the [custom number formats guide](docs/index.html#custom-radixes) for a
+walkthrough, bit-pattern examples, and the configuration reference.
+In **F10 → Number format**, use **Configure custom fixed…** or
+**Configure custom float…**, then select the corresponding format to apply it
+to the selected/focused signals. The prompt starts with the current settings;
+edit them, press Enter to accept, or Esc to cancel. Both slots also participate
+in **r**/**R** cycling. Settings changes support undo/redo and update every
+signal using that slot within the viewer.
+
+```text
+;fixed 3 4 signed
+;radix fixed
+;float 4 3 auto ieee
+;radix float
+```
+
+Fixed-point values use two's complement when signed; integer bits **exclude
+the sign bit**. Use `unsigned` to omit the sign. The displayed value is the
+decoded integer divided by `2^fraction_bits`, with exact decimal output.
+Total widths from 1 to 1024 bits are supported, including zero fraction bits.
+The default slot is signed, with 7 integer and 8 fraction bits (16 bits total).
+
+Custom floats have one sign bit, an implicit leading significand bit for normal
+numbers, and subnormal values when the exponent is zero. Configure exponent
+and stored mantissa widths, followed optionally by a bias (`auto` means
+`2^(exponent_bits-1)-1`) and a special-value policy:
+
+- `ieee`: the maximum exponent encodes infinity or NaN.
+- `finite`: the maximum exponent encodes ordinary finite values.
+- `nan`: only the maximum exponent **and** maximum mantissa encode NaN;
+  the remaining patterns are finite. This policy needs at least one mantissa bit.
+
+The default float slot uses 5 exponent bits, 10 mantissa bits, automatic bias,
+and `ieee`. Exponents may have 1–15 bits, mantissas may have zero bits, and the
+total width must not exceed 1024 bits. Explicit biases range from -65535 to
+65535. **F** expands a selected custom float into fields and a decoded value.
+These formats describe individual words; any external scaling must be supplied
+separately. Analog display retains its existing numeric interpretation.
+
+Signal widths must match the configured total; a `width!` label reports a
+mismatch. Short VCD binary values are zero-extended, and unknown X/Z values are
+preserved. Sessions and arrangements store both slot definitions and signal
+assignments. Text/SVG snapshots using a saved arrangement honor those settings;
+an explicit snapshot radix overrides the saved signal assignments.
+
+**u** / `;undo` reverses an edit; **Ctrl-R** / `;redo` reapplies it to the original
+signals, even after changing focus or selection. Each bulk formatting/removal
+operation is one history entry. Editing history holds up to 100 entries and
+covers formatting, analog toggles, add/remove, reordering, and grouping. A new
+edit clears redo; navigation preserves it. Restoring a session/arrangement or
+reloading a trace clears editing history. History itself is not saved in sessions.
+
 An empty view explains whether no signals are selected, scopes are folded, or
 the trace is still loading, and shows the relevant selection/navigation keys.
 
@@ -579,6 +652,10 @@ ignored. `keys` maps an action name to a single character.
   "workmode": "classic",
   "theme": "phosphor",
   "radix": "hex",
+  "custom_radixes": {
+    "fixed": {"integer_bits": 7, "fraction_bits": 8, "signed": true},
+    "float": {"exponent_bits": 5, "mantissa_bits": 10, "bias": null, "specials": "ieee"}
+  },
   "wave_style": 2,
   "menu_bar": false,
   "grid": 1,

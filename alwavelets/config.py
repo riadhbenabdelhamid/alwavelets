@@ -18,6 +18,11 @@ defaults, so a malformed config never blocks startup. Example:
 The workmode supplies presentation defaults; explicit theme/menu settings
 override them. `workmode` accepts "calm", "classic" (default), or "minimal".
 
+`custom_radixes` optionally configures two shared slots: "fixed" accepts
+integer_bits, fraction_bits, signed; "float" accepts exponent_bits,
+mantissa_bits, bias (null for automatic), specials (ieee/finite/nan).
+The global `radix` and individual signals may select "fixed" or "float".
+
 `keys` maps an action name (the keymap handler name, e.g. "quit", "zoom_in",
 "next_edge") to a single character that should trigger it.
 """

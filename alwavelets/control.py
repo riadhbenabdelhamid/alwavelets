@@ -31,6 +31,7 @@ import socket
 import stat
 import threading
 import time
+from .custom_radix import custom_radix_state
 
 PROTOCOL_VERSION = 1
 
@@ -384,6 +385,7 @@ def snapshot_state(v):
                    for g in v.groups],
         "markers": [{"time": m.time, "label": m.label} for m in v.markers],
         "radix": v.radix.value,
+        "custom_radixes": custom_radix_state(getattr(v, 'custom_radixes', None)),
         "workmode": getattr(v, 'workmode', 'classic'),
         "theme": getattr(v, 'current_theme', 'classic'),
         "message": v._message or "",

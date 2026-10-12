@@ -17,8 +17,8 @@ def clip_cells(text, limit):
     return text, used
 
 
-def read_prompt(screen, label, attribute=0):
-    text, cursor, left = '', 0, 0
+def read_prompt(screen, label, attribute=0, initial=''):
+    text, cursor, left = initial, len(initial), 0
     curses.noecho()
     curses.curs_set(1)
     try:

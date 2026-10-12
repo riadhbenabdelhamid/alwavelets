@@ -12,6 +12,7 @@ ACTION_INFO = {
     'toggle_inspector': ('Signal inspector', 'Show or hide focused signal details and cursor values'),
     'toggle_overview': ('Timeline overview', 'Show or hide the whole-trace position strip; click to navigate'),
     'open_action_palette': ('Actions', 'Search commands and keyboard actions'),
+    'open_signal_menu': ('Signal actions', 'Open a menu beside the focused signal; formatting applies to the selection'),
     '_kb_help': ('Help', 'Show quick keyboard help'),
     '_kb_show_manual': ('Manual', 'Open the full reference manual'),
     '_kb_cycle_workmode': ('Workmode', 'Cycle Classic, Minimal, and Calm presentation'),
@@ -30,10 +31,10 @@ ACTION_INFO = {
     '_kb_toggle_cursor': ('Toggle cursor', 'Show or hide the time cursor'),
     'expand_bus': ('Expand bus bits', 'Expand or collapse individual bit lanes of the focused bus'),
     'expand_float_fields': ('Decode float fields', 'Expand the focused bus into IEEE 754 fields'),
-    'cycle_signal_radix': ('Signal radix', 'Change the number format of the focused waveform'),
+    'cycle_signal_radix': ('Signal radix', 'Change the number format of selected waveforms, or the focused waveform'),
     '_kb_radix_cycle': ('Global radix', 'Change the number format for all waveforms'),
-    '_kb_signal_color': ('Signal color', 'Change the focused waveform color'),
-    '_kb_signal_height': ('Signal height', 'Change the focused analog waveform height'),
+    '_kb_signal_color': ('Signal color', 'Change the color of selected waveforms, or the focused waveform'),
+    '_kb_signal_height': ('Signal height', 'Change the height of selected analog waveforms, or the focused waveform'),
     '_kb_label_size': ('Value labels', 'Cycle hidden, compact, and full bus labels'),
     '_kb_line_thickness': ('Wave style', 'Cycle thin, ultra-thin, and half-cell resolution'),
     '_kb_toggle_grid': ('Grid', 'Cycle off, vertical, and both grid directions'),
@@ -42,6 +43,7 @@ ACTION_INFO = {
     '_kb_backspace_remove': ('Remove selection', 'Remove selected waveforms; undo with the Undo action'),
     'delete_signal': ('Remove signal', 'Remove the focused waveform from the view'),
     'undo': ('Undo', 'Undo the last supported signal or layout edit'),
+    'redo': ('Redo', 'Replay the last undone signal or layout edit'),
     '_kb_move_signal_up': ('Move signal up', 'Reorder the focused waveform'),
     '_kb_move_signal_down': ('Move signal down', 'Reorder the focused waveform'),
     '_kb_command_line': ('Command prompt', 'Enter a viewer command'),
@@ -110,12 +112,17 @@ COMMAND_INPUT = {
     'loadgtkw': ('Load GTKWave layout', '<path>', 'trace.gtkw'),
     'savegtkw': ('Save GTKWave layout', '<path>', 'trace.gtkw'),
     'radix': ('Set global radix', '<radix>', 'hex'),
+    'fixed': ('Configure custom fixed-point', '<integer bits> <fraction bits> [signed|unsigned]', '7 8 signed'),
+    'float': ('Configure custom float', '<exponent bits> <mantissa bits> [bias|auto] [ieee|finite|nan]', '5 10 auto ieee'),
     'theme': ('Choose theme', '<name or path>', 'phosphor'),
     'workmode': ('Choose workmode', '<calm|classic|minimal>', 'classic'),
     'decode': ('Load value translations', '<path>', 'opcodes.txt'),
     'eval': ('Evaluate Tcl', '<script>', 'set time 100'),
 }
 COMMAND_INFO = {
+    'signal-menu': ('Signal actions', 'Open the signal menu (F10)'),
+    'undo': ('Undo', 'Undo a signal or layout edit (u)'),
+    'redo': ('Redo', 'Replay an undone signal or layout edit (Ctrl-R)'),
     'session': ('Save session', 'Save the current layout and appearance for this trace'),
     'stats': ('Signal statistics', 'Measure the focused waveform in the current time range'),
     'cancel': ('Cancel analysis', 'Stop the current analysis job'),
@@ -166,6 +173,10 @@ def contextual_menu(viewer):
     else:
         if viewer.selected_signals:
             items += [item('_kb_backspace_remove', f'Remove {len(viewer.selected_signals)} selected'), item('undo')]
+        if getattr(viewer, '_redo_stack', []):
+            items.append(item('redo'))
+        if viewer.selected_signals or viewer.focused_signal_id() is not None:
+            items.append(item('open_signal_menu'))
         sid = viewer.focused_signal_id()
         sig = viewer.get_signal(sid) if sid else None
         if sig is not None:

@@ -25,6 +25,8 @@ class TclEngine:
             'cursor': self._cmd_cursor,
             'marker': self._cmd_marker,
             'radix': self._cmd_radix,
+            'fixed': lambda args: self.viewer.configure_custom_radix('fixed', ' '.join(args)),
+            'float': lambda args: self.viewer.configure_custom_radix('float', ' '.join(args)),
             'analog': self._cmd_analog,
             'set': self._cmd_set,
             'puts': self._cmd_puts,
@@ -172,6 +174,7 @@ class TclEngine:
         if args:
             for r in Radix:
                 if r.value == args[0]:
+                    self.viewer._redo_stack = []
                     self.viewer.radix = r
                     break
 
@@ -180,6 +183,7 @@ class TclEngine:
             for sid in self.viewer.display_order:
                 sig = self.viewer.vcd.signals.get(sid)
                 if sig and fnmatch.fnmatch(sig.name, pat):
+                    self.viewer._redo_stack = []
                     self.viewer.analog_signals.add(sid)
 
     def _cmd_set(self, args):

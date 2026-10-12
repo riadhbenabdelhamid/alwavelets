@@ -12,6 +12,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .ui_navigation import set_time_range
+from .ui_editing import remember_members, remove_rows
 
 
 
@@ -210,15 +211,14 @@ class KeymapMixin:
         self.update_layout()
 
     def _kb_radix_cycle(self):
+        self._redo_stack = []
         radixes = list(Radix)
         self.radix = radixes[(radixes.index(self.radix) + 1) % len(radixes)]
 
     def _kb_toggle_analog(self):
         sid = self.focused_signal_id()
         if sid:
-            def _undo(sid=sid, was=(sid in self.analog_signals)):
-                (self.analog_signals.add if was else self.analog_signals.discard)(sid)
-            self.push_undo("analog toggle", _undo)
+            self.push_undo("analog toggle", remember_members(self.analog_signals, [sid]))
             if sid in self.analog_signals:
                 self.analog_signals.discard(sid)
             else:
@@ -250,27 +250,7 @@ class KeymapMixin:
 
     def _kb_backspace_remove(self):
         if self.selected_signals:
-            from .display_order import DisplayOrder, member_positions
-            removed = (member_positions(self.display_order, self.selected_signals)
-                       if isinstance(self.display_order, DisplayOrder) else
-                       [(i, sid) for i, sid in enumerate(self.display_order) if sid in self.selected_signals])
-            for i, _ in reversed(removed):
-                self.display_order.pop(i)
-            # Keep the finder's membership set in sync, or `/` will refuse to
-            # re-add these signals (it treats them as already displayed).
-            self._display_order_set.difference_update(s for _, s in removed)
-            self._scope_check_cache = {}
-
-            def _undo(removed=removed):
-                for i, sid in removed:     # ascending: indices stay valid
-                    if sid in self._display_order_set:
-                        continue
-                    self.display_order.insert(min(i, len(self.display_order)), sid)
-                    self._display_order_set.add(sid)
-            self.push_undo(f"remove {len(removed)} signals", _undo)
-            self.selected_signals.clear()
-            self._visual_mode = False
-            self._show_message(f"Removed {len(removed)} signals (u to undo)")
+            remove_rows(self, self.selected_signals)
         else:
             self.delete_signal()
 
@@ -281,13 +261,9 @@ class KeymapMixin:
 
     def _kb_signal_color(self):
         self.cycle_signal_color()
-        c = self.sig_color.get(self.focused_signal_id(), 0)
-        self._show_message(f"Color: {c}" if c else "Color: default")
 
     def _kb_signal_height(self):
         self.cycle_signal_height()
-        h = self.sig_height.get(self.focused_signal_id(), 1)
-        self._show_message(f"Height: {h}")
 
     def _kb_show_tree(self):
         self.show_tree = True
@@ -392,6 +368,8 @@ class KeymapMixin:
             127: self._kb_backspace_remove, 8: self._kb_backspace_remove,
             ord('d'): self.delete_signal,
             ord('u'): self.undo,
+            18: self.redo,  # Ctrl-R
+            K.KEY_F10: self.open_signal_menu,
             ord('/'): self.open_finder,
             ord('n'): self.next_search_result,
             ord('f'): self.do_find_value,

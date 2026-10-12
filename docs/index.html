@@ -197,6 +197,7 @@
   <a href="#keys-signals">Managing the signal list</a>
   <a href="#groups">Groups (incl. nested)</a>
   <a href="#keys-display">Display &amp; styling</a>
+  <a href="#custom-radixes">Custom number formats</a>
   <a href="#mouse">Mouse</a>
   <div class="grp">Command layer</div>
   <a href="#cmdline">The ; command line</a>
@@ -354,9 +355,9 @@
       <tr><td class="k"><kbd>Space</kbd></td><td>Toggle-highlight the focused signal (scattered multi-select).</td></tr>
       <tr><td class="k"><kbd>J</kbd> / <kbd>K</kbd></td><td>Move the focused signal down / up in the list.</td></tr>
       <tr><td class="k"><kbd>d</kbd> · <kbd>Backspace</kbd></td><td>Remove the focused signal · remove the whole selection.</td></tr>
-      <tr><td class="k"><kbd>u</kbd></td><td><b>Undo</b> — one stack for every layout/styling change: removes (single and bulk), moves, finder adds, radix/color/height cycles, analog toggles, group edits. Flashes what it undid.</td></tr>
+      <tr><td class="k"><kbd>u</kbd> · <kbd>Ctrl-R</kbd></td><td><b>Undo / redo</b> supported edits: removes (single and bulk), moves, finder adds, radix/color/height changes, custom-format settings, analog toggles, and group edits. Also available as <code>;undo</code> / <code>;redo</code>.</td></tr>
       <tr><td class="k"><kbd>x</kbd></td><td>Expand a bus into per-bit virtual lanes.</td></tr>
-      <tr><td class="k"><kbd>F</kbd></td><td>Decompose a float bus into IEEE-754 sign / exponent / mantissa / value lanes (f16/f32/f64).</td></tr>
+      <tr><td class="k"><kbd>F</kbd></td><td>Decompose the focused float bus into sign / exponent / mantissa / decoded-value lanes. Supports f16, bf16, f32, f64, and the selected <a href="#custom-float">custom float</a>. A zero-width mantissa has no lane. Press again to collapse.</td></tr>
     </tbody>
   </table></div>
 </section>
@@ -388,11 +389,12 @@ u            <span class="cm"># undo any group edit</span></code></pre>
   <div class="tblwrap"><table>
     <thead><tr><th>Key</th><th>Action</th></tr></thead>
     <tbody>
-      <tr><td class="k"><kbd>r</kbd> · <kbd>R</kbd></td><td>Cycle the global radix · the focused signal's own radix (bin / hex / dec / unsigned / f16 / f32 / f64).</td></tr>
+      <tr><td class="k"><kbd>r</kbd> · <kbd>R</kbd></td><td>Cycle the global radix · apply the next radix to the selection, or the focused signal if nothing is selected. Choices: bin / hex / dec / uns / f16 / bf16 / f32 / f64 / fixed / float.</td></tr>
+      <tr><td class="k"><kbd>F10</kbd></td><td>Open signal actions → <b>Number format</b> to choose a radix or configure the <a href="#custom-radixes">two custom slots</a>. <b>Default (global)</b> clears per-signal overrides. Also available by right-clicking a signal label or entering <code>;signal-menu</code>.</td></tr>
       <tr><td class="k"><kbd>a</kbd></td><td>Toggle analog rendering for the focused signal (line graph instead of bits).</td></tr>
-      <tr><td class="k"><kbd>H</kbd></td><td>Cycle signal height 1–4 rows. Multi-row analog gets real vertical resolution.</td></tr>
+      <tr><td class="k"><kbd>H</kbd></td><td>Cycle selected/focused signal height 1–4 rows. Multi-row analog gets real vertical resolution.</td></tr>
       <tr><td class="k"><kbd>w</kbd></td><td>Wave style: ultra-thin → thin → <b>hi-res</b>. Hi-res doubles horizontal resolution for bits (sub-cell ▀▄▚▞) and draws multi-row analog as a <b>braille curve</b> (2×4 sub-pixels per cell) — see the ADC in the hero above.</td></tr>
-      <tr><td class="k"><kbd>v</kbd></td><td>Cycle a per-signal color (6 user colors + default).</td></tr>
+      <tr><td class="k"><kbd>v</kbd></td><td>Cycle the color of selected/focused signals (6 user colors + default).</td></tr>
       <tr><td class="k"><kbd>L</kbd></td><td>Bus value label size: hidden / compact (4 chars) / full.</td></tr>
       <tr><td class="k"><kbd>t</kbd> · <kbd>Enter</kbd></td><td>Toggle at-cursor value column · full vs short signal names.</td></tr>
       <tr><td class="k"><kbd>i</kbd></td><td>Indent names by scope depth.</td></tr>
@@ -408,6 +410,73 @@ u            <span class="cm"># undo any group edit</span></code></pre>
   </table></div>
 </section>
 
+<!-- ══════════════════ CUSTOM NUMBER FORMATS ══════════════════ -->
+<section id="custom-radixes">
+  <h2>Custom number formats</h2>
+  <p class="lead">Define how a bus encodes a number using two reusable radix slots: <code>fixed</code> for fixed-point values and <code>float</code> for a custom floating-point layout.</p>
+  <p>The built-in floating-point choices remain available: <code>f16</code>, <code>bf16</code> (bfloat16), <code>f32</code>, and <code>f64</code>. Choose BF16 in the signal menu or enter <code>;radix bf16</code>; <kbd>F</kbd> honors BF16 when it is selected on a 16-bit bus.</p>
+
+  <h3>Configure, then apply</h3>
+  <ol>
+    <li>Focus a waveform, or select several with <kbd>Space</kbd> / <kbd>V</kbd>.</li>
+    <li>Open <kbd>F10</kbd> → <b>Number format</b> → <b>Configure custom fixed…</b> or <b>Configure custom float…</b>. Edit the prefilled settings; <kbd>Ctrl-U</kbd> clears the input, <kbd>Enter</kbd> accepts, and <kbd>Esc</kbd> cancels.</li>
+    <li>Back in the number-format menu, choose <b>Custom fixed</b> or <b>Custom float</b> to apply that slot to the selected/focused signals. Its label shows the current layout and total width.</li>
+  </ol>
+  <p><code>;fixed</code> and <code>;float</code> also open the configuration prompts. With arguments they configure directly, using the syntax below. Configuration alone does not assign the radix: use the menu for selected signals, or <code>;radix fixed</code> / <code>;radix float</code> for the global default. Signals with explicit overrides keep them until you choose <b>Default (global)</b>.</p>
+  <div class="callout"><b>Two shared slots.</b> Each viewer has one fixed-point definition and one float definition. Editing a slot updates all signals using it in that viewer. Both settings edits and per-signal assignments support <kbd>u</kbd> / <kbd>Ctrl-R</kbd> undo/redo. The slots also appear in <kbd>r</kbd> / <kbd>R</kbd> cycling.</div>
+
+  <h3 id="custom-fixed">Custom fixed-point</h3>
+  <pre class="block"><code>;fixed &lt;integer bits&gt; &lt;fraction bits&gt; [signed|unsigned]</code></pre>
+  <p><b>Integer bits exclude the sign bit.</b> Signed values use two's complement with a total width of <code>1 + I + F</code>; unsigned values use <code>I + F</code>. The displayed value is the decoded integer divided by <code>2^F</code>, with exact decimal output.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>Meaning and limits</th></tr></thead>
+    <tbody>
+      <tr><td>Integer bits (<code>I</code>)</td><td>0–1024 bits to the left of the binary point, excluding the optional sign.</td></tr>
+      <tr><td>Fraction bits (<code>F</code>)</td><td>0–1024 bits to the right of the binary point; zero gives integer values.</td></tr>
+      <tr><td>Signedness</td><td><code>signed</code> (the command default) or <code>unsigned</code>.</td></tr>
+      <tr><td>Total width</td><td>Must be 1–1024 bits and match the signal width.</td></tr>
+      <tr><td>Initial slot</td><td><code>7 8 signed</code>: a 16-bit word with 1 sign, 7 integer, and 8 fraction bits.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Example: interpret an 8-bit bus as signed fixed-point with 3 integer and 4 fraction bits:</p>
+  <pre class="block"><code>;fixed 3 4 signed
+;radix fixed</code></pre>
+  <p>The raw word <code>11101000</code> represents <code>-24 / 16 = -1.5</code>. With <code>;fixed 4 4 unsigned</code>, the same 8-bit word represents <code>232 / 16 = 14.5</code>. Changing the definition refreshes signals already using <code>fixed</code>.</p>
+
+  <h3 id="custom-float">Custom floating-point</h3>
+  <pre class="block"><code>;float &lt;exponent bits&gt; &lt;mantissa bits&gt; [bias|auto] [ieee|finite|nan]</code></pre>
+  <p>Words contain one sign bit, then <code>E</code> exponent bits and <code>M</code> stored mantissa bits: <code>1 + E + M</code> bits in total. Normal numbers have an implicit leading 1; exponent zero represents signed zero or subnormal values.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>Meaning and limits</th></tr></thead>
+    <tbody>
+      <tr><td>Exponent bits (<code>E</code>)</td><td>1–15.</td></tr>
+      <tr><td>Mantissa bits (<code>M</code>)</td><td>0–1022, subject to the 1024-bit total limit. Counts stored bits only.</td></tr>
+      <tr><td>Bias</td><td><code>auto</code> (the command default) means <code>2^(E-1)-1</code>. Alternatively, supply an integer from -65535 to 65535.</td></tr>
+      <tr><td>Total width</td><td>Must be 2–1024 bits and match the signal width.</td></tr>
+      <tr><td>Initial slot</td><td><code>5 10 auto ieee</code>: a 16-bit word with bias 15.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The final argument controls how the maximum exponent is interpreted. Supply a bias or <code>auto</code> before choosing a policy:</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Policy</th><th>Maximum-exponent behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>ieee</code> (default)</td><td>Zero mantissa means infinity; nonzero mantissa means NaN.</td></tr>
+      <tr><td><code>finite</code></td><td>All mantissas represent ordinary finite values; there are no infinity/NaN encodings.</td></tr>
+      <tr><td><code>nan</code></td><td>Only the maximum exponent together with the maximum mantissa represents NaN, with either sign. Other patterns are finite. Requires at least one mantissa bit.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Example: an 8-bit float with 4 exponent bits, 3 mantissa bits, and automatic bias 7:</p>
+  <pre class="block"><code>;float 4 3 auto ieee
+;radix float</code></pre>
+  <p><code>00111100</code> splits into <code>0 | 0111 | 100</code> and displays <code>1.5 [+|E:7|M:4]</code>. <code>;float 2 1 auto finite</code> instead defines a 4-bit format whose <code>0111</code> word represents <code>6</code>. Press <kbd>F</kbd> on a bus using custom float to inspect its fields and decoded-value lane; collapse and expand again after changing the definition to regenerate those lanes.</p>
+
+  <h3>Width checks, saving, and exports</h3>
+  <p>A <code>width! (need 8b)</code> label means the signal width does not match the configured word width. Adjust the definition or select a matching bus. Short binary strings in a correctly sized VCD signal are zero-extended; unknown <code>X</code>/<code>Z</code> values remain unknown.</p>
+  <p><code>;session</code> saves both definitions and the global/per-signal assignments for the next open. Arrangements saved through <kbd>E</kbd> → <code>a</code> also contain them. Set startup defaults through <code>custom_radixes</code> in <a href="#custom-radix-config">config.json</a>; interactive edits do not rewrite that file.</p>
+  <p>Text and SVG snapshots using a saved arrangement honor its custom definitions and per-signal assignments. An explicit snapshot <code>radix</code> overrides the assignments while using the arrangement's definition for that slot. Without an arrangement, custom snapshot formats use the initial definitions above.</p>
+  <p>These formats decode individual words. External block/tensor scaling is separate, and changing a radix does not change analog plots' existing numeric interpretation.</p>
+</section>
+
 <!-- ══════════════════ MOUSE ══════════════════ -->
 <section id="mouse">
   <h2>Mouse</h2>
@@ -416,7 +485,7 @@ u            <span class="cm"># undo any group edit</span></code></pre>
     <tbody>
       <tr><td class="k">Click</td><td>Place the active cursor at that time; focus that row.</td></tr>
       <tr><td class="k">Drag</td><td><b>Drag-to-zoom</b>: hold and sweep a time range — the band inverts live — release to zoom to it. Under 3 columns counts as a click. <kbd>Z</kbd> fits back out; drag jumps are in the zoom history.</td></tr>
-      <tr><td class="k">Right-click</td><td>Drop a marker at that time.</td></tr>
+      <tr><td class="k">Right-click</td><td>On a signal label: open signal actions, including <b>Number format</b>. A selected label keeps the selection; an unselected label targets that signal. On the waveform: drop a marker at that time.</td></tr>
       <tr><td class="k">Scroll ↑ / ↓</td><td>Zoom in / out, centered on the pointer.</td></tr>
     </tbody>
   </table></div>
@@ -457,6 +526,9 @@ u            <span class="cm"># undo any group edit</span></code></pre>
     <tr><td class="k"><code>session [save]</code> · <code>session load</code> · <code>session clear</code></td><td>Whole-session sidecar — see <a href="#session">Sessions</a>.</td></tr>
     <tr><td class="k"><code>loadgtkw F</code> · <code>savegtkw F</code></td><td>GTKWave <code>.gtkw</code> interop: apply / write a save file (signal list + radixes).</td></tr>
     <tr><td class="k"><code>radix R</code> · <code>theme T</code></td><td>Set global radix · switch theme by name or load a theme JSON path.</td></tr>
+    <tr><td><code>fixed I F [signed|unsigned]</code></td><td>Configure the <a href="#custom-fixed">custom fixed-point slot</a>; integer bits exclude sign. Use <code>radix fixed</code> to select it globally.</td></tr>
+    <tr><td><code>float E M [bias|auto] [ieee|finite|nan]</code></td><td>Configure the <a href="#custom-float">custom float slot</a>; use <code>radix float</code> to select it globally.</td></tr>
+    <tr><td class="k"><code>signal-menu</code> · <code>undo</code> · <code>redo</code></td><td>Open signal actions · undo a supported edit · redo it.</td></tr>
     <tr><td class="k"><code>decode F</code></td><td>Load a decode/translation JSON file.</td></tr>
     <tr><td class="k"><code>follow</code></td><td>Live-tail a growing dump (running simulation) with auto-scroll.</td></tr>
     <tr><td class="k"><code>bookmark</code>/<code>bm</code> · <code>gb</code> · <code>bookmarks</code> · <code>savebm</code></td><td>Create / jump to / list / save bookmarks.</td></tr>
@@ -479,6 +551,7 @@ analog &lt;signal&gt;        expand &lt;bus&gt;            translate &lt;file&gt
 measure &lt;signal&gt;       export_csv &lt;file&gt;       screenshot &lt;file&gt;
 theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variables &amp; loops</span></code></pre>
   <p>Example — arrange a debug view in one line: <code>:foreach s [signals cpu.*] { add_signal $s }</code></p>
+  <p>Scripts can also configure the two custom slots with <code>fixed I F [signed|unsigned]</code> and <code>float E M [bias|auto] [ieee|finite|nan]</code>, then select one with <code>radix fixed</code> or <code>radix float</code>.</p>
 </section>
 
 <!-- ══════════════════ SESSIONS ══════════════════ -->
@@ -488,10 +561,10 @@ theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variable
   <div class="tblwrap"><table>
     <thead><tr><th>File</th><th>What it holds</th><th>Written by</th></tr></thead>
     <tbody>
-      <tr><td class="k"><code>&lt;trace&gt;.alwavelets_session.json</code></td><td><b>The whole session</b>: display order, groups (incl. nesting), analog flags, global + per-signal radixes, colors, heights, markers, zoom window, cursors, name width, spacing, grid, wave style, theme. <b>Auto-restores on the next open</b> of that trace.</td><td><code>;session</code></td></tr>
+      <tr><td class="k"><code>&lt;trace&gt;.alwavelets_session.json</code></td><td><b>The whole session</b>: display order, groups (incl. nesting), analog flags, global + per-signal radixes, custom fixed/float definitions, colors, heights, markers, zoom window, cursors, name width, spacing, grid, wave style, theme. <b>Auto-restores on the next open</b> of that trace.</td><td><code>;session</code></td></tr>
       <tr><td class="k"><code>&lt;trace&gt;.alwavelets_bookmarks.json</code></td><td>Named time bookmarks.</td><td><code>;savebm</code></td></tr>
       <tr><td class="k"><code>&lt;trace&gt;.alwavelets_notes.json</code></td><td>Time-anchored annotations.</td><td><code>;saveann</code> / <kbd>A</kbd></td></tr>
-      <tr><td class="k">arrangement <code>.json</code></td><td>Portable layout (order, groups, radix, markers) at a path you choose — reusable across traces with matching signal ids.</td><td><kbd>E</kbd>&nbsp;→&nbsp;<code>a</code> / load with <code>l</code></td></tr>
+      <tr><td class="k">arrangement <code>.json</code></td><td>Portable layout (order, groups, global/per-signal radixes, custom fixed/float definitions, markers) at a path you choose — reusable across traces with matching signal identities.</td><td><kbd>E</kbd>&nbsp;→&nbsp;<code>a</code> / load with <code>l</code></td></tr>
       <tr><td class="k"><code>*.gtkw</code></td><td>GTKWave save file (signal list + radixes) for interop both ways.</td><td><code>;savegtkw</code></td></tr>
       <tr><td class="k"><code>~/.cache/alwavelets/*.wlc</code></td><td>Binary parse cache validated against file size + mtime — an unchanged 51&nbsp;MB VCD reopens in ~0.15&nbsp;s. Disable per-run with <code>--no-cache</code>.</td><td>automatic</td></tr>
       <tr><td class="k"><code>~/.config/alwavelets/config.json</code></td><td>Startup defaults + key remaps — see below.</td><td>you</td></tr>
@@ -517,22 +590,36 @@ theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variable
       <p>Colors are xterm-256 indices <em>or</em> <code>#rrggbb</code>. Hex resolves at the best fidelity the terminal offers: exact RGB on direct-color terminfo → redefined palette slots where the palette is writable → nearest-256 quantization. <code>theme_nord.json</code> ships as a full true-color example; <code>theme_solarized.json</code> as an indexed one.</p>
     </div>
     <div>
-      <h3>config.json</h3>
+      <h3 id="custom-radix-config">config.json</h3>
       <p>Optional, at <code>~/.config/alwavelets/config.json</code> (or <code>$XDG_CONFIG_HOME</code>). Every key optional; malformed files never block startup.</p>
       <pre class="block"><code>{
   "theme": "phosphor",
   "radix": "hex",
-  "wave_style": 2,        <span class="cm">// 0 thin … 2 hi-res</span>
+  "custom_radixes": {
+    "fixed": {
+      "integer_bits": 7,
+      "fraction_bits": 8,
+      "signed": true
+    },
+    "float": {
+      "exponent_bits": 5,
+      "mantissa_bits": 10,
+      "bias": null,
+      "specials": "ieee"
+    }
+  },
+  "wave_style": 2,
   "menu_bar": false,
   "grid": 1,
   "name_width": 28,
-  "keys": {               <span class="cm">// remap by action name</span>
+  "keys": {
     "quit": "Q",
     "zoom_in": "=",
     "toggle_cursor": " "
   }
 }</code></pre>
       <p>Action names are the handler names — <code>quit</code>, <code>zoom_in</code>, <code>next_edge</code>, <code>toggle_panel</code>, … (any <code>_kb_*</code> with the prefix dropped).</p>
+      <p><code>bias: null</code> selects automatic bias. Set <code>radix</code> to <code>fixed</code> or <code>float</code> to use a custom slot globally at startup. A saved session restores its own definitions and assignments. Invalid optional custom definitions are ignored; valid settings still load.</p>
     </div>
   </div>
 </section>
@@ -580,13 +667,14 @@ theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variable
 
   <h3>Tool reference</h3>
   <p>Common conventions: <code>file</code> is a VCD/FST path (required everywhere); <code>signals</code> is a list of names or globs (<code>top.alu.*</code>); <code>start</code>/<code>end</code> accept ticks or unit strings like <code>"500ns"</code>, <code>"1.5us"</code> and default to the trace extent; <code>arrangement</code> points at a saved arrangement JSON to supply the signal list + radixes.</p>
+  <p>Accepted radix names: <code>bin</code>, <code>hex</code>, <code>dec</code>, <code>unsigned</code> (or <code>uns</code>), <code>f16</code>, <code>bf16</code>, <code>f32</code>, <code>f64</code>, <code>fixed</code>, and <code>float</code>. For custom text/SVG labels, provide an arrangement containing your <a href="#custom-radixes">slot definitions</a>.</p>
   <div class="cards">
     <div class="card"><h4>render_waveform</h4><p>Unicode-text waveform of the given signals over a window — directly readable by the model.</p>
-      <table><tbody><tr><td class="k"><code>width</code></td><td>character width, default 100</td></tr><tr><td class="k"><code>radix</code></td><td>bin | hex | dec | unsigned</td></tr></tbody></table></div>
+      <table><tbody><tr><td class="k"><code>width</code></td><td>character width, default 100</td></tr><tr><td class="k"><code>radix</code></td><td>Any radix listed above; default hex.</td></tr></tbody></table></div>
     <div class="card"><h4>render_waveform_svg</h4><p>Same snapshot as inline SVG image content (vision-capable clients render it).</p>
       <table><tbody><tr><td class="k"><code>width</code></td><td>pixel width, default 900</td></tr><tr><td class="k"><code>theme</code></td><td>dark | light | phosphor | theme-JSON path</td></tr></tbody></table></div>
     <div class="card"><h4>render_waveform_png</h4><p>Pixel-accurate PNG raster of the window, inline image content.</p>
-      <table><tbody><tr><td class="k"><code>width</code></td><td>pixel width, default 900</td></tr><tr><td class="k"><code>radix</code></td><td>bin | hex | dec | unsigned</td></tr></tbody></table></div>
+      <table><tbody><tr><td class="k"><code>width</code></td><td>pixel width, default 900</td></tr><tr><td class="k"><code>radix</code></td><td>Any radix listed above; default hex.</td></tr></tbody></table></div>
     <div class="card"><h4>list_signals</h4><p>Discover signal full-names, optionally glob-filtered.</p>
       <table><tbody><tr><td class="k"><code>pattern</code></td><td>glob, default <code>*</code></td></tr><tr><td class="k"><code>limit</code></td><td>max names, default 200</td></tr></tbody></table></div>
     <div class="card"><h4>measure</h4><p>Per-signal stats over a window — transition count, period, frequency — plus the edge-to-edge delta between the first two signals.</p>

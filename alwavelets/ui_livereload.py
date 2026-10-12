@@ -160,6 +160,8 @@ class LiveReloadMixin:
             self._clear_decode_results(all_results=True)
         self.vcd.close()
         self.vcd = new_vcd
+        self._undo_stack, self._redo_stack = [], []
+        self._signal_menu = None
         self.scope_tree = new_vcd.scopes
         self.collapsed_scopes = restore_folds(self.scope_tree, collapsed)
         # These signals are new objects with new values. The row cache keys on

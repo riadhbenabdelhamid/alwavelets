@@ -50,3 +50,12 @@ def test_wide_unicode_path_and_cursor_movement(monkeypatch):
     path = '/測定/' * 30 + 'signal-e\u0301.csv'
     keys = list(path) + [curses.KEY_HOME, curses.KEY_END, '\n']
     assert read_prompt(Screen(keys), 'Export: ') == path
+
+
+def test_prefilled_settings_can_be_accepted_replaced_or_cancelled(monkeypatch):
+    monkeypatch.setattr(curses, 'noecho', lambda: None)
+    monkeypatch.setattr(curses, 'curs_set', lambda _: None)
+    assert read_prompt(Screen(['\n']), 'Fixed: ', initial='7 8 signed') == '7 8 signed'
+    assert read_prompt(Screen(['\x1b']), 'Fixed: ', initial='7 8 signed') == ''
+    keys = ['\x15'] + list('0 15 unsigned') + ['\n']
+    assert read_prompt(Screen(keys), 'Fixed: ', initial='7 8 signed') == '0 15 unsigned'

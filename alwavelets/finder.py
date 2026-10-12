@@ -276,6 +276,8 @@ class FinderMixin:
             chosen = [self._finder_cands[m[self.finder_sel]][0]]
 
         added_sids = [sid for sid in chosen if sid not in self._display_order_set]
+        from .ui_editing import remember_rows
+        restore = remember_rows(self, added_sids) if added_sids else None
         for sid in added_sids:
             self.display_order.append(sid)
             self._display_order_set.add(sid)
@@ -283,11 +285,7 @@ class FinderMixin:
         if added:
             self._invalidate_scope_cache()
 
-            def _undo(sids=added_sids):
-                gone = set(sids)
-                from .display_order import remove_display_ids
-                remove_display_ids(self.display_order, gone)
-            self.push_undo(f"add {added} signal{'s' if added != 1 else ''}", _undo)
+            self.push_undo(f"add {added} signal{'s' if added != 1 else ''}", restore)
 
         # Jump to the first chosen signal, unfolding its group if collapsed.
         target = chosen[0]

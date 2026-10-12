@@ -11,6 +11,8 @@ import math
 import re
 import sys
 from enum import Enum
+from .custom_radix import (CustomFixed, CustomFloat, custom_value_error,
+                           resolve_custom_radix)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -599,8 +601,11 @@ class Radix(Enum):
     DEC = "dec"
     UNSIGNED = "uns"
     FLOAT16 = "f16"
+    BFLOAT16 = "bf16"
     FLOAT32 = "f32"
     FLOAT64 = "f64"
+    CUSTOM_FIXED = "fixed"
+    CUSTOM_FLOAT = "float"
 
 
 class TimeScaledSignal(AliasSignal):
@@ -808,9 +813,16 @@ class TranslationMap:
 # Format specs: (total_bits, exp_bits, mantissa_bits, exp_bias)
 IEEE754_FORMATS = {
     Radix.FLOAT16: (16, 5, 10, 15),
+    Radix.BFLOAT16: (16, 8, 7, 127),
     Radix.FLOAT32: (32, 8, 23, 127),
     Radix.FLOAT64: (64, 11, 52, 1023),
 }
+
+
+def float_format_spec(fmt):
+    if isinstance(fmt, CustomFloat):
+        return fmt.total_bits, fmt.exponent_bits, fmt.mantissa_bits, fmt.exponent_bias
+    return IEEE754_FORMATS[fmt]
 
 
 def ieee754_decode(bits_int, fmt):
@@ -819,7 +831,9 @@ def ieee754_decode(bits_int, fmt):
     Returns (float_val, sign, exponent_raw, exponent_real, mantissa_raw, special)
     where special is None, 'inf', '-inf', 'nan', '+0', '-0', or 'denorm'.
     """
-    total, exp_bits, man_bits, bias = IEEE754_FORMATS[fmt]
+    if isinstance(fmt, CustomFloat):
+        return fmt.decode(bits_int)
+    total, exp_bits, man_bits, bias = float_format_spec(fmt)
 
     sign = (bits_int >> (total - 1)) & 1
     exp_raw = (bits_int >> man_bits) & ((1 << exp_bits) - 1)
@@ -830,7 +844,7 @@ def ieee754_decode(bits_int, fmt):
     # Special cases
     if exp_raw == 0 and man_raw == 0:
         special = '-0' if sign else '+0'
-        return (0.0, sign, exp_raw, exp_real, man_raw, special)
+        return (-0.0 if sign else 0.0, sign, exp_raw, exp_real, man_raw, special)
     elif exp_raw == 0:
         # Denormalized
         fval = (-1) ** sign * (man_raw / (1 << man_bits)) * (2 ** (1 - bias))
@@ -859,6 +873,10 @@ def format_real(val):
 
 def format_float_value(val, fmt, size=1):
     """Format a binary value string as IEEE 754 float."""
+    if isinstance(fmt, CustomFloat):
+        error = custom_value_error(val, fmt, size)
+        if error:
+            return error
     if any(c in val for c in 'xXzZ'):
         return val.upper()
     try:
@@ -887,6 +905,10 @@ def format_float_value(val, fmt, size=1):
 
 def format_float_decomposed(val, fmt, size=1):
     """Format showing float value + S|E|M decomposition."""
+    if isinstance(fmt, CustomFloat):
+        error = custom_value_error(val, fmt, size)
+        if error:
+            return error
     if any(c in val for c in 'xXzZ'):
         return val.upper()
     try:
@@ -894,7 +916,7 @@ def format_float_decomposed(val, fmt, size=1):
     except ValueError:
         return format_real(val)
 
-    total, exp_bits, man_bits, bias = IEEE754_FORMATS[fmt]
+    total, exp_bits, man_bits, bias = float_format_spec(fmt)
     fval, sign, exp_raw, exp_real, man_raw, special = ieee754_decode(bits, fmt)
 
     # Float value part
@@ -922,8 +944,7 @@ def make_float_field_signals(parent_sig, fmt):
     Create virtual signals for IEEE 754 field decomposition.
     Returns list of (field_name, VCDSignal) for sign, exponent, mantissa.
     """
-    total, exp_bits, man_bits, bias = IEEE754_FORMATS[fmt]
-    fmt_name = {Radix.FLOAT16: 'f16', Radix.FLOAT32: 'f32', Radix.FLOAT64: 'f64'}[fmt]
+    total, exp_bits, man_bits, bias = float_format_spec(fmt)
     results = []
 
     # Sign bit
@@ -939,7 +960,7 @@ def make_float_field_signals(parent_sig, fmt):
     # Mantissa field
     man_sig = VCDSignal(
         f"{parent_sig.name}.mant", f"{parent_sig.identifier}__fmant",
-        size=man_bits, signal_type="wire", scope=parent_sig.scope
+        size=max(1, man_bits), signal_type="wire", scope=parent_sig.scope
     )
     # Decoded float value (as real)
     float_sig = VCDSignal(
@@ -975,20 +996,29 @@ def make_float_field_signals(parent_sig, fmt):
     results = [
         ('sign', sign_sig),
         ('exp', exp_sig),
-        ('mant', man_sig),
+        *([('mant', man_sig)] if man_bits else []),
         ('value', float_sig),
     ]
     return results
 
 
 def format_value(val, radix, size=1):
+    if radix in (Radix.CUSTOM_FIXED, Radix.CUSTOM_FLOAT):
+        radix = resolve_custom_radix(radix)
+    if isinstance(radix, (CustomFixed, CustomFloat)):
+        error = custom_value_error(val, radix, size)
+        if error:
+            return error
+        if isinstance(radix, CustomFixed):
+            return radix.format(int(val, 2))
+        return format_float_decomposed(val, radix, size)
     if val in ('x', 'z', '0', '1') and size == 1:
         return val.upper()
     if any(c in val for c in 'xXzZ'):
         return val.upper()
 
     # IEEE 754 float formats
-    if radix in (Radix.FLOAT16, Radix.FLOAT32, Radix.FLOAT64):
+    if radix in IEEE754_FORMATS:
         return format_float_decomposed(val, radix, size)
 
     try:

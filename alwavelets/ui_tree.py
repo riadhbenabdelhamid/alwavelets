@@ -160,6 +160,7 @@ class TreePanelMixin:
 
     def _tree_add_scope_signals(self, scope_node):
         """Add all signals in scope (and subscopes) to display."""
+        self._redo_stack = []
         if isinstance(self.display_order, DisplayOrder):
             order = self.display_order
             order.add_ranges(scope_ranges(scope_node, order.catalog))
@@ -175,6 +176,7 @@ class TreePanelMixin:
 
     def _tree_remove_scope_signals(self, scope_node):
         """Remove all signals in scope (and subscopes) from display."""
+        self._redo_stack = []
         if isinstance(self.display_order, DisplayOrder):
             order = self.display_order
             order.remove_ranges(scope_ranges(scope_node, order.catalog, ordered=False))

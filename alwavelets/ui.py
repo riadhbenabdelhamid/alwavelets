@@ -32,10 +32,14 @@ from .ui_commands import CommandLineMixin
 from .ui_keymap import KeymapMixin
 from .ui_debug import DebugActionsMixin, load_analysis_data
 from .ui_drawing import DrawingMixin
-from .ui_chrome import wave_bottom, wave_origin
+from .ui_chrome import signal_origin, wave_bottom, wave_origin
 from .ui_actions import ActionPaletteMixin
 from .ui_navigation import ViewHistoryMixin, push_view_history, set_time_range
 from .ui_inspection import InspectionMixin
+from .ui_editing import apply_format, format_targets, remember_entries, remember_rows, step_history
+from .ui_signal_menu import SignalMenuMixin
+from .ui_custom_radix import CustomRadixMixin
+from .custom_radix import custom_radix_state, load_custom_radixes
 
 
 # ══════════════════════════════════════════════════════════════
@@ -78,7 +82,7 @@ def nearest_color_256(r, g, b):
     return (232 + gi) if d_gray < d_cube else cube
 
 
-class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
+class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
     """Full-featured TUI waveform viewer."""
 
     # Color pair indices
@@ -246,11 +250,13 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         self.manual = AlwaveletsManual()
         self.show_colors = False
         self.show_actions = False
+        self._signal_menu = None
         self.show_inspector = False
         self.show_overview = False
         self.selected_signals = set()
         self.markers = []
         self.radix = Radix.HEX
+        self.custom_radixes = load_custom_radixes(None)
         self.analog_signals = set()   # sig_ids rendered as analog
         self.search_term = ""
         self.search_results = []
@@ -260,7 +266,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         from .catalog import SignalCatalog
         self.display_order = vcd.signal_order if isinstance(vcd.signals, SignalCatalog) else list(vcd.signal_order)
         self._sync_display_set()
-        self._undo_stack = []         # (description, inverse-closure) — see undo()
+        self._undo_stack = []         # (description, reversible action)
+        self._redo_stack = []
 
         # Collapsible display groups (overlay on display_order; see view_rows).
         # 'parent' (a group name or None) nests groups; see create_group.
@@ -459,6 +466,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         cfg = _cfg.load_config()
         if not cfg:
             return
+        self.custom_radixes = load_custom_radixes(cfg.get('custom_radixes'), self.custom_radixes)
         mode = cfg.get('workmode')
         if isinstance(mode, str) and mode.lower() in self.WORKMODES:
             self.apply_workmode(mode, notify=False)
@@ -1079,16 +1087,13 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                     break
         if not added:
             return "add: nothing matched %s" % ", ".join(pats)
+        restore = remember_rows(self, added)
         for sid in added:
             self.display_order.append(sid)
             self._display_order_set.add(sid)
         self._invalidate_scope_cache()
 
-        def _undo(sids=list(added)):
-            gone = set(sids)
-            remove_display_ids(self.display_order, gone)
-            self._display_order_set.difference_update(gone)
-        self.push_undo("add %d signal%s" % (len(added), "s" * (len(added) != 1)), _undo)
+        self.push_undo("add %d signal%s" % (len(added), "s" * (len(added) != 1)), restore)
         self._rebuild_view_rows()
         self._focus_on(added[0])
         self._needs_layout = True
@@ -1116,17 +1121,13 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         if not removed:
             return "remove: nothing displayed matched %s" % ", ".join(pats)
         gone = {s for _, s in removed}
+        restore = remember_rows(self, gone)
         remove_display_ids(self.display_order, gone)
         self._display_order_set.difference_update(gone)
         self._scope_check_cache = {}
 
-        def _undo(items=list(removed)):
-            for i, sid in items:                      # ascending: indices hold
-                if sid not in self._display_order_set:
-                    self.display_order.insert(min(i, len(self.display_order)), sid)
-                    self._display_order_set.add(sid)
         self.push_undo("remove %d signal%s" % (len(removed), "s" * (len(removed) != 1)),
-                       _undo)
+                       restore)
         self._rebuild_view_rows()
         self._needs_layout = True
         return "Removed %d signal%s" % (len(removed), "s" * (len(removed) != 1))
@@ -1175,24 +1176,9 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         if not 0 <= new_idx < len(self.display_order):
             return
         do = self.display_order
-        other = do[new_idx]                     # the signal we swap past
+        restore = remember_rows(self, [sid])
         do[idx], do[new_idx] = do[new_idx], do[idx]
-
-        def _undo(sid=sid, other=other, direction=direction, back=idx):
-            # Anchor on `other` rather than on absolute indices: display_order
-            # can be mutated between the move and the undo by paths that don't
-            # push onto the stack (tree browser, ;loadgtkw, ;derive), and by
-            # then a saved index points at an unrelated signal.
-            do = self.display_order
-            if sid not in do:
-                return
-            do.remove(sid)
-            if other in do:
-                at = do.index(other)
-                do.insert(at if direction > 0 else at + 1, sid)
-            else:
-                do.insert(min(back, len(do)), sid)
-        self.push_undo("move signal", _undo)
+        self.push_undo("move signal", restore)
         self._rebuild_view_rows()
         self._focus_on(sid)             # follow the signal, not the row number
 
@@ -1206,45 +1192,29 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             idx = self.display_order.index(sid)
         except ValueError:
             return
+        restore = remember_rows(self, [sid])
         self.display_order.pop(idx)
         self._display_order_set.discard(sid)   # keep the finder's view in sync
         self._scope_check_cache = {}
         sig = self.get_signal(sid)
         name = sig.name if sig else sid
-        # Anchor on the following signal so undo restores the original slot
-        # even if the list shifted in the meantime.
-        anchor = self.display_order[idx] if idx < len(self.display_order) else None
-
-        def _undo(sid=sid, anchor=anchor, back=idx):
-            do = self.display_order
-            if sid in self._display_order_set:
-                return
-            at = do.index(anchor) if anchor in do else min(back, len(do))
-            do.insert(at, sid)
-            self._display_order_set.add(sid)
-        self.push_undo(f"remove {name}", _undo)
+        self.push_undo(f"remove {name}", restore)
         self._rebuild_view_rows()       # also clamps sig_offset / focus_idx
 
-    # ── Undo (one stack of inverse actions; `u`) ──
+    # ── Editing history (`u` undo, Ctrl-R redo) ──
 
     def push_undo(self, desc, fn):
-        """Record the inverse of a layout/styling mutation. `fn` must restore
-        the previous state when called; `desc` is shown by undo()."""
+        """Record an inverse that returns the action needed to replay it."""
+        self._redo_stack = []
         self._undo_stack.append((desc, fn))
         if len(self._undo_stack) > 100:
             self._undo_stack.pop(0)
 
     def undo(self):
-        if not self._undo_stack:
-            self._show_message("Nothing to undo")
-            return
-        desc, fn = self._undo_stack.pop()
-        fn()
-        self._sync_display_set()
-        self._reindex_groups()
-        self._rebuild_view_rows()
-        self._needs_layout = True
-        self._show_message(f"Undid: {desc}")
+        step_history(self)
+
+    def redo(self):
+        step_history(self, redo=True)
 
     def _undo_groups_snapshot(self):
         """Inverse closure restoring the whole groups list as it is now
@@ -1257,24 +1227,21 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         order = copy_order(self.display_order)     # ;group gathers/adds rows too
 
         def _undo():
+            nonlocal snap, order
+            current, current_order = _copy(self.groups), copy_order(self.display_order)
             self.groups = _copy(snap)
             self.display_order = copy_order(order)
+            snap, order = current, current_order
             self._sync_display_set()
             self._reindex_groups()
             self._rebuild_view_rows()
+            return _undo
         return _undo
 
     def _undo_dict_entry(self, d, sid):
         """Inverse closure for a single dict-entry mutation (color/height/
         radix maps): restores sid's previous value or absence."""
-        had, prev = sid in d, d.get(sid)
-
-        def _undo():
-            if had:
-                d[sid] = prev
-            else:
-                d.pop(sid, None)
-        return _undo
+        return remember_entries(d, [sid])
 
     # ── Scope Folding ──
 
@@ -1511,14 +1478,15 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                 for sig_id in visible:
                     sig = self.get_signal(sig_id)
                     name = sig.full_name[:20].ljust(20)
-                    val = format_typed_value(sig, sig.value_at(self.cursor_time), self.radix)
+                    radix = self.get_signal_radix(sig_id)
+                    val = format_typed_value(sig, sig.value_at(self.cursor_time), radix)
 
                     if sig.size == 1 and sig.signal_type not in ('real', 'realtime'):
                         chars, _ = draw_single_bit_culled(sig, self.time_start, self.time_end, 60)
                     elif sig_id in self.analog_signals or sig.analog_mode:
                         chars, _ = draw_analog_culled(sig, self.time_start, self.time_end, 60)
                     else:
-                        chars, _, labels = draw_bus_culled(sig, self.time_start, self.time_end, 60, self.radix)
+                        chars, _, labels = draw_bus_culled(sig, self.time_start, self.time_end, 60, radix)
                         for col, lbl in labels.items():
                             for j, c in enumerate(lbl):
                                 if col + j < 60:
@@ -1544,6 +1512,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                         'collapsed': g['collapsed'], 'parent': g.get('parent')}
                        for g in self.groups],
             'radix': self.radix.value,
+            'custom_radixes': custom_radix_state(getattr(self, 'custom_radixes', None)),
+            'sig_radix': {k: r.value for k, r in self.sig_radix.items()},
             'selected_signals': list(self.selected_signals),
             'markers': [{'time': m.time, 'label': m.label} for m in self.markers],
         }
@@ -1560,6 +1530,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             with open(fname) as f:
                 data = json.load(f)
             data, missing = remap_view_state(self.vcd, data)
+            self._undo_stack, self._redo_stack = [], []
+            self._signal_menu = None
             # Validate signal IDs exist
             valid_ids = self.vcd.signals
             saved_order = data.get('display_order', [])
@@ -1579,6 +1551,11 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             self._rebuild_view_rows()
             radix_val = data.get('radix', 'hex')
             self.radix = next((r for r in Radix if r.value == radix_val), Radix.HEX)
+            self.custom_radixes = load_custom_radixes(data.get('custom_radixes'),
+                                                      getattr(self, 'custom_radixes', None))
+            by_val = {r.value: r for r in Radix}
+            self.sig_radix = {k: by_val[v] for k, v in data.get('sig_radix', {}).items()
+                              if k in valid_ids and v in by_val}
             self.selected_signals = set(s for s in data.get('selected_signals', []) if s in valid_ids)
             self.markers = [Marker(m['time'], m.get('label', '')) for m in data.get('markers', [])]
             self._show_message(f"Arrangement loaded ← {fname}" +
@@ -1616,6 +1593,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             **fold_state(self.collapsed_scopes),
             'radix': self.radix.value,
             'sig_radix': {k: r.value for k, r in self.sig_radix.items()},
+            'custom_radixes': custom_radix_state(getattr(self, 'custom_radixes', None)),
             'sig_color': self.sig_color,
             'sig_height': self.sig_height,
             'markers': [{'time': m.time, 'label': m.label} for m in self.markers],
@@ -1676,6 +1654,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             return False
         try:
             data, missing = remap_view_state(self.vcd, data)
+            self._undo_stack, self._redo_stack = [], []
+            self._signal_menu = None
             valid = self.vcd.signals
             saved_order = data.get('display_order', [])
             order = saved_order if isinstance(saved_order, DisplayOrder) else [s for s in saved_order if s in valid]
@@ -1694,6 +1674,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             self._reindex_groups()
             by_val = {r.value: r for r in Radix}
             self.radix = by_val.get(data.get('radix'), self.radix)
+            self.custom_radixes = load_custom_radixes(data.get('custom_radixes'),
+                                                      getattr(self, 'custom_radixes', None))
             self.sig_radix = {k: by_val[v] for k, v in data.get('sig_radix', {}).items()
                               if k in valid and v in by_val}
             self.sig_color = {k: int(v) for k, v in data.get('sig_color', {}).items()
@@ -1774,7 +1756,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
 
     def get_signal_radix(self, sig_id):
         """Get radix for signal (per-signal or global)."""
-        return self.sig_radix.get(sig_id, self.radix)
+        return resolve_custom_radix(self.sig_radix.get(sig_id, self.radix),
+                                    getattr(self, 'custom_radixes', None))
 
     get_radix = get_signal_radix  # alias
 
@@ -1824,6 +1807,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
 
     def _invalidate_scope_cache(self):
         self._scope_check_cache = {}
+        self._redo_stack = []
 
     def _rebuild_tree(self):
         """Rebuild scope runs; resolve individual signals only for visible rows."""
@@ -1850,6 +1834,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
         sig = self.get_signal(sig_id)
         if not sig or sig.size <= 1:
             return
+        self._redo_stack = []
         if sig_id in self.expanded_buses:
             self.collapse_bus(sig_id)
             return
@@ -1874,6 +1859,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             sig_id = self.focused_signal_id()
         if not sig_id or sig_id not in self.expanded_buses:
             return
+        self._redo_stack = []
         virt_ids = self.expanded_buses.pop(sig_id)
         for vid in virt_ids:
             if vid in self.display_order:
@@ -1881,35 +1867,43 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             self.virtual_signals.pop(vid, None)
 
     def expand_float_fields(self):
-        """Expand focused bus into IEEE 754 float fields (sign/exp/mantissa/value)."""
+        """Expand focused bus into float fields (sign/exp/mantissa/value)."""
         sid = self.focused_signal_id()
         if not sid:
             return
         sig = self.get_signal(sid)
-        if not sig or sig.size < 16:
-            self._show_message("Signal must be ≥16 bits for float decode")
-            return
-
-        # If already expanded, collapse
+        # Collapsing remains available after changing the custom slot width.
         if sid in self.expanded_buses:
             self.collapse_bus(sid)
             return
+        chosen = self.get_signal_radix(sid)
+        custom = isinstance(chosen, CustomFloat)
+        if custom and sig and sig.size != chosen.total_bits:
+            self._show_message(f'Custom float needs a {chosen.total_bits}-bit signal')
+            return
+        if not sig or (sig.size < 16 and not custom):
+            self._show_message("Signal must be ≥16 bits for float decode")
+            return
 
-        # Auto-detect format from signal width
-        if sig.size == 16:
-            fmt = Radix.FLOAT16
+        # A 16-bit bus can hold either half precision or bfloat16.
+        if custom:
+            fmt = chosen
+        elif sig.size == 16:
+            fmt = Radix.BFLOAT16 if chosen == Radix.BFLOAT16 else Radix.FLOAT16
         elif sig.size == 32:
             fmt = Radix.FLOAT32
         elif sig.size == 64:
             fmt = Radix.FLOAT64
         else:
             # Prompt user
-            choice = self.prompt_input(f"Float format for {sig.size}-bit ({sig.name}): [h]alf [s]ingle [d]ouble: ")
+            choice = self.prompt_input(f"Float format for {sig.size}-bit ({sig.name}): [h]alf [b]f16 [s]ingle [d]ouble: ")
             if not choice:
                 return
             c = choice[0].lower()
             if c == 'h':
                 fmt = Radix.FLOAT16
+            elif c == 'b':
+                fmt = Radix.BFLOAT16
             elif c == 's':
                 fmt = Radix.FLOAT32
             elif c == 'd':
@@ -1918,7 +1912,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                 return
 
         # Set the signal's radix to the float format
-        self.sig_radix[sid] = fmt
+        self._redo_stack = []
+        self.sig_radix[sid] = Radix.CUSTOM_FLOAT if custom else fmt
 
         # Create field decomposition signals
         fields = make_float_field_signals(sig, fmt)
@@ -1932,7 +1927,9 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                 self.analog_signals.add(vid)
             # Auto-set exponent to decimal radix
             if field_name == 'exp':
-                self.sig_radix[vid] = Radix.DEC
+                self.sig_radix[vid] = Radix.UNSIGNED if custom else Radix.DEC
+            elif custom and field_name in ('sign', 'mant'):
+                self.sig_radix[vid] = Radix.BIN
 
         self.expanded_buses[sid] = virt_ids
 
@@ -1944,41 +1941,40 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
     # ── Per-Signal Properties ──
 
     def cycle_signal_radix(self):
-        """Cycle radix on focused signal."""
-        sid = self.focused_signal_id()
-        if not sid:
+        """Cycle from the focused selected signal and apply to all targets."""
+        targets = format_targets(self)
+        if not targets:
             return
-        self.push_undo("radix change", self._undo_dict_entry(self.sig_radix, sid))
+        sid = self.focused_signal_id()
+        sid = sid if sid in targets else targets[0]
         current = self.sig_radix.get(sid, self.radix)
         radixes = list(Radix)
         nxt = radixes[(radixes.index(current) + 1) % len(radixes)]
-        self.sig_radix[sid] = nxt
+        apply_format(self, 'radix', nxt, targets)
 
     USER_COLORS = [1, 2, 3, 4, 5, 6]  # map to color pairs
 
     def cycle_signal_color(self):
-        """Cycle color assignment on focused signal."""
-        sid = self.focused_signal_id()
-        if not sid:
+        """Cycle color for the selection, or just the focused signal."""
+        targets = format_targets(self)
+        if not targets:
             return
-        self.push_undo("color change", self._undo_dict_entry(self.sig_color, sid))
+        sid = self.focused_signal_id()
+        sid = sid if sid in targets else targets[0]
         current = self.sig_color.get(sid, 0)
         nxt = (current + 1) % (len(self.USER_COLORS) + 1)  # 0 = default
-        if nxt == 0:
-            self.sig_color.pop(sid, None)
-        else:
-            self.sig_color[sid] = nxt
+        apply_format(self, 'color', nxt or None, targets)
 
     def cycle_signal_height(self):
-        """Cycle waveform height (1-4 rows) on focused signal."""
-        sid = self.focused_signal_id()
-        if not sid:
+        """Cycle waveform height (1-4 rows) for the selected signals."""
+        targets = format_targets(self)
+        if not targets:
             return
-        self.push_undo("height change", self._undo_dict_entry(self.sig_height, sid))
+        sid = self.focused_signal_id()
+        sid = sid if sid in targets else targets[0]
         current = self.sig_height.get(sid, 1)
         nxt = (current % 4) + 1
-        self.sig_height[sid] = nxt
-        self._needs_layout = True   # taller analog reserves more rows
+        apply_format(self, 'height', nxt, targets)
 
     # ── Edge-to-Edge Measurement ──
 
@@ -2478,7 +2474,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
 
 
 
-    def prompt_input(self, prompt_text):
+    def prompt_input(self, prompt_text, initial=''):
         # Under agent control there is nobody at the keyboard to answer, and
         # blocking here would freeze the viewer for the user too. Commands
         # that would prompt become no-ops; agents pass arguments inline.
@@ -2486,7 +2482,7 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             return ""
         from .ui_prompt import read_prompt
         try:
-            return read_prompt(self.stdscr, prompt_text, curses.color_pair(self.C_PROMPT))
+            return read_prompt(self.stdscr, prompt_text, curses.color_pair(self.C_PROMPT), initial=initial)
         finally:
             self._needs_layout = True  # the terminal can resize while prompting
             self._dirty = True
@@ -2654,6 +2650,20 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
             return
 
         clicked = bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        if (bstate & curses.BUTTON3_CLICKED and self._drag_anchor is None
+                and not (self.panel_mode and not self.sidebar_width and self.panel_focus == 0)
+                and self.wave_top <= my < wave_bottom(self)
+                and signal_origin(self) <= mx < wave_origin(self)):
+            row_index = getattr(self, '_signal_hit_rows', {}).get(my)
+            if row_index is not None:
+                self.focus_idx = row_index
+                sid = self.focused_signal_id()
+                if sid is not None:
+                    if sid not in self.selected_signals:
+                        self.selected_signals.clear()
+                        self._visual_mode = False
+                    self.open_signal_menu(mx, my)
+            return
         if self._drag_anchor is None:
             if getattr(self, 'overview_row', None) == my:
                 if clicked and mx >= wave_origin(self):
@@ -2824,6 +2834,8 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                             self.draw_instruction_results()
                         self.draw_status_bar()
 
+                    if self._signal_menu is not None:
+                        self.draw_signal_menu()
                     self.stdscr.refresh()
                     self._dirty = False
 
@@ -2856,6 +2868,10 @@ class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingM
                 #    layout stays stale until a second resize ──
                 if key == curses.KEY_RESIZE:
                     self._needs_layout = True
+                    continue
+
+                if self._signal_menu is not None:
+                    self.signal_menu_handle_key(key)
                     continue
 
                 if self.show_actions:
