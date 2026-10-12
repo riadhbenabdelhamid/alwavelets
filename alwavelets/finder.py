@@ -369,7 +369,10 @@ class FinderMixin:
 
         if n == 0:
             try:
-                put(top, 3, "searching…" if busy else "no matches", curses.A_DIM)
+                from .ui_chrome import elide
+                put(top, 1, elide("Searching signals…" if busy else "No matching signals", w - 2), curses.A_DIM)
+                if top + 1 < h - 1 and not busy:
+                    put(top + 1, 1, elide("Ctrl-U Clear search · Esc Return", w - 2), curses.A_DIM)
             except curses.error:
                 pass
         for i in range(min(vis, n - self.finder_scroll)):

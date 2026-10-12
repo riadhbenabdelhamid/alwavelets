@@ -76,6 +76,27 @@ hierarchy as an overlay; **Tab** or **Esc** returns to waveforms. The active
 pane has a **▸** in its header. **s** toggles hierarchy browsing, and **(** / **)**
 adjust the signal-label width. Waveforms receive keyboard focus at startup.
 
+**F8 / F9** (or `;back` / `;forward`) step through the last 50 time ranges.
+Zoom, pan, time jumps, and search jumps that move the view are recorded.
+Going back preserves the cursors and stops live following; navigating somewhere
+new clears the forward history. Signal editing still has its separate `u` undo.
+
+**F6** (`;inspect`) toggles a signal inspector below the waveforms. It shows the
+focused signal's path, width, type, radix, cursor A/B values, visible transition
+count, and cursor time difference. Reads run in the background for that signal
+only. Missing lazy-loaded data is labelled as unavailable without loading extra
+ranges. Long paths wrap across two rows; values fit the available terminal width.
+
+**F7** (`;overview`) toggles a one-row timeline above the ruler. The highlighted
+interval shows the visible portion of the trace; `A`, `B`, and marker ticks show
+reference positions. Click to move the view while keeping its duration. The
+overview uses time metadata and stays provisional while the extent is loading.
+Both optional panels start hidden, work in all three workmodes, and save with
+`;session`. Config fields `inspector` and `overview` set their startup defaults.
+
+An empty view explains whether no signals are selected, scopes are folded, or
+the trace is still loading, and shows the relevant selection/navigation keys.
+
 Three selectable **workmodes** combine a palette with presentation defaults:
 
 | Mode | Appearance |

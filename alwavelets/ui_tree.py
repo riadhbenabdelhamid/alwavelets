@@ -9,7 +9,7 @@ from .parsers import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .hierarchy import scope_signal_ids, scope_all_selected, scope_ranges
 from .display_order import DisplayOrder
-from .ui_chrome import elide, text_width
+from .ui_chrome import elide, text_width, wave_bottom
 
 
 class TreePanelMixin:
@@ -205,7 +205,7 @@ class TreePanelMixin:
         if not self.panel_mode or (not self.sidebar_width and self.panel_focus != 0):
             return
         tw = self.sidebar_width or max(1, self.width - 1)
-        h = self.height
+        h = wave_bottom(self) + 1
         has_focus = (self.panel_focus == 0)
 
         # Use cached tree (rebuilt on toggle, not on draw)

@@ -15,7 +15,7 @@ from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .streaming import read_cancellation
-from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_origin
+from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_bottom, wave_origin
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -153,7 +153,7 @@ class DrawingMixin:
         if not self.instr_trace.built:
             return
 
-        h, w = self.height, self.width
+        h, w = wave_bottom(self) + 1, self.width
         panel_w = min(40, w // 3)
         start_x = w - panel_w
 
@@ -463,6 +463,10 @@ class DrawingMixin:
                 if len(self._row_extras) > 512:
                     self._row_extras.clear()
                 self._row_extras[(kind, sig_id)] = labels, limits
+                if result is placeholder:
+                    if not hasattr(self, '_pending_row_ids'):
+                        self._pending_row_ids = set()
+                    self._pending_row_ids.add(sig_id)
                 return result
             out = compute()
             # Bound it: within one window the live keys are the visible rows,
@@ -501,6 +505,7 @@ class DrawingMixin:
     def _draw_signals(self):
         start_row = self.wave_top
         self._signal_hit_rows = {}
+        self._pending_row_ids = set()
         grid_columns = [col for col, _ in self._ruler_ticks()] if self.show_grid else ()
         # Compute row stride: all non-zero spacing adds at least 1 separator row
         if self.signal_spacing > 0 and self.signal_spacing < 1:
@@ -516,6 +521,9 @@ class DrawingMixin:
         if queries is not None:
             visible_ids = set(visible)
             queries.retain('rows', lambda key: key[1] in visible_ids)
+        if not visible:
+            self.draw_empty_view()
+            return
 
         # Ensure data for current view window is loaded (lazy mode)
         if self.vcd._lazy_mode:
@@ -526,7 +534,7 @@ class DrawingMixin:
 
         for idx, sig_id in enumerate(visible):
             row = start_row + idx * row_stride + extra_rows
-            if row >= self.height - 1:
+            if row >= wave_bottom(self):
                 break
 
             if self.is_group_header(sig_id):       # a collapsible group header row
@@ -548,7 +556,7 @@ class DrawingMixin:
                 self._draw_scope_separator(row, sep_label)
                 row += 1
                 extra_rows += 1
-                if row >= self.height - 1:
+                if row >= wave_bottom(self):
                     break
             prev_scope = cur_scope
             is_selected = sig_id in self.selected_signals
@@ -558,7 +566,7 @@ class DrawingMixin:
             is_bus = sig.size > 1 and not is_analog
             # Analog signals may span several rows (H key); others are 1 row.
             sig_rows = self.sig_height.get(sig_id, 1) if is_analog else 1
-            sig_rows = max(1, min(sig_rows, self.height - 1 - row))
+            sig_rows = max(1, min(sig_rows, wave_bottom(self) - row))
             for rr in range(row, row + sig_rows):
                 self._signal_hit_rows[rr] = idx
             custom_color = self.sig_color.get(sig_id, 0)
@@ -715,10 +723,16 @@ class DrawingMixin:
                             except curses.error:
                                 pass
 
+            if sig_id in self._pending_row_ids or (self.vcd.is_loading and not sig.num_changes()):
+                label = 'Loading…'
+            elif not sig.num_changes():
+                label = 'No recorded values'
+            else:
+                label = ''
             if self.show_grid >= 2:
                 # Horizontal separator after each signal
                 sep_row = row + row_stride - 1 if row_stride > 1 else row
-                if sep_row < self.height - 1 and sep_row != row:
+                if sep_row < wave_bottom(self) and sep_row != row:
                     try:
                         sep_line = '┈' * (self.width - signal_origin(self) - 1)
                         self.stdscr.addstr(sep_row, signal_origin(self), sep_line, curses.color_pair(self.C_SCOPE) | curses.A_DIM)
@@ -728,7 +742,7 @@ class DrawingMixin:
             # ── Split diff view: draw second waveform below with delimiters ──
             if has_diff and sig_id in self.diff_sig_map:
                 diff_row = row + 1
-                if diff_row < self.height - 1:
+                if diff_row < wave_bottom(self):
                     self._signal_hit_rows[diff_row] = idx
                     extra_rows += 1
                     sig_b = self.diff_sig_map[sig_id]
@@ -875,10 +889,18 @@ class DrawingMixin:
                         except curses.error:
                             pass
 
+            # Pending/empty data is not a waveform; keep its explanation
+            # readable instead of overpainting it with cursor glyphs.
+            if label:
+                try:
+                    self.stdscr.addstr(row, wave_origin(self), elide(label, self.wave_width - 1), curses.A_DIM)
+                except curses.error:
+                    pass
+
             # ── Fractional spacing: visual sub-row gap using block characters ──
             if frac_spacing > 0:
                 sep_row = row + sig_rows
-                if sep_row < self.height - 1:
+                if sep_row < wave_bottom(self):
                     gap_attr = curses.color_pair(self.C_SCOPE) | curses.A_DIM
                     if frac_spacing >= 0.5:
                         # 0.5 = lower half block — looks like half a blank row
@@ -898,7 +920,7 @@ class DrawingMixin:
         total = len(self.display_order)
         if total > self.visible_signals and self.width > wave_origin(self) + 3:
             track_top = self.wave_top
-            track_bot = self.height - 2
+            track_bot = wave_bottom(self) - 1
             track_h = max(1, track_bot - track_top + 1)
             thumb_h = max(1, min(track_h, round(track_h * self.visible_signals / total)))
             thumb_top = track_top + min(track_h - thumb_h,
@@ -915,7 +937,7 @@ class DrawingMixin:
 
     def _draw_group_header(self, row, name, focused):
         """Draw a collapsible group header row (▼ expanded / ▶ collapsed)."""
-        if row >= self.height - 1 or row < self.wave_top:
+        if row >= wave_bottom(self) or row < self.wave_top:
             return
         g = self._group_by_name.get(name, {})
         arrow = '▶' if g.get('collapsed') else '▼'
@@ -935,7 +957,7 @@ class DrawingMixin:
 
     def _draw_scope_separator(self, row, scope_name):
         """Draw a scope separator with highlighted module name."""
-        if row >= self.height - 1 or row < self.wave_top:
+        if row >= wave_bottom(self) or row < self.wave_top:
             return
         try:
             sep_line = '┄' * (self.width - signal_origin(self) - 1)
@@ -962,7 +984,7 @@ class DrawingMixin:
         if x1 < x0:
             return
         off = wave_origin(self)
-        for row in range(self.ruler_row, self.height - 1):
+        for row in range(self.ruler_row, wave_bottom(self)):
             try:
                 self.stdscr.chgat(row, off + x0, x1 - x0 + 1, curses.A_REVERSE)
             except curses.error:
@@ -1172,6 +1194,7 @@ class DrawingMixin:
                 "F4/Ctrl-P Search commands · ↑↓ Choose · Enter Run · Esc Back",
             ]),
             ("Navigation", [
+                "F8 Back · F9 Forward · F7 Timeline overview",
                 "\u2190\u2192/hl Scroll \u00b7 \u2191\u2193/jk Signals \u00b7 +/- Zoom",
                 "Z Fit all \u00b7 W Fit A\u2194B \u00b7 S Snap \u00b7 Home/End \u00b7 PgUp/Dn",
             ]),
@@ -1188,6 +1211,7 @@ class DrawingMixin:
                 "P Pattern \u00b7 / Find \u00b7 n Next",
             ]),
             ("Signals", [
+                "F6 Inspector: signal details and A/B values",
                 "s Hierarchy \u00b7 Tab Pane focus / fold group \u00b7 Esc Waves",
                 "B Scope tree \u00b7 { Collapse all \u00b7 } Expand all",
                 "x Expand bus \u00b7 F Float decode (S|E|M)",

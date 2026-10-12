@@ -14,6 +14,11 @@ def wave_origin(viewer):
     return signal_origin(viewer) + viewer.name_width + 1
 
 
+def wave_bottom(viewer):
+    """Exclusive bottom of the waveform/browser area, above optional details."""
+    return getattr(viewer, 'wave_bottom', viewer.height - 1)
+
+
 def elide(text, width):
     """Fit a label without splitting a wide character; mark omitted text."""
     if width <= 0:

@@ -7,6 +7,10 @@ from .ui_chrome import elide, text_width
 
 
 ACTION_INFO = {
+    'view_back': ('Previous view', 'Restore the previous time range; keep cursor positions'),
+    'view_forward': ('Next view', 'Return to the next time range after going back'),
+    'toggle_inspector': ('Signal inspector', 'Show or hide focused signal details and cursor values'),
+    'toggle_overview': ('Timeline overview', 'Show or hide the whole-trace position strip; click to navigate'),
     'open_action_palette': ('Actions', 'Search commands and keyboard actions'),
     '_kb_help': ('Help', 'Show quick keyboard help'),
     '_kb_show_manual': ('Manual', 'Open the full reference manual'),
@@ -171,9 +175,13 @@ def contextual_menu(viewer):
         elif not viewer.panel_mode:
             items.append(item('_kb_tab', 'Fold group'))
         items += [item('_kb_zoom_in'), item('_kb_zoom_out'), item('zoom_fit_all')]
+        if getattr(viewer, 'zoom_history', []):
+            items.append(item('view_back', 'Back'))
+        if getattr(viewer, 'zoom_forward', []):
+            items.append(item('view_forward', 'Forward'))
         if viewer.cursor_b_on:
             items.append(item('zoom_to_selection'))
-    items += [item('open_finder'), item('_kb_cycle_workmode'), item('_kb_toggle_panel'), item('_kb_toggle_menu_bar')]
+    items += [item('open_finder'), item('toggle_inspector'), item('toggle_overview'), item('_kb_cycle_workmode'), item('_kb_toggle_panel'), item('_kb_toggle_menu_bar')]
     return [(key, label) for key, label in items if key]
 
 

@@ -135,9 +135,9 @@ class TclEngine:
         self.output.append(self.viewer.remove_signals(args))
 
     def _cmd_zoom(self, args):
+        from .ui_navigation import set_time_range
         if len(args) >= 2:
-            self.viewer.time_start = int(args[0])
-            self.viewer.time_end = int(args[1])
+            set_time_range(self.viewer, int(args[0]), int(args[1]))
         elif len(args) == 1:
             self.viewer.zoom(float(args[0]))
 

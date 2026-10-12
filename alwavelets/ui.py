@@ -32,8 +32,10 @@ from .ui_commands import CommandLineMixin
 from .ui_keymap import KeymapMixin
 from .ui_debug import DebugActionsMixin, load_analysis_data
 from .ui_drawing import DrawingMixin
-from .ui_chrome import wave_origin
+from .ui_chrome import wave_bottom, wave_origin
 from .ui_actions import ActionPaletteMixin
+from .ui_navigation import ViewHistoryMixin, push_view_history, set_time_range
+from .ui_inspection import InspectionMixin
 
 
 # ══════════════════════════════════════════════════════════════
@@ -76,7 +78,7 @@ def nearest_color_256(r, g, b):
     return (232 + gi) if d_gray < d_cube else cube
 
 
-class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
+class Alwavelets(InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
     """Full-featured TUI waveform viewer."""
 
     # Color pair indices
@@ -210,6 +212,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
 
     @display_order.setter
     def display_order(self, order):
+        self._empty_view_folded = False
         from .catalog import SignalCatalog
         catalog = getattr(getattr(self, 'vcd', None), 'signals', None)
         if isinstance(catalog, SignalCatalog):
@@ -243,6 +246,8 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         self.manual = AlwaveletsManual()
         self.show_colors = False
         self.show_actions = False
+        self.show_inspector = False
+        self.show_overview = False
         self.selected_signals = set()
         self.markers = []
         self.radix = Radix.HEX
@@ -414,6 +419,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
 
         # Zoom history
         self.zoom_history = []        # list of (time_start, time_end)
+        self.zoom_forward = []
         self.zoom_history_max = 50
 
         # Protocol decode
@@ -476,6 +482,9 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                 pass
         if 'menu_bar' in cfg:
             self.show_menu_bar = bool(cfg['menu_bar'])
+        for key, attr in (('inspector', 'show_inspector'), ('overview', 'show_overview')):
+            if isinstance(cfg.get(key), bool):
+                setattr(self, attr, cfg[key])
         if 'grid' in cfg:
             try:
                 self.show_grid = int(cfg['grid']) % 3
@@ -749,9 +758,14 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         #   menu hidden: 0 title · 1 ruler · 2+ signals
         self.menu_row = 1
         self.ruler_row = 2 if self.show_menu_bar else 1
+        self.overview_row = self.ruler_row if self.show_overview and self.height >= 8 else None
+        if self.overview_row is not None:
+            self.ruler_row += 1
         self.wave_top = self.ruler_row + 1
+        self.inspector_rows = min(8, max(0, self.height - self.wave_top - 4)) if self.show_inspector else 0
+        self.wave_bottom = self.height - 1 - self.inspector_rows
         # Each signal takes (1 + spacing) rows, plus extra for diff pairs
-        rows_for_signals = max(1, self.height - self.wave_top - 1)
+        rows_for_signals = max(1, self.wave_bottom - self.wave_top)
         # All non-zero spacings add at least 1 real separator row
         if self.signal_spacing > 0 and self.signal_spacing < 1:
             row_stride = 2  # signal row + thin separator row
@@ -768,6 +782,9 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             self.visible_signals = max(1, int(rows_for_signals / avg_rows))
         else:
             self.visible_signals = max(1, rows_for_signals // row_stride)
+        focused_row = self.sig_offset + self.focus_idx
+        self.focus_idx = min(self.focus_idx, self.visible_signals - 1)
+        self.sig_offset = max(0, focused_row - self.focus_idx)
 
     @property
     def cursor_time(self):
@@ -967,14 +984,14 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         # Keep the anchor at the same fraction of the viewport. Rounding the
         # new offset to a tick and clamping at t=0 are the only adjustments.
         offset = time_to_column(center, self.time_start, self.time_end, new_span)
-        self.time_start = max(0, center - offset)
-        self.time_end = self.time_start + new_span
+        start = max(0, center - offset)
+        set_time_range(self, start, start + new_span)
 
     def scroll_time(self, direction):
         span = self.time_end - self.time_start
         step = max(span // 8, 1)
-        self.time_start = max(0, self.time_start + step * direction)
-        self.time_end = self.time_start + span
+        start = max(0, self.time_start + step * direction)
+        set_time_range(self, start, start + span)
 
     def move_cursor(self, direction):
         span = self.time_end - self.time_start
@@ -984,12 +1001,10 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         # Auto-scroll if cursor exits window
         if new_t < self.time_start:
             diff = self.time_start - new_t
-            self.time_start -= diff
-            self.time_end -= diff
+            set_time_range(self, self.time_start - diff, self.time_end - diff)
         elif new_t > self.time_end:
             diff = new_t - self.time_end
-            self.time_start += diff
-            self.time_end += diff
+            set_time_range(self, self.time_start + diff, self.time_end + diff)
 
     # ── Edge Navigation ──
 
@@ -1033,8 +1048,8 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         span = self.time_end - self.time_start
         ct = self.cursor_time
         if ct < self.time_start or ct > self.time_end:
-            self.time_start = max(0, ct - span // 4)
-            self.time_end = self.time_start + span
+            start = max(0, ct - span // 4)
+            set_time_range(self, start, start + span)
 
     # ── Signal Management ──
 
@@ -1299,6 +1314,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             if isinstance(self.collapsed_scopes, ScopeFolds):
                 self.display_order = self.collapsed_scopes.order()
                 self._sync_display_set()
+                self._empty_view_folded = not self.display_order and bool(self.collapsed_scopes)
                 return
             order = DisplayOrder.from_order(catalog, catalog.order)
             from .hierarchy import ScopeIndex, scope_ranges
@@ -1309,6 +1325,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                     order.remove_ranges(scope_ranges(node, catalog, ordered=False))
             self.display_order = order
             self._sync_display_set()
+            self._empty_view_folded = not self.display_order and bool(self.collapsed_scopes)
             return
         if not self.collapsed_scopes:
             self.display_order = list(self.vcd.signal_order)
@@ -1318,6 +1335,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         if getattr(catalog, 'order', None) is self.vcd.signal_order and hasattr(catalog, 'visible_ids'):
             self.display_order = list(catalog.visible_ids(self.collapsed_scopes))
             self._sync_display_set()
+            self._empty_view_folded = not self.display_order and bool(self.collapsed_scopes)
             return
         result = []
         for sid in self.vcd.signal_order:
@@ -1336,13 +1354,13 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                 result.append(sid)
         self.display_order = result
         self._sync_display_set()
+        self._empty_view_folded = not self.display_order and bool(self.collapsed_scopes)
 
     # ── Navigation: Zoom ──
 
     def zoom_fit_all(self):
         """Zoom to show entire time range."""
-        self.time_start = 0
-        self.time_end = max(self.vcd.max_time, 10)
+        set_time_range(self, 0, max(self.vcd.max_time, 10))
 
     def zoom_to_selection(self):
         """Zoom to fit between cursor A and cursor B."""
@@ -1350,8 +1368,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             return
         t1, t2 = min(self.cursor_a, self.cursor_b), max(self.cursor_a, self.cursor_b)
         margin = max((t2 - t1) // 20, 1)
-        self.time_start = max(0, t1 - margin)
-        self.time_end = t2 + margin
+        set_time_range(self, max(0, t1 - margin), t2 + margin)
 
     def snap_cursor_to_edge(self):
         """Snap cursor to nearest transition on focused signal."""
@@ -1613,6 +1630,8 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             'workmode': getattr(self, 'workmode', 'classic'),
             'menu_bar': getattr(self, 'show_menu_bar', True),
             'scope_separators': getattr(self, 'show_module_sep', False),
+            'inspector': getattr(self, 'show_inspector', False),
+            'overview': getattr(self, 'show_overview', False),
         }
 
     def save_session(self):
@@ -1685,7 +1704,8 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             mode = data.get('workmode')
             if isinstance(mode, str) and mode in self.WORKMODES:
                 self.apply_workmode(mode, notify=False)
-            for key, attr in (('menu_bar', 'show_menu_bar'), ('scope_separators', 'show_module_sep')):
+            for key, attr in (('menu_bar', 'show_menu_bar'), ('scope_separators', 'show_module_sep'),
+                              ('inspector', 'show_inspector'), ('overview', 'show_overview')):
                 if isinstance(data.get(key), bool):
                     setattr(self, attr, data[key])
             if 'name_width' in data:
@@ -1779,6 +1799,9 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                 return '…'
         else:
             val = sig.value_at(self.cursor_time)
+        return self._format_signal_raw_value(sig, sig_id, val)
+
+    def _format_signal_raw_value(self, sig, sig_id, val):
         if sig_id in self.analog_signals or getattr(sig, 'analog_mode', False):
             nv = numeric_value(val, sig.signal_type)
             if nv is not None:
@@ -2137,14 +2160,11 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
 
     def push_zoom_history(self):
         """Save current zoom state before changing."""
-        self.zoom_history.append((self.time_start, self.time_end))
-        if len(self.zoom_history) > self.zoom_history_max:
-            self.zoom_history.pop(0)
+        push_view_history(self)
 
     def pop_zoom_history(self):
         """Restore previous zoom state."""
-        if self.zoom_history:
-            self.time_start, self.time_end = self.zoom_history.pop()
+        self.view_back()
 
     # ── Decode Overlay Drawing ──
 
@@ -2422,8 +2442,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
         self.apply_bookmark(bm)
 
     def apply_bookmark(self, bm):
-        self.time_start = bm.time_start
-        self.time_end = bm.time_end
+        set_time_range(self, bm.time_start, max(bm.time_start + 1, bm.time_end))
         self.cursor_a = bm.cursor_a
         self.cursor_b = bm.cursor_b
         self.cursor_on = bm.cursor_on
@@ -2635,6 +2654,13 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
             return
 
         clicked = bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        if self._drag_anchor is None:
+            if getattr(self, 'overview_row', None) == my:
+                if clicked and mx >= wave_origin(self):
+                    self.overview_click(mx - wave_origin(self))
+                return
+            if my >= getattr(self, 'wave_bottom', getattr(self, 'height', 100000) - 1):
+                return
         if self._drag_anchor is None and getattr(self, 'ruler_row', 0) <= my < getattr(self, 'height', 100000) - 1:
             sidebar = getattr(self, 'sidebar_width', 0)
             browser = getattr(self, 'panel_mode', False) and (mx < sidebar or
@@ -2643,7 +2669,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                 if clicked:
                     self.panel_focus = 0
                     index = self.tree_scroll + my - self.wave_top
-                    if self.wave_top <= my < max(self.wave_top + 1, self.height // 2) and index < len(self._tree_flat):
+                    if self.wave_top <= my < max(self.wave_top + 1, (wave_bottom(self) + 1) // 2) and index < len(self._tree_flat):
                         self.tree_cursor = index
                         self._panel_update_selected_scope()
                     self.menu_page = 0
@@ -2666,9 +2692,8 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                 if abs(wave_x - self._drag_anchor_x) >= 3:   # a real drag
                     t0, t1 = sorted((self._drag_anchor, t))
                     if t1 > t0:
-                        self.push_zoom_history()
-                        self.time_start, self.time_end = t0, t1
-                        self._show_message(f"Zoom: {t0} – {t1}  (u-turn: Z fit all)")
+                        set_time_range(self, t0, t1)
+                        self._show_message(f"Zoom: {t0} – {t1}  (;back restores view)")
                 self._drag_anchor = self._drag_cur = None
                 return
             if bstate & curses.REPORT_MOUSE_POSITION:
@@ -2780,8 +2805,10 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                     elif self.show_tree:
                         self.draw_tree_browser()
                     else:
+                        self.prepare_inspector()
                         self._prepare_row_window()
                         self.draw_header()
+                        self.draw_overview()
                         self.draw_ruler()
                         self.draw_signals()
                         if self.show_annotations:
@@ -2792,6 +2819,7 @@ class Alwavelets(ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixi
                             self.draw_register_panel()
                         if self._drag_cur is not None:
                             self.draw_drag_selection()
+                        self.draw_inspector()
                         if getattr(self, 'show_instruction_results', False):
                             self.draw_instruction_results()
                         self.draw_status_bar()

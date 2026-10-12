@@ -12,6 +12,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
+from .ui_navigation import set_time_range
 
 
 class CommandLineMixin:
@@ -41,6 +42,10 @@ class CommandLineMixin:
         the interactive prompt and the agent control channel."""
         return {
             'actions': lambda: self.open_action_palette(),
+            'back': lambda: self.view_back(),
+            'forward': lambda: self.view_forward(),
+            'inspect': lambda: self.toggle_inspector(),
+            'overview': lambda: self.toggle_overview(),
             'help': lambda: self._cmd_help(),
             'zoom': lambda: self._cmd_zoom_range(args),
             'fit': lambda: self.zoom_fit_all(),
@@ -141,6 +146,10 @@ class CommandLineMixin:
     def _cmd_help(self):
         cmds = [
             "actions   — Search actions and shortcuts (F4 / Ctrl-P)",
+            "back      — Restore previous time range (F8)",
+            "forward   — Return to next time range (F9)",
+            "inspect   — Toggle focused-signal details (F6)",
+            "overview  — Toggle timeline overview (F7)",
             "help      — Show this list",
             "zoom A B  — Set time range [A..B]",
             "fit       — Zoom to fit all",
@@ -189,8 +198,7 @@ class CommandLineMixin:
         parts = args.split()
         if len(parts) >= 2:
             try:
-                self.time_start = self._time_arg(parts[0])
-                self.time_end = self._time_arg(parts[1])
+                set_time_range(self, self._time_arg(parts[0]), self._time_arg(parts[1]))
             except ValueError:
                 self._show_message("Usage: zoom <start> <end>   (ticks or e.g. 170ns 290ns)")
         else:

@@ -11,6 +11,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
+from .ui_navigation import set_time_range
 
 
 
@@ -96,14 +97,13 @@ class KeymapMixin:
 
     def _kb_home(self):
         span = self.time_end - self.time_start
-        self.time_start = 0
-        self.time_end = span
+        set_time_range(self, 0, span)
         self.cursor_a = 0
 
     def _kb_end(self):
         span = self.time_end - self.time_start
-        self.time_end = self.vcd.max_time
-        self.time_start = max(0, self.time_end - span)
+        end = max(1, self.vcd.max_time)
+        set_time_range(self, max(0, end - span), end)
         self.cursor_a = self.vcd.max_time
 
     def _kb_page_up(self):
@@ -331,6 +331,10 @@ class KeymapMixin:
             K.KEY_F2: self._kb_toggle_menu_bar,
             K.KEY_F3: self._kb_cycle_workmode,
             K.KEY_F4: self.open_action_palette,
+            K.KEY_F6: self.toggle_inspector,
+            K.KEY_F7: self.toggle_overview,
+            K.KEY_F8: self.view_back,
+            K.KEY_F9: self.view_forward,
             16: self.open_action_palette,  # Ctrl-P
             ord('C'): self._kb_show_colors,
             K.KEY_RIGHT: self._kb_cursor_right, ord('l'): self._kb_cursor_right,
