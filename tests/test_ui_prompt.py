@@ -59,3 +59,11 @@ def test_prefilled_settings_can_be_accepted_replaced_or_cancelled(monkeypatch):
     assert read_prompt(Screen(['\x1b']), 'Fixed: ', initial='7 8 signed') == ''
     keys = ['\x15'] + list('0 15 unsigned') + ['\n']
     assert read_prompt(Screen(keys), 'Fixed: ', initial='7 8 signed') == '0 15 unsigned'
+
+
+def test_cancel_sentinel_distinguishes_empty_label_from_escape(monkeypatch):
+    monkeypatch.setattr(curses, 'noecho', lambda: None)
+    monkeypatch.setattr(curses, 'curs_set', lambda _: None)
+    assert read_prompt(Screen(['\x1b']), 'Label: ', initial='old', cancel_value=None) is None
+    assert read_prompt(Screen(['\x15', '\n']), 'Label: ', initial='old', cancel_value=None) == ''
+    assert read_prompt(Screen(['\n']), 'Label: ', cancel_value=None) == ''

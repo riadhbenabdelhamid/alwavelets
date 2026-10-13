@@ -1103,6 +1103,7 @@ class DrawingMixin(RegisterPanelMixin):
             ]),
             ("Cursors & Markers", [
                 "c Hide/show selected \u00b7 1/2 Show A/B \u00b7 m Mark \u00b7 M Clear",
+                "F12 Marker list: jump, rename, delete \u00b7 u/Ctrl-R Undo/redo",
                 "< > . Marker jump \u00b7 gt Go to time",
                 "e Edge-to-edge \u00b7 f Find value \u00b7 ]/[ Edge (focused)",
                 "P Pattern \u00b7 / Find \u00b7 n Next",

@@ -13,6 +13,7 @@ from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
 from .ui_navigation import active_cursor_visible, set_active_cursor_visible, set_time_range
 from .ui_editing import remember_members, remove_rows
+from .marker_editing import delete_markers
 
 
 
@@ -144,7 +145,7 @@ class KeymapMixin:
         self.jump_prev_edge(any_visible=False)
 
     def _kb_clear_markers(self):
-        self.markers.clear()
+        delete_markers(self, self.markers)
 
     def _kb_toggle_full_names(self):
         self.show_full_names = not self.show_full_names
@@ -326,6 +327,7 @@ class KeymapMixin:
             K.KEY_F7: self.toggle_overview,
             K.KEY_F8: self.view_back,
             K.KEY_F9: self.view_forward,
+            K.KEY_F12: self.open_marker_manager,
             16: self.open_action_palette,  # Ctrl-P
             ord('C'): self._kb_show_colors,
             K.KEY_RIGHT: self._kb_cursor_right, ord('l'): self._kb_cursor_right,

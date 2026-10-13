@@ -107,6 +107,15 @@ cursor's visibility. To hide both, press **1**, **c**, **2**, **c**. Left/right
 move the selected cursor when visible and scroll the view when it is hidden.
 The A–B measurement appears only while both cursors are visible.
 
+**F12** (or `;markers`, or **Manage markers** in the action palette) opens a
+time-sorted marker list. Use **↑/↓**, **PgUp/PgDn**, or **Home/End** to select;
+**Enter** jumps the active cursor to that marker and makes it visible.
+**r** renames, **Delete** removes one, **m** adds at the cursor, and **M** clears
+all. **u** / **Ctrl-R** undo/redo marker edits; **Esc** closes the list.
+You can also click a row, double-click to jump, or click the controls.
+In label prompts, empty **Enter** leaves no label and **Esc** cancels.
+Markers are saved with `;session`; **,** / **.** still jump between them.
+
 Select signals with **Space** or **V**, then use **R**, **v**, or **H** to change
 their radix, color, or analog height together. Cycling uses the focused selected
 signal's setting (or the first selected signal by ID when focus is elsewhere)
@@ -187,9 +196,10 @@ assignments. Text/SVG snapshots using a saved arrangement honor those settings;
 an explicit snapshot radix overrides the saved signal assignments.
 
 **u** / `;undo` reverses an edit; **Ctrl-R** / `;redo` reapplies it to the original
-signals, even after changing focus or selection. Each bulk formatting/removal
+targets, even after changing focus or selection. Each bulk formatting/removal
 operation is one history entry. Editing history holds up to 100 entries and
-covers formatting, analog toggles, add/remove, reordering, and grouping. A new
+covers signal formatting, analog toggles, add/remove, reordering, grouping,
+and marker creation, renaming, deletion, and clear-all. A new
 edit clears redo; navigation preserves it. Restoring a session/arrangement or
 reloading a trace clears editing history. History itself is not saved in sessions.
 

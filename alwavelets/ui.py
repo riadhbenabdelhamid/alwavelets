@@ -39,6 +39,8 @@ from .ui_navigation import ViewHistoryMixin, active_cursor_visible, push_view_hi
 from .ui_inspection import InspectionMixin
 from .ui_editing import apply_format, format_targets, remember_entries, remember_rows, step_history
 from .ui_signal_menu import SignalMenuMixin
+from .ui_markers import MarkerManagerMixin
+from .marker_editing import add_marker
 from .ui_custom_radix import CustomRadixMixin
 from .ui_spacing import SPACING_MODES, row_spacing, spacing_name
 from .custom_radix import custom_radix_state, load_custom_radixes
@@ -84,7 +86,7 @@ def nearest_color_256(r, g, b):
     return (232 + gi) if d_gray < d_cube else cube
 
 
-class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
+class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistoryMixin, ActionPaletteMixin, DrawingMixin, DebugActionsMixin, KeymapMixin, CommandLineMixin, ExportMixin, TreePanelMixin, FinderMixin, LiveReloadMixin):
     """Full-featured TUI waveform viewer."""
 
     # Color pair indices
@@ -253,6 +255,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         self.show_colors = False
         self.show_actions = False
         self._signal_menu = None
+        self._marker_menu = None
         self.show_inspector = False
         self.show_overview = False
         self.selected_signals = set()
@@ -1548,6 +1551,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             self._clear_expansion_views()
             self._undo_stack, self._redo_stack = [], []
             self._signal_menu = None
+            self._marker_menu = None
             # Validate signal IDs exist
             valid_ids = self.vcd.signals
             saved_order = data.get('display_order', [])
@@ -1678,6 +1682,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                 self._clear_expansion_views()
             self._undo_stack, self._redo_stack = [], []
             self._signal_menu = None
+            self._marker_menu = None
             valid = self.vcd.signals
             saved_order = data.get('display_order', [])
             order = saved_order if isinstance(saved_order, DisplayOrder) else [s for s in saved_order if s in valid]
@@ -2503,15 +2508,16 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
 
 
-    def prompt_input(self, prompt_text, initial=''):
+    def prompt_input(self, prompt_text, initial='', cancel_value=''):
         # Under agent control there is nobody at the keyboard to answer, and
         # blocking here would freeze the viewer for the user too. Commands
         # that would prompt become no-ops; agents pass arguments inline.
         if self._remote_depth:
-            return ""
+            return cancel_value
         from .ui_prompt import read_prompt
         try:
-            return read_prompt(self.stdscr, prompt_text, curses.color_pair(self.C_PROMPT), initial=initial)
+            return read_prompt(self.stdscr, prompt_text, curses.color_pair(self.C_PROMPT),
+                               initial=initial, cancel_value=cancel_value)
         finally:
             self._needs_layout = True  # the terminal can resize while prompting
             self._dirty = True
@@ -2561,8 +2567,9 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             self._ensure_cursor_visible()
 
     def place_marker(self):
-        label = self.prompt_input(f"Marker label (t={self.cursor_time}): ")
-        self.markers.append(Marker(self.cursor_time, label))
+        label = self.prompt_input(f"Marker label (t={self.cursor_time}): ", cancel_value=None)
+        if label is not None:
+            return add_marker(self, self.cursor_time, label)
 
     def do_export_menu(self):
         """Show export sub-menu."""
@@ -2768,7 +2775,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                 self._drag_cur = None
 
         elif bstate & curses.BUTTON3_CLICKED:
-            self.markers.append(Marker(t, ""))
+            add_marker(self, t)
 
         elif bstate & curses.BUTTON4_PRESSED:
             self.zoom(0.5, center=t)  # scroll up = zoom in
@@ -2875,6 +2882,8 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
                     if self._signal_menu is not None:
                         self.draw_signal_menu()
+                    if self._marker_menu is not None:
+                        self.draw_marker_manager()
                     self.stdscr.refresh()
                     self._dirty = False
 
@@ -2907,6 +2916,10 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
                 #    layout stays stale until a second resize ──
                 if key == curses.KEY_RESIZE:
                     self._needs_layout = True
+                    continue
+
+                if self._marker_menu is not None:
+                    self.marker_manager_handle_key(key)
                     continue
 
                 if self._signal_menu is not None:

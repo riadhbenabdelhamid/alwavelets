@@ -17,7 +17,7 @@ def clip_cells(text, limit):
     return text, used
 
 
-def read_prompt(screen, label, attribute=0, initial=''):
+def read_prompt(screen, label, attribute=0, initial='', cancel_value=''):
     text, cursor, left = initial, len(initial), 0
     curses.noecho()
     curses.curs_set(1)
@@ -45,7 +45,7 @@ def read_prompt(screen, label, attribute=0, initial=''):
             if key in ('\n', '\r', curses.KEY_ENTER):
                 return text.strip()
             if key in ('\x1b', 27):
-                return ''
+                return cancel_value
             if key in ('\b', '\x7f', curses.KEY_BACKSPACE):
                 if cursor:
                     text = text[:cursor - 1] + text[cursor:]

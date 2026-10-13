@@ -4,7 +4,8 @@ import fnmatch
 import os
 import re
 
-from .core import Radix, TranslationMap, Marker
+from .core import Radix, TranslationMap
+from .marker_editing import add_marker
 
 
 # ══════════════════════════════════════════════════════════════
@@ -169,7 +170,7 @@ class TclEngine:
                 from .snapshot import parse_time
                 t = parse_time(self.viewer.vcd, args[0])
             label = " ".join(args[1:]) if len(args) > 1 else ""
-            self.viewer.markers.append(Marker(t, label))
+            add_marker(self.viewer, t, label)
 
     def _cmd_radix(self, args):
         if args:

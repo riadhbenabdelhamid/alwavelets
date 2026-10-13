@@ -41,6 +41,7 @@ class CommandLineMixin:
         """verb -> zero-arg callable, bound to `args`. Single source for both
         the interactive prompt and the agent control channel."""
         return {
+            'markers': lambda: self.open_marker_manager(),
             'signal-menu': lambda: self.open_signal_menu(),
             'expand-fields': lambda: self.expand_format_fields(),
             'undo': lambda: self.undo(),
@@ -162,6 +163,7 @@ class CommandLineMixin:
             "zoom A B  — Set time range [A..B]",
             "fit       — Zoom to fit all",
             "goto T    — Move cursor to time T",
+            "markers   — Manage time markers (F12): jump, rename, delete, undo",
             "find PAT  — Focus a signal (among those already displayed)",
             "add PAT   — Add signals to the display ('add top.alu.*')",
             "remove PAT— Remove signals from the display (alias: rm)",
