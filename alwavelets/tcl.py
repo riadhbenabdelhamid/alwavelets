@@ -155,6 +155,7 @@ class TclEngine:
         if args:
             if args[0] in ('a', 'A', '1'):
                 self.viewer.active_cursor = 'a'
+                self.viewer.cursor_on = True
             elif args[0] in ('b', 'B', '2'):
                 self.viewer.active_cursor = 'b'
                 self.viewer.cursor_b_on = True
@@ -200,7 +201,7 @@ class TclEngine:
                 self.output.append(f"{sig.full_name} [{sig.size}]")
 
     def _cmd_measure(self, args):
-        if self.viewer.cursor_b_on:
+        if self.viewer.cursor_on and self.viewer.cursor_b_on:
             delta = self.viewer.cursor_delta
             self.output.append(f"Delta: {delta} ({self.viewer.vcd.time_to_str(delta)})")
 

@@ -18,6 +18,7 @@ from .streaming import read_cancellation
 from .ui_chrome import elide, menu_pages, signal_origin, text_width, wave_bottom, wave_origin, wave_right
 from .ui_spacing import row_spacing, spacing_name
 from .ui_registers import RegisterPanelMixin
+from .ui_navigation import active_cursor_visible
 
 # Timescale unit → seconds, for turning tick deltas into real frequencies.
 _UNIT_S = {'s': 1.0, 'ms': 1e-3, 'us': 1e-6, 'ns': 1e-9, 'ps': 1e-12, 'fs': 1e-15}
@@ -283,7 +284,7 @@ class DrawingMixin(RegisterPanelMixin):
         focused = not self.panel_mode or self.panel_focus == 1
         heading = " ▸ Signals" if focused else "   Signals"
         name_header = elide(heading, self.name_width).ljust(self.name_width)
-        if self.show_values and self.cursor_on and self.name_width >= 18:
+        if self.show_values and active_cursor_visible(self) and self.name_width >= 18:
             name_header = heading.ljust(self.name_width - 7) + " Value "
         try:
             self.stdscr.addstr(row, signal_origin(self), name_header,
@@ -516,7 +517,7 @@ class DrawingMixin(RegisterPanelMixin):
 
             # Compute value string
             val_str = ""
-            if self.show_values and self.cursor_on:
+            if self.show_values and active_cursor_visible(self):
                 val_str = self.format_signal_value(sig, sig_id)
 
             # Calculate available widths
@@ -919,7 +920,7 @@ class DrawingMixin(RegisterPanelMixin):
                 urgent_fields.append(len(fields) - 1)
 
         # Active cursor
-        if self.cursor_on:
+        if active_cursor_visible(self):
             cur_lbl = "A" if self.active_cursor == 'a' else "B"
             attr = curses.color_pair(self.C_CURSOR) if self.active_cursor == 'a' else curses.color_pair(self.C_CURSORB)
             _put(f" {cur_lbl} ", attr | curses.A_BOLD)
@@ -930,7 +931,7 @@ class DrawingMixin(RegisterPanelMixin):
         # Delta — plus the measurement readout: Δt as a real frequency
         # (1/Δt via the trace timescale) and the focused signal's transition
         # count inside [A, B].
-        if self.cursor_b_on:
+        if self.cursor_on and self.cursor_b_on:
             _sep()
             _put("Δ ", curses.color_pair(self.C_HEADER))
             delta_str = self.format_ruler_time(self.cursor_delta)
@@ -1101,7 +1102,7 @@ class DrawingMixin(RegisterPanelMixin):
                 "i Hierarchical indent mode",
             ]),
             ("Cursors & Markers", [
-                "c Cursor \u00b7 1/2 A/B \u00b7 m Mark \u00b7 M Clear",
+                "c Hide/show selected \u00b7 1/2 Show A/B \u00b7 m Mark \u00b7 M Clear",
                 "< > . Marker jump \u00b7 gt Go to time",
                 "e Edge-to-edge \u00b7 f Find value \u00b7 ]/[ Edge (focused)",
                 "P Pattern \u00b7 / Find \u00b7 n Next",

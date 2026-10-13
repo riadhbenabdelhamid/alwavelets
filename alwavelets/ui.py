@@ -35,7 +35,7 @@ from .ui_drawing import DrawingMixin
 from .ui_chrome import signal_origin, wave_bottom, wave_origin, wave_right
 from .ui_registers import register_layout, register_position, REGISTER_POSITIONS
 from .ui_actions import ActionPaletteMixin
-from .ui_navigation import ViewHistoryMixin, push_view_history, set_time_range
+from .ui_navigation import ViewHistoryMixin, active_cursor_visible, push_view_history, set_time_range
 from .ui_inspection import InspectionMixin
 from .ui_editing import apply_format, format_targets, remember_entries, remember_rows, step_history
 from .ui_signal_menu import SignalMenuMixin
@@ -242,7 +242,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         self.cursor_a = 0
         self.cursor_b = vcd.max_time // 2 if vcd.max_time > 0 else 50
         self.active_cursor = 'a'      # 'a' or 'b'
-        self.cursor_on = True
+        self.cursor_on = True        # cursor A visibility; B is independent
         self.cursor_b_on = False
 
         # Display
@@ -826,7 +826,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
     @property
     def cursor_delta(self):
-        if self.cursor_b_on:
+        if self.cursor_on and self.cursor_b_on:
             return abs(self.cursor_b - self.cursor_a)
         return None
 
@@ -1005,7 +1005,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
         if new_span == span:
             return
         if center is None:
-            center = self.cursor_time if self.cursor_on else (self.time_start + self.time_end) // 2
+            center = self.cursor_time if active_cursor_visible(self) else (self.time_start + self.time_end) // 2
         if not self.time_start <= center <= self.time_end:
             center = (self.time_start + self.time_end) // 2
         # Keep the anchor at the same fraction of the viewport. Rounding the
@@ -1346,7 +1346,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
     def zoom_to_selection(self):
         """Zoom to fit between cursor A and cursor B."""
-        if not self.cursor_b_on:
+        if not (self.cursor_on and self.cursor_b_on):
             return
         t1, t2 = min(self.cursor_a, self.cursor_b), max(self.cursor_a, self.cursor_b)
         margin = max((t2 - t1) // 20, 1)
@@ -1615,6 +1615,8 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             'markers': [{'time': m.time, 'label': m.label} for m in self.markers],
             'view': [self.time_start, self.time_end],
             'cursors': [self.cursor_a, self.cursor_b, self.cursor_b_on],
+            'cursor_on': getattr(self, 'cursor_on', True),
+            'active_cursor': getattr(self, 'active_cursor', 'a'),
             'name_width': self.name_width,
             'signal_spacing': self.signal_spacing,
             'signal_divider': row_spacing(self)[1],
@@ -1703,6 +1705,10 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
             self.sig_height = {k: int(v) for k, v in data.get('sig_height', {}).items()
                                if k in valid}
             apply_session_times(self, data)
+            if isinstance(data.get('cursor_on'), bool):
+                self.cursor_on = data['cursor_on']
+            if data.get('active_cursor') in ('a', 'b'):
+                self.active_cursor = data['active_cursor']
             mode = data.get('workmode')
             if isinstance(mode, str) and mode in self.WORKMODES:
                 self.apply_workmode(mode, notify=False)
@@ -2122,7 +2128,7 @@ class Alwavelets(CustomRadixMixin, SignalMenuMixin, InspectionMixin, ViewHistory
 
     def do_edge_to_edge(self):
         """Measure time between edges on two signals (setup/hold timing)."""
-        if not self.cursor_on:
+        if not active_cursor_visible(self):
             self._show_message("Enable cursor first (c)")
             return
 

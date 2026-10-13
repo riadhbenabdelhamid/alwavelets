@@ -1,4 +1,13 @@
-"""Bounded, range-only view history shared by interactive navigation paths."""
+"""Cursor visibility and bounded view history for interactive navigation."""
+
+
+def active_cursor_visible(viewer):
+    return viewer.cursor_b_on if getattr(viewer, 'active_cursor', 'a') == 'b' else viewer.cursor_on
+
+
+def set_active_cursor_visible(viewer, visible=True):
+    attribute = 'cursor_b_on' if getattr(viewer, 'active_cursor', 'a') == 'b' else 'cursor_on'
+    setattr(viewer, attribute, visible)
 
 
 def push_view_history(viewer):

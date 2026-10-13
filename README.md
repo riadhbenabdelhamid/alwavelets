@@ -101,6 +101,12 @@ applies, and **Esc** returns or closes. Right-clicking an unselected label
 selects that target for the menu; right-clicking a selected label keeps the
 selection. Right-clicking waveforms still places markers.
 
+**1** shows and selects cursor A; **2** shows and selects cursor B. **c** hides
+or shows only the selected cursor, preserving its position and the other
+cursor's visibility. To hide both, press **1**, **c**, **2**, **c**. Left/right
+move the selected cursor when visible and scroll the view when it is hidden.
+The A–B measurement appears only while both cursors are visible.
+
 Select signals with **Space** or **V**, then use **R**, **v**, or **H** to change
 their radix, color, or analog height together. Cycling uses the focused selected
 signal's setting (or the first selected signal by ID when focus is elsewhere)

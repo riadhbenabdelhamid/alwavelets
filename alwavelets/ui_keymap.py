@@ -11,7 +11,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
-from .ui_navigation import set_time_range
+from .ui_navigation import active_cursor_visible, set_active_cursor_visible, set_time_range
 from .ui_editing import remember_members, remove_rows
 
 
@@ -63,13 +63,13 @@ class KeymapMixin:
         self.show_colors = True
 
     def _kb_cursor_right(self):
-        if self.cursor_on:
+        if active_cursor_visible(self):
             self.move_cursor(1)
         else:
             self.scroll_time(1)
 
     def _kb_cursor_left(self):
-        if self.cursor_on:
+        if active_cursor_visible(self):
             self.move_cursor(-1)
         else:
             self.scroll_time(-1)
@@ -127,7 +127,7 @@ class KeymapMixin:
         self.focus_idx = 0
 
     def _kb_toggle_cursor(self):
-        self.cursor_on = not self.cursor_on
+        set_active_cursor_visible(self, not active_cursor_visible(self))
 
     def _kb_cursor_a(self):
         self.active_cursor = 'a'
@@ -136,7 +136,6 @@ class KeymapMixin:
     def _kb_cursor_b(self):
         self.active_cursor = 'b'
         self.cursor_b_on = True
-        self.cursor_on = True
 
     def _kb_next_edge(self):
         self.jump_next_edge(any_visible=False)

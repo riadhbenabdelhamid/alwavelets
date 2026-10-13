@@ -53,7 +53,7 @@ class InspectionMixin:
 
     def _inspector_window(self):
         return (id(self.vcd), self.sig_offset, self.focus_idx,
-                self.time_start, self.time_end, self.cursor_a, self.cursor_b, self.cursor_b_on)
+                self.time_start, self.time_end, self.cursor_a, self.cursor_b, self.cursor_on, self.cursor_b_on)
 
     def prepare_inspector(self):
         """Cancel obsolete reads before the drawing pass touches catalog pages."""
@@ -80,7 +80,7 @@ class InspectionMixin:
 
         # Snapshot coverage on the UI thread. The inspector never expands a
         # lazy trace's loaded ranges just to inspect an off-screen cursor.
-        a_ready = 0 <= a <= vcd.max_time and loaded(a, a)
+        a_ready = self.cursor_on and 0 <= a <= vcd.max_time and loaded(a, a)
         b_ready = b_on and 0 <= b <= vcd.max_time and loaded(b, b)
         range_ready = loaded(start, end)
 
@@ -132,13 +132,14 @@ class InspectionMixin:
                     if raw is None:
                         return 'outside trace' if tick < 0 or tick > self.vcd.max_time else 'not loaded'
                     return self._format_signal_raw_value(sig, sid, raw)
-                lines.append(f' A {self.format_ruler_time(self.cursor_a)} = {value("a", self.cursor_a)}')
+                lines.append(f' A {self.format_ruler_time(self.cursor_a)} = {value("a", self.cursor_a)}'
+                             if self.cursor_on else ' A off · 1 Activate cursor A')
                 lines.append(f' B {self.format_ruler_time(self.cursor_b)} = {value("b", self.cursor_b)}'
                              if self.cursor_b_on else ' B off · 2 Activate cursor B')
                 count = details['transitions']
                 lines.append(f' View transitions: {count:,}' if count is not None else ' View data not loaded')
                 lines.append(f' Δ A–B: {self.format_ruler_time(self.cursor_delta)}'
-                             if self.cursor_b_on else ' Enable both cursors to compare values')
+                             if self.cursor_on and self.cursor_b_on else ' Enable both cursors to compare values')
         for offset in range(self.inspector_rows):
             self._detail_line(top + offset, lines[offset] if offset < len(lines) else '',
                               curses.color_pair(self.C_HEADER) | curses.A_BOLD if offset == 0 else curses.A_NORMAL)

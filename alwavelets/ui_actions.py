@@ -26,9 +26,9 @@ ACTION_INFO = {
     '_kb_next_edge': ('Next edge', 'Move to the next transition on the focused waveform'),
     '_kb_prev_edge': ('Previous edge', 'Move to the previous transition on the focused waveform'),
     'snap_cursor_to_edge': ('Snap to edge', 'Snap the cursor to the nearest waveform transition'),
-    '_kb_cursor_a': ('Cursor A', 'Activate the first time cursor'),
-    '_kb_cursor_b': ('Cursor B', 'Activate the second time cursor'),
-    '_kb_toggle_cursor': ('Toggle cursor', 'Show or hide the time cursor'),
+    '_kb_cursor_a': ('Cursor A', 'Show and select cursor A'),
+    '_kb_cursor_b': ('Cursor B', 'Show and select cursor B'),
+    '_kb_toggle_cursor': ('Toggle selected cursor', 'Show or hide the selected cursor; keep the other unchanged'),
     'expand_bus': ('Expand bus bits', 'Expand or collapse individual bit lanes of the focused bus'),
     'expand_float_fields': ('Expand format components', 'Expand fixed-point or float into its fields and decoded value'),
     'cycle_signal_radix': ('Signal radix', 'Change the number format of selected waveforms, or the focused waveform'),
@@ -192,7 +192,7 @@ def contextual_menu(viewer):
             items.append(item('view_back', 'Back'))
         if getattr(viewer, 'zoom_forward', []):
             items.append(item('view_forward', 'Forward'))
-        if viewer.cursor_b_on:
+        if viewer.cursor_on and viewer.cursor_b_on:
             items.append(item('zoom_to_selection'))
     items += [item('open_finder'), item('toggle_inspector'), item('toggle_overview'), item('_kb_cycle_workmode'), item('_kb_toggle_panel'), item('_kb_toggle_menu_bar')]
     return [(key, label) for key, label in items if key]

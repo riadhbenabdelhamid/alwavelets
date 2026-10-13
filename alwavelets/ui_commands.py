@@ -12,7 +12,7 @@ from .analysis import *  # noqa: F401,F403
 from .persistence import *  # noqa: F401,F403
 from .tcl import TclEngine  # noqa: F401
 from .manual import AlwaveletsManual  # noqa: F401
-from .ui_navigation import set_time_range
+from .ui_navigation import set_active_cursor_visible, set_time_range
 
 
 class CommandLineMixin:
@@ -265,7 +265,7 @@ class CommandLineMixin:
                 if t is None:
                     self._show_message(f'No match: {args}')
                     return
-                self.cursor_on = True
+                set_active_cursor_visible(self)
                 self.cursor_time = t
                 self._ensure_cursor_visible()
                 self._show_message(f'⌖ {vcd.time_to_str(t)}: {args}{wrapped}')
@@ -284,7 +284,7 @@ class CommandLineMixin:
         if t is None:
             self._show_message(f"No match: {args}")
             return
-        self.cursor_on = True
+        set_active_cursor_visible(self)
         self.cursor_time = t
         self._ensure_cursor_visible()
         self._show_message(f"⌖ {self.vcd.time_to_str(t)}: {args}{wrapped}")
@@ -344,7 +344,7 @@ class CommandLineMixin:
             self._show_message("No glitches or x-hazards found")
             return
         nxt = next((e for e in evs if e[0] > self.cursor_time), evs[0])
-        self.cursor_on = True
+        set_active_cursor_visible(self)
         self.cursor_time = nxt[0]
         self._ensure_cursor_visible()
         nx = sum(1 for e in evs if e[2] == "x")
