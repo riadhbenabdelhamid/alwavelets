@@ -116,6 +116,14 @@ def test_hints_follow_scope_signal_and_waveform_focus(viewer):
     assert ('u', 'Undo') in contextual_menu(viewer)
 
 
+def test_waveform_hints_expose_marker_list_without_jump_shortcuts(viewer):
+    viewer.panel_focus = 1
+    hints = contextual_menu(viewer)
+    assert ('F12', 'Markers') in hints
+    assert (',', 'Previous') not in hints
+    assert ('.', 'Next') not in hints
+
+
 @pytest.mark.parametrize('width', [24, 40, 80, 96, 120, 180])
 def test_hierarchy_never_replaces_waveform_labels_except_explicit_overlay(viewer, width):
     viewer.stdscr = Screen(width)

@@ -726,6 +726,18 @@ class DrawingMixin(RegisterPanelMixin):
                         except (curses.error, NameError, TypeError):
                             pass
 
+            # Markers sit behind cursors so a jump to a marker leaves the
+            # cursor visible at that column, including when zoomed out.
+            for marker in self.markers:
+                mc = self.time_to_col(marker.time)
+                ac = wave_origin(self) + mc
+                if 0 <= mc < self.wave_width and ac < wave_right(self):
+                    for rr in range(row, row + sig_rows):
+                        try:
+                            self.stdscr.addch(rr, ac, '▎', curses.color_pair(self.C_MARKER) | curses.A_BOLD)
+                        except curses.error:
+                            pass
+
             # ── Cursor A / B (span all of a multi-row signal's rows) ──
             if self.cursor_on:
                 cc = self.time_to_col(self.cursor_a)
@@ -744,17 +756,6 @@ class DrawingMixin(RegisterPanelMixin):
                     for rr in range(row, row + sig_rows):
                         try:
                             self.stdscr.addch(rr, ac, '┃', curses.color_pair(self.C_CURSORB) | curses.A_BOLD)
-                        except curses.error:
-                            pass
-
-            # ── Markers ──
-            for marker in self.markers:
-                mc = self.time_to_col(marker.time)
-                ac = wave_origin(self) + mc
-                if 0 <= mc < self.wave_width and ac < wave_right(self):
-                    for rr in range(row, row + sig_rows):
-                        try:
-                            self.stdscr.addch(rr, ac, '▎', curses.color_pair(self.C_MARKER) | curses.A_BOLD)
                         except curses.error:
                             pass
 
@@ -896,8 +897,9 @@ class DrawingMixin(RegisterPanelMixin):
         # Active flash message takes over the status row until it expires
         # (set by the non-blocking _show_message; cleared on an idle tick).
         if self._message is not None and time.monotonic() < self._message_expire:
+            message = elide(f' {self._message}', max(0, w - 1))
             try:
-                self.stdscr.addstr(row, 0, f" {self._message}"[:w - 1].ljust(w - 1),
+                self.stdscr.addstr(row, 0, message + ' ' * max(0, w - 1 - text_width(message)),
                                    curses.color_pair(self.C_PROMPT))
             except curses.error:
                 pass
@@ -1103,7 +1105,8 @@ class DrawingMixin(RegisterPanelMixin):
             ]),
             ("Cursors & Markers", [
                 "c Hide/show selected \u00b7 1/2 Show A/B \u00b7 m Mark \u00b7 M Clear",
-                "F12 Marker list: jump, rename, delete \u00b7 u/Ctrl-R Undo/redo",
+                "F12 Markers: ↑↓ Select · Enter Jump and close · u/Ctrl-R Undo/redo",
+                "Inside F12: / Filter labels/time · Ctrl-U Reset filter",
                 "< > . Marker jump \u00b7 gt Go to time",
                 "e Edge-to-edge \u00b7 f Find value \u00b7 ]/[ Edge (focused)",
                 "P Pattern \u00b7 / Find \u00b7 n Next",

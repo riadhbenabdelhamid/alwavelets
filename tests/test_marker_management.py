@@ -5,6 +5,7 @@ import pytest
 
 from alwavelets.core import Marker
 from alwavelets.marker_editing import add_marker, delete_markers, rename_marker
+from alwavelets.ui_chrome import wave_origin
 from test_ui_chrome import Screen, viewer as _viewer_fixture
 
 viewer = _viewer_fixture
@@ -65,6 +66,112 @@ def test_jump_reveals_only_active_cursor_and_recenters(viewer):
     assert viewer.cursor_a == 20 and viewer.cursor_b == 90
     assert not viewer.cursor_on and viewer.cursor_b_on
     assert 0 <= viewer.time_to_col(90) < viewer.wave_width - 1
+    assert viewer._message == 'Marker 1/1 · target · 90ns'
+
+
+@pytest.mark.parametrize('active', ['a', 'b'])
+@pytest.mark.parametrize('other_visible', [False, True])
+@pytest.mark.parametrize('key,start,target', [('.', 10, 60), ('>', 10, 60), (',', 90, 60), ('<', 90, 60)])
+def test_shortcut_jump_reveals_active_cursor_and_preserves_other_state(viewer, active, other_visible, key, start, target):
+    viewer.markers = [Marker(90, 'last'), Marker(10, 'first'), Marker(60, 'middle')]
+    viewer.active_cursor = active
+    viewer.cursor_a = viewer.cursor_b = 25
+    viewer.cursor_time = start
+    viewer.cursor_on = other_visible if active == 'b' else False
+    viewer.cursor_b_on = other_visible if active == 'a' else False
+    viewer.time_start, viewer.time_end = 0, 40
+    viewer.selected_signals = {'!'}
+    viewer._redo_stack = [('sentinel', lambda: None)]
+    before = viewer.focus_idx, viewer.tree_cursor, list(viewer.markers)
+    viewer.keymap[ord(key)]()
+    assert viewer.cursor_time == target
+    assert (viewer.cursor_on, viewer.cursor_b_on) == ((True, other_visible) if active == 'a' else (other_visible, True))
+    assert (viewer.cursor_b if active == 'a' else viewer.cursor_a) == 25
+    assert 0 <= viewer.time_to_col(target) < viewer.wave_width - 1
+    assert viewer._message == 'Marker 2/3 · middle · 60ns'
+    assert (viewer.focus_idx, viewer.tree_cursor, viewer.markers) == before
+    assert viewer.selected_signals == {'!'} and len(viewer._redo_stack) == 1
+    assert not viewer._undo_stack
+
+
+def test_navigation_reports_chronological_position_wrap_and_unlabeled_markers(viewer):
+    viewer.markers = [Marker(90, 'last'), Marker(10, ''), Marker(60, 'middle')]
+    viewer.cursor_time = 60
+    for key, message in [('.', 'Marker 3/3 · last · 90ns'),
+                         ('.', 'Marker 1/3 · (unlabeled) · 10ns · wrapped'),
+                         (',', 'Marker 3/3 · last · 90ns · wrapped'),
+                         (',', 'Marker 2/3 · middle · 60ns')]:
+        viewer.keymap[ord(key)]()
+        assert viewer._message == message
+    viewer.markers = [Marker(60, 'only')]
+    viewer.jump_next_marker()
+    assert viewer._message == 'Marker 1/1 · only · 60ns · wrapped'
+
+
+def test_duplicate_times_use_list_order_and_shortcuts_keep_moving_in_time(viewer):
+    viewer.markers = [Marker(10, 'first'), Marker(10, 'second'), Marker(60, 'later')]
+    viewer.open_marker_manager()
+    viewer.marker_manager_handle_key(curses.KEY_DOWN)
+    viewer.marker_manager_handle_key(10)
+    assert viewer._message == 'Marker 2/3 · second · 10ns'
+    viewer.jump_next_marker()
+    assert viewer._message == 'Marker 3/3 · later · 60ns'
+    viewer.jump_prev_marker()
+    assert viewer._message == 'Marker 2/3 · second · 10ns'
+
+
+def test_empty_marker_navigation_explains_how_to_add_without_changing_cursor(viewer):
+    viewer.cursor_on = viewer.cursor_b_on = False
+    before = viewer.cursor_time, viewer.time_start, viewer.time_end
+    for key in (',', '.'):
+        viewer.keymap[ord(key)]()
+        assert viewer._message == 'No markers · m adds one at the cursor'
+        assert not viewer.cursor_on and not viewer.cursor_b_on
+        assert (viewer.cursor_time, viewer.time_start, viewer.time_end) == before
+
+
+@pytest.mark.parametrize('width', [24, 40, 80])
+def test_long_unicode_jump_feedback_fits_and_survives_resize(viewer, width):
+    viewer.stdscr = Screen(width)
+    viewer.update_layout()
+    viewer.markers = [Marker(10, '測定 e\u0301 ' * 100 + '\nnext line')]
+    viewer.cursor_time = 10
+    viewer.jump_next_marker()
+    assert '\n' not in viewer._message
+    if width >= 40:
+        assert '10ns' in viewer._message and 'wrapped' in viewer._message
+    viewer.draw_status_bar()
+    assert 'Marker 1/1' in viewer.stdscr.line(viewer.height - 1)
+    viewer.stdscr = Screen(20)
+    viewer.update_layout()
+    viewer.draw_status_bar()  # Cell-aware clipping also handles a later resize.
+
+
+@pytest.mark.parametrize('active', ['a', 'b'])
+def test_marker_line_does_not_cover_cursor_after_jump(viewer, active):
+    viewer.panel_mode = False
+    viewer.show_module_sep = False
+    viewer.update_layout()
+    viewer.active_cursor = active
+    viewer.cursor_on = viewer.cursor_b_on = False
+    viewer.markers = [Marker(50, 'edge')]
+    viewer.jump_next_marker()
+    viewer.draw_ruler()
+    viewer.draw_signals()
+    col = wave_origin(viewer) + viewer.time_to_col(50)
+    assert viewer.stdscr.rows[viewer.ruler_row][col] == active.upper()
+    assert viewer.stdscr.rows[viewer.wave_top][col] == '┃'
+
+
+@pytest.mark.parametrize('width', [24, 40, 80])
+def test_popup_explains_selection_and_jump_closure(viewer, width):
+    viewer.stdscr = Screen(width)
+    viewer.update_layout()
+    viewer.markers = [Marker(10, 'first')]
+    viewer.open_marker_manager()
+    text = rendered(viewer)
+    assert '↑↓ Select' in text
+    assert ('Enter Jump and close' if width >= 52 else 'Enter Jump/close') in text
 
 
 def test_rename_cancel_clear_and_noop_preserve_redo(viewer, monkeypatch):
@@ -239,7 +346,7 @@ def test_draw_is_bounded_and_opaque_across_modes_and_sizes(viewer, mode, size):
         left, top, w, h = menu['rect']
         assert all('~' not in viewer.stdscr.rows[row][left:left + w] for row in range(top, top + h))
     if width >= 40:
-        assert len(menu['buttons']) == 8
+        assert len(menu['buttons']) == 9
     viewer.marker_manager_handle_key(27)
     assert viewer._marker_menu is None
 

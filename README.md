@@ -108,13 +108,24 @@ move the selected cursor when visible and scroll the view when it is hidden.
 The A–B measurement appears only while both cursors are visible.
 
 **F12** (or `;markers`, or **Manage markers** in the action palette) opens a
-time-sorted marker list. Use **↑/↓**, **PgUp/PgDn**, or **Home/End** to select;
-**Enter** jumps the active cursor to that marker and makes it visible.
+time-sorted marker list. Inside the list, use **↑/↓**, **PgUp/PgDn**, or
+**Home/End** to select; **Enter** jumps the active cursor to that marker,
+makes it visible, and closes the list.
 **r** renames, **Delete** removes one, **m** adds at the cursor, and **M** clears
 all. **u** / **Ctrl-R** undo/redo marker edits; **Esc** closes the list.
 You can also click a row, double-click to jump, or click the controls.
+Inside the list, **/** opens a filter prompt: enter a label or time and press
+**Enter** to apply; **Esc** cancels the prompt. Matching ignores case, and every
+space-separated term must occur in the label, displayed time, or raw tick count.
+The title shows matching/total counts. **Ctrl-U** in the list resets the filter;
+an empty filter also shows all markers. Filtering preserves the markers themselves:
+**Delete** removes the selected match, while **M** still clears all markers,
+including those hidden by the filter.
 In label prompts, empty **Enter** leaves no label and **Esc** cancels.
-Markers are saved with `;session`; **,** / **.** still jump between them.
+Markers are saved with `;session`. In the waveform view, **,** / **.** jump
+to the previous / next marker and reveal the active cursor. Each jump briefly
+shows the marker's position in the list, label, and time; **wrapped** means
+navigation passed an end of the list. Open **F12** again to select in the list.
 
 Select signals with **Space** or **V**, then use **R**, **v**, or **H** to change
 their radix, color, or analog height together. Cycling uses the focused selected

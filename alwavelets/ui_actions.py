@@ -54,7 +54,7 @@ ACTION_INFO = {
     'do_export_menu': ('Export', 'Save the view, waveform data, or an arrangement'),
     'add_annotation_prompt': ('Add annotation', 'Label the current time or the interval between cursors'),
     'place_marker': ('Place marker', 'Place a marker at the active cursor'),
-    'open_marker_manager': ('Manage markers', 'List, jump to, rename, or delete time markers (F12)'),
+    'open_marker_manager': ('Manage markers', 'Search, jump to, rename, or delete time markers (F12)'),
     '_kb_clear_markers': ('Clear markers', 'Remove all time markers'),
     'jump_next_marker': ('Next marker', 'Jump to the next marked time'),
     'jump_prev_marker': ('Previous marker', 'Jump to the previous marked time'),
@@ -121,7 +121,7 @@ COMMAND_INPUT = {
     'eval': ('Evaluate Tcl', '<script>', 'set time 100'),
 }
 COMMAND_INFO = {
-    'markers': ('Manage markers', 'Open the marker list (F12); edit markers with undo/redo'),
+    'markers': ('Manage markers', 'Search the marker list (F12); edit markers with undo/redo'),
     'spacing': ('Row spacing', 'Cycle Compact / Blank gap / Divider (|)'),
     'signal-menu': ('Signal actions', 'Open the signal menu (F10)'),
     'expand-fields': ('Expand format components', 'Expand or collapse fixed-point/float fields (F)'),
@@ -175,6 +175,7 @@ def contextual_menu(viewer):
         if kind == 'scope':
             items.append(('Enter', 'Open scope'))
     else:
+        items.append(item('open_marker_manager', 'Markers'))
         if viewer.selected_signals:
             items += [item('_kb_backspace_remove', f'Remove {len(viewer.selected_signals)} selected'), item('undo')]
         if getattr(viewer, '_redo_stack', []):

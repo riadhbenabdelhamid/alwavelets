@@ -355,7 +355,7 @@ class KeymapMixin:
             ord('['): self._kb_prev_edge,
             ord('m'): self.place_marker,
             ord('M'): self._kb_clear_markers,
-            ord('<'): self.jump_prev_marker, ord(','): self.jump_prev_marker,
+            ord(','): self.jump_prev_marker, ord('<'): self.jump_prev_marker,
             ord('.'): self.jump_next_marker, ord('>'): self.jump_next_marker,
             10: self._kb_toggle_full_names, K.KEY_ENTER: self._kb_toggle_full_names,
             ord('i'): self._kb_toggle_indent,

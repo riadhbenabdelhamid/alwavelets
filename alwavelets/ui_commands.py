@@ -163,7 +163,7 @@ class CommandLineMixin:
             "zoom A B  — Set time range [A..B]",
             "fit       — Zoom to fit all",
             "goto T    — Move cursor to time T",
-            "markers   — Manage time markers (F12): jump, rename, delete, undo",
+            "markers   — Manage time markers (F12): search, jump, rename, delete, undo",
             "find PAT  — Focus a signal (among those already displayed)",
             "add PAT   — Add signals to the display ('add top.alu.*')",
             "remove PAT— Remove signals from the display (alias: rm)",

@@ -1375,30 +1375,6 @@ class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, Inspecti
             self.cursor_time = best
             self._ensure_cursor_visible()
 
-    def jump_next_marker(self):
-        """Jump cursor to next marker after current position."""
-        if not self.markers:
-            return
-        ct = self.cursor_time
-        future = sorted([m.time for m in self.markers if m.time > ct])
-        if future:
-            self.cursor_time = future[0]
-        else:
-            self.cursor_time = sorted([m.time for m in self.markers])[0]
-        self._ensure_cursor_visible()
-
-    def jump_prev_marker(self):
-        """Jump cursor to previous marker before current position."""
-        if not self.markers:
-            return
-        ct = self.cursor_time
-        past = sorted([m.time for m in self.markers if m.time < ct], reverse=True)
-        if past:
-            self.cursor_time = past[0]
-        else:
-            self.cursor_time = sorted([m.time for m in self.markers])[-1]
-        self._ensure_cursor_visible()
-
     # ── Analysis ──
 
     def get_frequency_info(self):

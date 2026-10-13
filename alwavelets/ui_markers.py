@@ -6,16 +6,48 @@ from .ui_chrome import elide, menu_pages, text_width
 from .ui_navigation import set_active_cursor_visible
 
 
-_CONTROLS = [('Enter', 'Jump', curses.KEY_ENTER), ('r', 'Rename', ord('r')),
+_CONTROLS = [('Enter', 'Jump and close', curses.KEY_ENTER), ('/', 'Filter', ord('/')),
+             ('r', 'Rename', ord('r')),
              ('Del', 'Delete', curses.KEY_DC), ('m', 'Add', ord('m')),
              ('M', 'Clear all', ord('M')), ('u', 'Undo', ord('u')),
              ('Ctrl-R', 'Redo', 18), ('Esc', 'Close', 27)]
 
 
 class MarkerManagerMixin:
+    def jump_next_marker(self):
+        self._step_marker(1)
+
+    def jump_prev_marker(self):
+        self._step_marker(-1)
+
+    def _step_marker(self, direction):
+        items = sorted(self.markers, key=lambda marker: marker.time)
+        if not items:
+            self._show_message('No markers · m adds one at the cursor')
+            return
+        ct = self.cursor_time
+        indices = range(len(items)) if direction > 0 else range(len(items) - 1, -1, -1)
+        index = next((i for i in indices if (items[i].time - ct) * direction > 0), None)
+        wrapped = index is None
+        if wrapped:
+            index = 0 if direction > 0 else len(items) - 1
+        self._jump_to_marker(items, index, wrapped=wrapped)
+
+    def _jump_to_marker(self, items, index, wrapped=False):
+        marker = items[index]
+        self.cursor_time = marker.time
+        set_active_cursor_visible(self)
+        self._ensure_cursor_visible()
+        prefix = f'Marker {index + 1}/{len(items)}'
+        suffix = f' · {self.format_ruler_time(marker.time)}' + (' · wrapped' if wrapped else '')
+        # Reserve room for the time and wrap notice before clipping long labels.
+        label = ' '.join(marker.label.split()) or '(unlabeled)'
+        label = elide(label, max(0, self.width - 2 - text_width(prefix + ' · ' + suffix)))
+        self._show_message(prefix + (' · ' + label if label else '') + suffix)
+
     def open_marker_manager(self):
         selected = min(self.markers, key=lambda marker: abs(marker.time - self.cursor_time), default=None)
-        self._marker_menu = {'selected': selected, 'index': 0, 'scroll': 0}
+        self._marker_menu = {'selected': selected, 'index': 0, 'scroll': 0, 'query': ''}
         self._signal_menu = None
         self._drag_anchor = self._drag_cur = None
         self._pending_g = False
@@ -26,6 +58,13 @@ class MarkerManagerMixin:
         # and browsing never changes capture order or editing history.
         items = sorted(self.markers, key=lambda marker: marker.time)
         menu = self._marker_menu
+        menu['all_items'] = items
+        terms = menu['query'].casefold().split()
+        if terms:
+            def matches(marker):
+                text = f'{marker.label or "(unlabeled)"} {self.format_ruler_time(marker.time)} {marker.time}'.casefold()
+                return all(term in text for term in terms)
+            items = [marker for marker in items if matches(marker)]
         selected = menu['selected']
         if selected in items:
             menu['index'] = items.index(selected)
@@ -33,6 +72,15 @@ class MarkerManagerMixin:
             menu['index'] = min(menu['index'], max(0, len(items) - 1))
         menu['selected'] = items[menu['index']] if items else None
         return items
+
+    def _set_marker_filter(self, query):
+        menu = self._marker_menu
+        query = query.strip()
+        if query != menu['query']:
+            menu['query'] = query
+            menu['index'] = menu['scroll'] = 0
+            self._marker_items()  # Keep the selected marker if it still matches.
+            self._dirty = True
 
     def marker_manager_handle_key(self, key):
         self._dirty = True
@@ -60,9 +108,10 @@ class MarkerManagerMixin:
                     if y == row and x0 <= x < x1:
                         self.marker_manager_handle_key(action)
                         return
-                if top + 2 <= y < top + 2 + menu['rows']:
+                table_top = top + menu['table_top']
+                if table_top <= y < table_top + menu['rows']:
                     items = self._marker_items()
-                    index = menu['scroll'] + y - top - 2
+                    index = menu['scroll'] + y - table_top
                     if index < len(items):
                         menu['index'], menu['selected'] = index, items[index]
                         if state & curses.BUTTON1_DOUBLE_CLICKED:
@@ -75,10 +124,15 @@ class MarkerManagerMixin:
         marker = menu['selected']
         if key in (27, ord('q'), curses.KEY_F12):
             self._marker_menu = None
+        elif key == ord('/'):
+            query = self.prompt_input('Filter markers (label/time): ', initial=menu['query'], cancel_value=None)
+            if query is not None:
+                self._set_marker_filter(query)
+        elif key == 21:  # Ctrl-U resets the filter without closing the list.
+            self._set_marker_filter('')
         elif key in (10, 13, curses.KEY_ENTER) and marker is not None:
-            self.cursor_time = marker.time
-            set_active_cursor_visible(self)
-            self._ensure_cursor_visible()
+            all_items = menu['all_items']
+            self._jump_to_marker(all_items, all_items.index(marker))
             self._marker_menu = None
         elif key == ord('r') and marker is not None:
             label = self.prompt_input('Marker label: ', initial=marker.label, cancel_value=None)
@@ -116,11 +170,16 @@ class MarkerManagerMixin:
         items = self._marker_items()
         width = min(84, self.width - 2)
         choices = ([(key, label) for key, label, _ in _CONTROLS] if width >= 50 else
-                   [('Enter', 'Go'), ('r', 'Name'), ('Del', 'Del'), ('m', 'Add'),
+                   [('Enter', 'Jump/close'), ('/', 'Find'), ('r', 'Name'), ('Del', 'Del'), ('m', 'Add'),
                     ('M', 'All'), ('u', 'Undo'), ('^R', 'Redo'), ('Esc', 'Close')])
+        if menu['query']:
+            choices.insert(2, ('Ctrl-U', 'Reset filter') if width >= 50 else ('^U', 'Reset'))
+            choices = [(key, f'{label} {len(self.markers)}' if key == 'M' else label) for key, label in choices]
         controls = menu_pages(choices, width - 4, gap=2)
-        height = min(self.height - 2, max(1, len(items)) + 3 + len(controls))
-        rows = max(0, height - 3 - len(controls))
+        table_top = 3 if menu['query'] else 2
+        menu['table_top'] = table_top
+        height = min(self.height - 2, max(1, len(items)) + table_top + 2 + len(controls))
+        rows = max(0, height - table_top - 2 - len(controls))
         left, top = (self.width - width) // 2, (self.height - height) // 2
         menu['rect'], menu['rows'] = (left, top, width, height), rows
         menu['scroll'] = max(0, min(menu['scroll'], menu['index']))
@@ -139,7 +198,8 @@ class MarkerManagerMixin:
 
         for row in range(height):
             put(row, '')
-        title = f'Markers · {menu["index"] + 1 if items else 0}/{len(items)}'
+        title = (f'Markers · {len(items)}/{len(self.markers)} matches' if menu['query'] else
+                 f'Markers · {menu["index"] + 1 if items else 0}/{len(items)}')
         try:
             label = elide(' ' + title + ' ', width - 2)
             self.stdscr.addstr(top, left, '┌' + label + '─' * (width - 2 - text_width(label)) + '┐', normal | curses.A_BOLD)
@@ -151,18 +211,22 @@ class MarkerManagerMixin:
             put(2, 'Esc Close', curses.A_DIM)
             return
         visible = items[menu['scroll']:menu['scroll'] + rows]
+        if menu['query']:
+            put(1, 'Filter: ' + menu['query'])
         times = [self.format_ruler_time(marker.time) for marker in visible]
         time_width = min(max(4, max(map(text_width, times), default=4)), max(4, (width - 6) // 2))
-        put(1, 'Time'.ljust(time_width) + '  Label', normal | curses.A_BOLD)
-        for offset, (marker, time) in enumerate(zip(visible, times), 2):
+        put(table_top - 1, 'Time'.ljust(time_width) + '  Label', normal | curses.A_BOLD)
+        for offset, (marker, time) in enumerate(zip(visible, times), table_top):
             time = elide(time, time_width)
             text = time + ' ' * (time_width - text_width(time)) + '  ' + (marker.label or '(unlabeled)')
             put(offset, text, selected if marker is menu['selected'] else normal)
         if not items:
-            put(2, 'No markers · m Add', curses.A_DIM)
+            put(table_top, 'No matches · Ctrl-U Reset' if menu['query'] else 'No markers · m Add', curses.A_DIM)
+        put(table_top + rows, '↑↓ Select · PgUp/PgDn Page', normal | curses.A_DIM)
         actions = {key: action for key, _, action in _CONTROLS}
         actions['^R'] = 18
-        for offset, page in enumerate(controls, 2 + rows):
+        actions['Ctrl-U'] = actions['^U'] = 21
+        for offset, page in enumerate(controls, table_top + rows + 1):
             col = left + 2
             for key, label in page:
                 text = elide(key + ' ' + label, max(0, left + width - 2 - col))
