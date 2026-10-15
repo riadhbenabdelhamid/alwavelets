@@ -605,6 +605,7 @@ theme &lt;name&gt;           set / puts / foreach    <span class="cm"># variable
   <div class="cols2">
     <div>
       <h3>Themes</h3>
+      <p>On a white or bright terminal, choose <code>;theme light</code> for deeper signal colors, dark labels, and clear selections. Use <code>;theme calm-light</code>, <code>;theme classic-light</code>, or <code>;theme minimal-light</code> for the corresponding palette; Minimal Light stays monochrome. <kbd>F3</kbd> preserves the light palette family while switching workmodes. Choose a dark palette such as <code>;theme classic</code> to switch back. Save the choice with <code>;session</code>, or set <code>"theme": "classic-light"</code> in config.json for startup. Waveform areas retain the terminal background; the eight-color fallback also uses dark foregrounds.</p>
       <p><kbd>\</kbd> cycles built-ins (dark, light, phosphor, …); <code>;theme &lt;name|file.json&gt;</code> loads by name or file. A theme JSON maps ~30 roles (HIGH, LOW, EDGE, BUS, CURSOR, MENU, …) to colors:</p>
       <pre class="block"><code>{
   "name": "Nord",

@@ -56,6 +56,9 @@ from .custom_radix import custom_radix_state, load_custom_radixes
 
 # ── true-color theme support ─────────────────────────────────────────
 
+LIGHT_THEMES = frozenset({'light', 'calm-light', 'classic-light', 'minimal-light'})
+
+
 def hex_to_rgb(spec):
     """'#rrggbb' -> (r, g, b) ints, or None if it isn't one."""
     if isinstance(spec, str) and len(spec) == 7 and spec[0] == '#':
@@ -135,18 +138,18 @@ class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, Inspecti
             'VAL': (117, -1), 'SCOPE': (245, -1), 'ROWALT': (-1, 233),
             'BUSNAME': (111, -1), 'DIFF_BG': (255, 52), 'DIFF_ED': (209, -1),
         },
-        'light': {  # Black on white
+        'light': {  # Deep foregrounds for white and off-white terminals.
             'name': 'Light',
-            'HIGH': (28, -1), 'LOW': (22, -1), 'EDGE': (160, -1),
-            'UNDEF': (208, -1), 'HIZ': (24, -1), 'BUS': (25, -1),
-            'BUSLBL': (16, 254), 'ANALOG': (30, -1),
-            'ANHI': (160, -1), 'ANMID': (172, -1), 'ANLO': (30, -1),
-            'CURSOR': (255, 20), 'CURSORB': (255, 127), 'MARKER': (129, -1),
-            'DELTA': (20, 229), 'HEADER': (16, 254), 'MENU': (16, 253),
-            'MENUKEY': (22, 253), 'MENUSEP': (247, 253), 'PROMPT': (255, 160),
-            'HELP': (16, 153), 'SELECT': (255, 28), 'FOCUS': (16, 252),
-            'VAL': (25, -1), 'SCOPE': (242, -1), 'ROWALT': (-1, 255),
-            'BUSNAME': (25, -1), 'DIFF_BG': (16, 217), 'DIFF_ED': (166, -1),
+            'HIGH': (22, -1), 'LOW': (23, -1), 'EDGE': (124, -1),
+            'UNDEF': (58, -1), 'HIZ': (24, -1), 'BUS': (19, -1),
+            'BUSLBL': (16, 254), 'ANALOG': (23, -1),
+            'ANHI': (124, -1), 'ANMID': (58, -1), 'ANLO': (24, -1),
+            'CURSOR': (231, 25), 'CURSORB': (231, 90), 'MARKER': (90, -1),
+            'DELTA': (17, 153), 'HEADER': (234, 254), 'MENU': (234, 253),
+            'MENUKEY': (19, 253), 'MENUSEP': (239, 253), 'PROMPT': (231, 124),
+            'HELP': (234, 255), 'SELECT': (231, 24), 'FOCUS': (16, 153),
+            'VAL': (19, -1), 'SCOPE': (238, -1), 'ROWALT': (16, 255),
+            'BUSNAME': (19, -1), 'DIFF_BG': (52, 224), 'DIFF_ED': (124, -1),
         },
         'phosphor': {  # Classic green on black
             'name': 'Phosphor',
@@ -207,7 +210,29 @@ class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, Inspecti
         'MENUSEP': (240, -1), 'ROWALT': (-1, -1), 'BUSLBL': (252, -1),
         'DELTA': (252, 234), 'HELP': (252, 234), 'FOCUS': (255, 235),
     }
-    THEME_ORDER = ['calm', 'classic', 'minimal', 'dark', 'light', 'phosphor', 'futuristic', 'mono']
+    THEMES['classic-light'] = {**THEMES['light'], 'name': 'Classic Light'}
+    THEMES['calm-light'] = {
+        **THEMES['light'], 'name': 'Calm Light',
+        'HIGH': (23, -1), 'LOW': (239, -1), 'EDGE': (24, -1),
+        'BUS': (24, -1), 'BUSNAME': (24, -1), 'ANALOG': (24, -1),
+        'ANHI': (89, -1), 'ANMID': (58, -1), 'ANLO': (24, -1),
+        'HIZ': (54, -1), 'VAL': (24, -1), 'MENUKEY': (23, 253),
+    }
+    THEMES['minimal-light'] = {
+        **THEMES['light'], 'name': 'Minimal Light',
+        'HIGH': (234, -1), 'LOW': (239, -1), 'EDGE': (16, -1),
+        'UNDEF': (236, -1), 'HIZ': (238, -1), 'BUS': (236, -1),
+        'BUSLBL': (234, -1), 'ANALOG': (236, -1),
+        'ANHI': (234, -1), 'ANMID': (236, -1), 'ANLO': (239, -1),
+        'CURSOR': (231, 234), 'CURSORB': (231, 240), 'MARKER': (236, -1),
+        'DELTA': (234, 252), 'HEADER': (234, -1), 'MENU': (236, -1),
+        'MENUKEY': (16, -1), 'MENUSEP': (239, -1), 'PROMPT': (231, 236),
+        'HELP': (234, 255), 'SELECT': (231, 236), 'FOCUS': (16, 252),
+        'VAL': (236, -1), 'SCOPE': (238, -1), 'ROWALT': (-1, -1),
+        'BUSNAME': (236, -1), 'DIFF_BG': (234, 252), 'DIFF_ED': (16, -1),
+    }
+    THEME_ORDER = ['calm', 'classic', 'minimal', 'dark', 'light',
+                   'calm-light', 'classic-light', 'minimal-light', 'phosphor', 'futuristic', 'mono']
     WORKMODES = {
         'calm': {'name': 'Calm', 'theme': 'calm', 'menu_bar': True, 'scope_separators': True},
         'classic': {'name': 'Classic', 'theme': 'classic', 'menu_bar': True, 'scope_separators': False},
@@ -636,7 +661,7 @@ class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, Inspecti
                 self._show_message('Workmodes: calm, classic, minimal')
             return False
         self.workmode = name
-        self.current_theme = mode['theme']
+        self.current_theme = mode['theme'] + ('-light' if self.current_theme in LIGHT_THEMES else '')
         self.show_menu_bar = mode['menu_bar']
         self.show_module_sep = mode['scope_separators']
         self.signal_spacing = 0
@@ -681,12 +706,35 @@ class Alwavelets(MarkerManagerMixin, CustomRadixMixin, SignalMenuMixin, Inspecti
         self.apply_theme()
 
     def _apply_basic_colors(self):
-        """Keep monochrome modes monochrome on an eight-color terminal too."""
-        if self.current_theme in ('minimal', 'mono'):
+        """Preserve light/dark contrast and monochrome on eight-color terminals."""
+        if self.current_theme in ('minimal', 'mono', 'minimal-light'):
+            light = self.current_theme == 'minimal-light'
+            foreground = curses.COLOR_BLACK if light else curses.COLOR_WHITE
+            opposite = curses.COLOR_WHITE if light else curses.COLOR_BLACK
             inverse = {self.C_CURSOR, self.C_CURSORB, self.C_SELECT, self.C_PROMPT}
             for pair in range(self.C_HIGH, self.C_DIFF_ED + 1):
-                fg, bg = ((curses.COLOR_BLACK, curses.COLOR_WHITE) if pair in inverse
-                          else (curses.COLOR_WHITE, -1))
+                fg, bg = ((opposite, foreground) if pair in inverse else (foreground, -1))
+                curses.init_pair(pair, fg, bg)
+        elif self.current_theme in LIGHT_THEMES:
+            black, white = curses.COLOR_BLACK, curses.COLOR_WHITE
+            blue, red = curses.COLOR_BLUE, curses.COLOR_RED
+            pairs = {
+                self.C_HIGH: (curses.COLOR_GREEN, -1), self.C_LOW: (black, -1),
+                self.C_EDGE: (red, -1), self.C_UNDEF: (black, -1), self.C_HIZ: (blue, -1),
+                self.C_BUS: (blue, -1), self.C_BUSLBL: (black, white),
+                self.C_ANALOG: (blue, -1), self.C_ANHI: (red, -1),
+                self.C_ANMID: (black, -1), self.C_ANLO: (blue, -1),
+                self.C_CURSOR: (white, blue), self.C_CURSORB: (white, curses.COLOR_MAGENTA),
+                self.C_MARKER: (curses.COLOR_MAGENTA, -1), self.C_DELTA: (white, blue),
+                self.C_HEADER: (black, white), self.C_MENU: (black, white),
+                self.C_MENUKEY: (blue, white), self.C_MENUSEP: (black, white),
+                self.C_PROMPT: (white, red), self.C_HELP: (black, white),
+                self.C_SELECT: (white, blue), self.C_FOCUS: (white, blue),
+                self.C_VAL: (blue, -1), self.C_SCOPE: (black, -1),
+                self.C_ROWALT: (black, white), self.C_BUSNAME: (blue, -1),
+                self.C_DIFF_BG: (white, red), self.C_DIFF_ED: (red, -1),
+            }
+            for pair, (fg, bg) in pairs.items():
                 curses.init_pair(pair, fg, bg)
         else:
             # ── Fallback 8-color palette ──

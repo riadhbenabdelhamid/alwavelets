@@ -233,6 +233,16 @@ displayed signals, zoom, cursors, and per-signal settings. `;theme` and `\`
 still change only the palette. `;session` saves the mode and any subsequent
 appearance adjustments for that trace.
 
+On a white or bright terminal, use **`;theme light`** for deep signal colors,
+dark labels, and clear selections. The light palettes are also available as
+**`;theme calm-light`**, **`;theme classic-light`**, and **`;theme minimal-light`**;
+Minimal Light stays monochrome. **F3** keeps the light palette family when
+switching workmodes. Choosing a dark palette such as `;theme classic` switches
+the family back. Save the choice for this trace with `;session`, or set
+`"theme": "classic-light"` in `~/.config/alwavelets/config.json` as a startup
+default. The light palettes keep the terminal's background in waveform areas
+and use darker foregrounds in the eight-color fallback too.
+
 For clearer separation between neighboring signals, press **`|`** to cycle
 **Compact → Blank gap → Divider**, or choose directly:
 

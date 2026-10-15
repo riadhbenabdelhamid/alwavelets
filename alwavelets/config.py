@@ -17,6 +17,8 @@ defaults, so a malformed config never blocks startup. Example:
 
 The workmode supplies presentation defaults; explicit theme/menu settings
 override them. `workmode` accepts "calm", "classic" (default), or "minimal".
+On light terminals, use theme "light", "calm-light", "classic-light", or
+"minimal-light". Workmode changes retain the selected light/dark palette family.
 
 `custom_radixes` optionally configures two shared slots: "fixed" accepts
 integer_bits, fraction_bits, signed; "float" accepts exponent_bits,
