@@ -10,6 +10,14 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/alwavelets-demo.svg" width="840"
+       alt="A one-minute tour of Alwavelets recorded from the real viewer: opening a trace, fuzzy signal search, expanding a bus, radix, expression search, cursors and edge snapping, glitch detection, measurements, markers, groups, the scope browser, themes, the action palette, saving the session, and an agent driving the live view">
+</p>
+
+<p align="center"><sub>A one-minute tour, every frame a real screen of the viewer
+(<code>python3 tools/make_demo.py</code> re-records it).</sub></p>
+
 A dependency-free terminal waveform viewer for digital-design simulation
 traces. Runs over SSH / tmux / a bare console — no display server required.
 
@@ -941,6 +949,13 @@ style enforcement.
 
 `pip install .` installs the package and an `alwavelets` console command
 (`pyproject.toml`; no runtime dependencies).
+
+The animated tour at the top of this README is recorded, not drawn:
+`tools/make_demo.py` runs the viewer inside tmux, types the storyboard's
+keystrokes, captures every screen with its colours and writes
+`assets/alwavelets-demo.svg` (CSS-animated, no scripts) — and a GIF with
+`--gif`. It needs tmux, `pip install pyte` and, for the GIF, Pillow; none of
+these is a runtime dependency.
 
 ### Performance benchmarks
 
