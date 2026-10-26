@@ -8,10 +8,13 @@ draws, not a mock-up. The frames are assembled into:
 
   * an animated SVG (CSS keyframes, no scripts): crisp at any size, small,
     and GitHub renders it in a README `<img>`;
-  * optionally a GIF via Pillow, for sites that do not animate SVG.
+  * optionally a step-through HTML page (previous/next, keyboard, play)
+    for the GitHub Pages site, and a GIF via Pillow for sites that do not
+    animate SVG.
 
 Usage:
     python3 tools/make_demo.py                         # assets/alwavelets-demo.svg
+    python3 tools/make_demo.py --html docs/tour.html  # the step-by-step page
     python3 tools/make_demo.py --gif assets/alwavelets-demo.gif
     python3 tools/make_demo.py --png-dir /tmp/frames   # one PNG per frame
 
@@ -444,6 +447,158 @@ def write_svg(frames, path):
     return os.path.getsize(path), total
 
 
+# ── HTML stepper (docs/tour.html) ────────────────────────────────────
+
+def _html_esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def write_html(frames, path):
+    """A page that steps through the same frames one at a time: previous and
+    next buttons, ← → Space Home End on the keyboard, play/pause, a step list
+    to jump to a scene, and a #n hash so a frame can be linked to. Each frame
+    is text in a <pre>, so it is crisp at any zoom and selectable."""
+    pres, steps = [], []
+    for i, f in enumerate(frames):
+        rows = []
+        for row in f.cells:
+            parts = []
+            for x, text, fg, bg, bold in runs(row):
+                st = []
+                if fg != DEFAULT_FG:
+                    st.append("color:%s" % fg)
+                if bg != TERM_BG:
+                    st.append("background:%s" % bg)
+                t = _html_esc(text)
+                if bold:
+                    t = "<b>%s</b>" % t
+                parts.append('<span style="%s">%s</span>' % (";".join(st), t) if st else t)
+            rows.append("".join(parts).rstrip() if not any(c[2] not in (None, "default") for c in row)
+                        else "".join(parts))
+        keys = "".join('<kbd>%s</kbd>' % _html_esc(k) for k in f.keys)
+        pres.append(
+            '<section class="frame" data-i="%d" data-hold="%d" hidden>\n'
+            '<pre class="term">%s</pre>\n'
+            '<div class="cap"><span class="step">%02d</span>%s<strong>%s</strong>'
+            '<p>%s</p></div>\n</section>' % (
+                i, int(f.hold * 1000), "\n".join(rows), f.step, keys,
+                _html_esc(f.title), _html_esc(f.desc)))
+        if not steps or steps[-1][1] != f.title:
+            steps.append((i, f.title))
+    step_list = "".join('<li><a href="#%d" data-i="%d">%s</a></li>' % (i, i, _html_esc(t))
+                        for i, t in steps)
+    page = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alwavelets — Guided tour</title>
+<meta name="description" content="Step through Alwavelets, the terminal waveform viewer, one real screen at a time.">
+<style>
+  :root { --bg:#f2f5f2; --panel:#e7ede8; --ink:#1d2620; --dim:#5c6a60; --acc:#17803e; --acc-ink:#0e5c2b;
+          --line:#c8d2c9; --key-bg:#ffffff; --key-edge:#b9c4ba; --term-bg:%(term_bg)s; --term-ink:%(term_fg)s; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1210; --panel:#151b17; --ink:#d8e2da; --dim:#8a988e; --acc:#3ddc6e; --acc-ink:#7ceb9a;
+            --line:#243028; --key-bg:#1d2620; --key-edge:#34413a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.55 system-ui,"Segoe UI",Roboto,"Helvetica Neue",sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; } h1 .dia { color: var(--acc); }
+  .lede { color: var(--dim); margin: 0 0 18px; }
+  .lede a, .steps a, footer a { color: var(--acc-ink); }
+  .bar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin: 0 0 12px; }
+  button { font: 600 13px/1 system-ui,sans-serif; color: var(--ink); background: var(--panel);
+           border:1px solid var(--line); border-radius: 8px; padding: 9px 14px; cursor:pointer; }
+  button:hover { border-color: var(--acc); color: var(--acc-ink); }
+  button:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  .count { font: 600 13px/1 ui-monospace,Menlo,Consolas,monospace; color: var(--dim); min-width: 64px; text-align:center; }
+  .hint { color: var(--dim); font-size: 12.5px; margin-left: auto; }
+  .frame { background: var(--term-bg); border-radius: 10px; padding: 10px 12px 12px; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+  .term { margin:0; color: var(--term-ink); font: 12.5px/1.3 ui-monospace,"SFMono-Regular",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+          white-space: pre; overflow-x: auto; -webkit-font-smoothing: antialiased; }
+  .cap { margin-top: 10px; padding-top: 10px; border-top: 1px solid #2a3139; color: #9da7b3; font-size: 13.5px; }
+  .cap strong { color: #e6edf3; font-size: 15px; margin-left: 6px; }
+  .cap p { margin: 6px 0 0; }
+  .step { font: 600 11px/1 ui-monospace,monospace; color: #6e7681; margin-right: 10px; }
+  kbd { display:inline-block; font: 600 11.5px/1 ui-monospace,Menlo,Consolas,monospace; color:#e6edf3; background:#30363d;
+        border:1px solid #484f58; border-radius:5px; padding: 4px 7px; margin: 0 4px 0 0; }
+  .steps { margin: 22px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 16px; }
+  .steps a { display:block; padding: 5px 8px; border-radius: 6px; text-decoration: none; color: var(--ink); }
+  .steps a:hover { background: var(--panel); }
+  .steps a.cur { background: var(--panel); color: var(--acc-ink); font-weight: 600; }
+  .steps a::before { content: attr(data-n) " "; color: var(--dim); font: 600 11px/1 ui-monospace,monospace; }
+  footer { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--dim); font-size: 12.5px; }
+  @media (max-width: 700px) { .hint { display:none; } .term { font-size: 10px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1><span class="dia">◆</span> Alwavelets — guided tour</h1>
+<p class="lede">The same one-minute tour as the README, one real screen at a time. Use the buttons or
+← → on the keyboard, Space to play and pause; every frame is what the viewer actually drew.
+Back to the <a href="index.html">complete field guide</a>.</p>
+<div class="bar" role="toolbar" aria-label="Tour controls">
+  <button id="prev" type="button" aria-label="Previous frame">◀ Prev</button>
+  <button id="play" type="button" aria-pressed="false">▶ Play</button>
+  <button id="next" type="button" aria-label="Next frame">Next ▶</button>
+  <span class="count" id="count" aria-live="polite"></span>
+  <span class="hint">← → step · Space play/pause · Home/End</span>
+</div>
+%(frames)s
+<ol class="steps" id="steps" aria-label="Scenes">%(steps)s</ol>
+<footer>Recorded from the real viewer by <code>tools/make_demo.py</code> ·
+<a href="https://github.com/riadhbenabdelhamid/alwavelets">Alwavelets on GitHub</a></footer>
+</div>
+<script>
+(function () {
+  var frames = Array.prototype.slice.call(document.querySelectorAll('.frame'));
+  var links = Array.prototype.slice.call(document.querySelectorAll('#steps a'));
+  var play = document.getElementById('play'), count = document.getElementById('count');
+  var cur = 0, timer = null;
+  links.forEach(function (a, n) { a.setAttribute('data-n', String(n + 1).padStart(2, '0')); });
+  function show(i, fromHash) {
+    cur = (i + frames.length) %% frames.length;
+    frames.forEach(function (f, n) { f.hidden = n !== cur; });
+    count.textContent = String(cur + 1).padStart(2, '0') + ' / ' + frames.length;
+    var active = null;
+    links.forEach(function (a) { if (+a.dataset.i <= cur) active = a; a.classList.remove('cur'); });
+    if (active) active.classList.add('cur');
+    if (!fromHash && history.replaceState) history.replaceState(null, '', '#' + cur);
+    if (timer) schedule();
+  }
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(function () { show(cur + 1); }, +frames[cur].dataset.hold || 2500);
+  }
+  function setPlaying(on) {
+    if (on) { schedule(); play.textContent = '❚❚ Pause'; play.setAttribute('aria-pressed', 'true'); }
+    else { clearTimeout(timer); timer = null; play.textContent = '▶ Play'; play.setAttribute('aria-pressed', 'false'); }
+  }
+  document.getElementById('prev').onclick = function () { show(cur - 1); };
+  document.getElementById('next').onclick = function () { show(cur + 1); };
+  play.onclick = function () { setPlaying(!timer); };
+  links.forEach(function (a) { a.onclick = function (e) { e.preventDefault(); show(+a.dataset.i); }; });
+  document.addEventListener('keydown', function (e) {
+    if (e.target.tagName === 'BUTTON' && e.key === ' ') return;
+    if (e.key === 'ArrowRight' || e.key === 'l' || e.key === 'j') { show(cur + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'h' || e.key === 'k') { show(cur - 1); e.preventDefault(); }
+    else if (e.key === ' ') { setPlaying(!timer); e.preventDefault(); }
+    else if (e.key === 'Home') { show(0); } else if (e.key === 'End') { show(frames.length - 1); }
+  });
+  window.addEventListener('hashchange', function () { var n = parseInt(location.hash.slice(1), 10); if (!isNaN(n)) show(n, true); });
+  var start = parseInt(location.hash.slice(1), 10);
+  show(isNaN(start) ? 0 : start, true);
+})();
+</script>
+</body>
+</html>
+""" % {"frames": "\n".join(pres), "steps": step_list, "term_bg": TERM_BG, "term_fg": DEFAULT_FG}
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    return os.path.getsize(path)
+
+
 # ── PNG / GIF writer (Pillow, optional) ──────────────────────────────
 
 def _glyph_font(ch, mono, fallback, _cache={}):
@@ -513,6 +668,7 @@ def load_fonts():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "assets", "alwavelets-demo.svg"))
+    ap.add_argument("--html", help="also write a step-through page here (e.g. docs/tour.html)")
     ap.add_argument("--gif", help="also write an animated GIF here (needs Pillow)")
     ap.add_argument("--png-dir", help="also write one PNG per frame here (needs Pillow)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every captured screen")
@@ -526,6 +682,8 @@ def main():
     frames = record(args.verbose)
     size, total = write_svg(frames, args.out)
     print("%s: %d frames, %.1fs loop, %d KB" % (args.out, len(frames), total, size // 1024))
+    if args.html:
+        print("%s: %d KB" % (args.html, write_html(frames, args.html) // 1024))
     if args.gif or args.png_dir:
         fonts = load_fonts()
         images = [render_png(f, fonts) for f in frames]

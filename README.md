@@ -16,9 +16,10 @@
 </p>
 
 <p align="center"><sub>A one-minute tour, every frame a real screen of the viewer.
-Click the image to open it on its own, where hovering pauses it; it holds a still
-frame if your system asks for reduced motion.
-<code>python3 tools/make_demo.py</code> re-records it.</sub></p>
+Prefer your own pace? <a href="https://riadhbenabdelhamid.github.io/alwavelets/tour.html">Step
+through it frame by frame</a>. Click the image to open it on its own, where hovering pauses it;
+it holds a still frame if your system asks for reduced motion.
+<code>python3 tools/make_demo.py</code> re-records both.</sub></p>
 
 A dependency-free terminal waveform viewer for digital-design simulation
 traces. Runs over SSH / tmux / a bare console — no display server required.
@@ -955,8 +956,8 @@ style enforcement.
 The animated tour at the top of this README is recorded, not drawn:
 `tools/make_demo.py` runs the viewer inside tmux, types the storyboard's
 keystrokes, captures every screen with its colours and writes
-`assets/alwavelets-demo.svg` (CSS-animated, no scripts) — and a GIF with
-`--gif`. It needs tmux, `pip install pyte` and, for the GIF, Pillow; none of
+`assets/alwavelets-demo.svg` (CSS-animated, no scripts), the step-by-step
+page `docs/tour.html` with `--html`, and a GIF with `--gif`. It needs tmux, `pip install pyte` and, for the GIF, Pillow; none of
 these is a runtime dependency.
 
 ### Performance benchmarks
