@@ -376,6 +376,12 @@ def write_svg(frames, path):
         t += f.hold
     css.append("@keyframes bar{from{width:0}to{width:%dpx}}" % (W - 2 * PAD))
     css.append(".bar{animation:bar %.2fs linear infinite}" % total)
+    # Pause while hovered (works when the SVG is opened as a document; an
+    # <img> in a README gets no pointer events) and respect reduced motion
+    # by holding the first frame.
+    css.append("svg:hover g[class^=f],svg:hover .bar{animation-play-state:paused}")
+    css.append("@media (prefers-reduced-motion:reduce){g[class^=f],.bar{animation:none}"
+               "g[class^=f]{opacity:0}.f0{opacity:1}}")
 
     out = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
            'font-size="%d">' % (W, H, W, H, FS),

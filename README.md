@@ -15,8 +15,10 @@
        alt="A one-minute tour of Alwavelets recorded from the real viewer: opening a trace, fuzzy signal search, expanding a bus, radix, expression search, cursors and edge snapping, glitch detection, measurements, markers, groups, the scope browser, themes, the action palette, saving the session, and an agent driving the live view">
 </p>
 
-<p align="center"><sub>A one-minute tour, every frame a real screen of the viewer
-(<code>python3 tools/make_demo.py</code> re-records it).</sub></p>
+<p align="center"><sub>A one-minute tour, every frame a real screen of the viewer.
+Click the image to open it on its own, where hovering pauses it; it holds a still
+frame if your system asks for reduced motion.
+<code>python3 tools/make_demo.py</code> re-records it.</sub></p>
 
 A dependency-free terminal waveform viewer for digital-design simulation
 traces. Runs over SSH / tmux / a bare console — no display server required.
